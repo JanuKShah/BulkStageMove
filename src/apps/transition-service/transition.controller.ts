@@ -48,6 +48,20 @@ export class TransitionController {
     };
   }
 
+  @Get(':id/failures')
+  async failures(
+    @Headers() headers: Headers_,
+    @Param('id') id: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.service.failures(requireWorkspaceId(headers), requireUuid('id', id), limit);
+  }
+
+  @Get(':id/batches')
+  async batches(@Headers() headers: Headers_, @Param('id') id: string) {
+    return this.service.batches(requireWorkspaceId(headers), requireUuid('id', id));
+  }
+
   @Get(':id/transitions')
   transitions(
     @Headers() headers: Headers_,

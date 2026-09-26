@@ -79,4 +79,57 @@ export class BulkJobRepository {
     );
     return Object.fromEntries(rows.map((r) => [r.status, r.n]));
   }
+
+  /**
+   * Failed items, with the reason and the batch they belonged to.
+   *
+   * A batch is applied whole or not at all, so a refusal fails every record in
+   * it. That makes "which records do I fix" answerable only by naming the batch
+   * and the rule that blocked it, which is what this returns.
+   */
+  async failures(
+    workspaceId: string,
+    jobId: string,
+    limit: number,
+  ): Promise<
+    {
+      batch_no: number;
+      opportunity_id: string;
+      name: string;
+      from_stage_id: string;
+      error: string | null;
+      attempts: number;
+    }[]
+  > {
+    return this.db.query(
+      `SELECT i.batch_no, i.opportunity_id, o.name, i.from_stage_id, i.error, i.attempts
+         FROM bulk_job_item i
+         JOIN opportunity o ON o.id = i.opportunity_id AND o.workspace_id = i.workspace_id
+        WHERE i.job_id = $1 AND i.workspace_id = $2 AND i.status = 'failed'
+        ORDER BY i.batch_no, o.name
+        LIMIT $3`,
+      [jobId, workspaceId, limit],
+    );
+  }
+
+  /** Per-batch rollup, so a job of 50 batches can be read at a glance. */
+  async batchSummary(
+    workspaceId: string,
+    jobId: string,
+  ): Promise<
+    { batch_no: number; total: number; completed: number; failed: number; pending: number }[]
+  > {
+    return this.db.query(
+      `SELECT batch_no,
+              count(*)::int AS total,
+              count(*) FILTER (WHERE status = 'completed')::int AS completed,
+              count(*) FILTER (WHERE status = 'failed')::int    AS failed,
+              count(*) FILTER (WHERE status IN ('pending','running'))::int AS pending
+         FROM bulk_job_item
+        WHERE job_id = $1 AND workspace_id = $2
+        GROUP BY batch_no
+        ORDER BY batch_no`,
+      [jobId, workspaceId],
+    );
+  }
 }

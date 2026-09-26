@@ -171,6 +171,15 @@ async function cmdHealth(): Promise<Reply[]> {
   return results;
 }
 
+async function cmdJobFailures(jobId: string, limit?: number): Promise<Reply> {
+  const qs = limit ? `?limit=${limit}` : '';
+  return request('transition', `/bulk-moves/${jobId}/failures${qs}`);
+}
+
+async function cmdJobBatches(jobId: string): Promise<Reply> {
+  return request('transition', `/bulk-moves/${jobId}/batches`);
+}
+
 async function cmdJobStatus(jobId: string): Promise<Reply> {
   return request('transition', `/bulk-moves/${jobId}`);
 }
@@ -256,9 +265,57 @@ function renderJobTransitions(reply: Reply): void {
 function renderJobStatus(reply: Reply): void {
   print(reply, 'bulk job');
   if (reply.status >= 400) return;
-  const b = reply.body as { status: string; totalMatched: number; items: Record<string, number> };
+  const b = reply.body as {
+    status: string;
+    totalMatched: number;
+    failedCount: number;
+    error: string | null;
+    items: Record<string, number>;
+  };
   const done = (b.items['completed'] ?? 0) + (b.items['failed'] ?? 0);
   console.log(`  progress: ${done}/${b.totalMatched}  status=${b.status}`);
+  if (b.error) console.log(`  error:    ${b.error}`);
+  if ((b.items['failed'] ?? 0) > 0) {
+    console.log('\n  a batch is applied whole or not at all, so one blocked record');
+    console.log('  fails every record in its batch. See them with: job-failures');
+  }
+}
+
+/** Renders which records failed and why - the only actionable failure output. */
+function renderJobFailures(reply: Reply): void {
+  if (reply.status >= 400) {
+    print(reply, 'job failures');
+    return;
+  }
+  const rows = (reply.body as Row[]).map((f) => ({
+    batch: f['batch_no'],
+    opportunity: String(f['opportunity_id']).slice(0, 8),
+    name: f['name'],
+    from_stage: String(f['from_stage_id']).slice(0, 8),
+    attempts: f['attempts'],
+    error: String(f['error'] ?? '').slice(0, 60),
+  }));
+  table(rows, ['batch', 'opportunity', 'name', 'from_stage', 'attempts', 'error']);
+}
+
+/** Renders per-batch progress, which is the unit work is actually done in. */
+function renderJobBatches(reply: Reply): void {
+  if (reply.status >= 400) {
+    print(reply, 'job batches');
+    return;
+  }
+  table(
+    (reply.body as Row[]).map((b) => ({
+      batch: b['batch_no'],
+      total: b['total'],
+      completed: b['completed'],
+      failed: b['failed'],
+      outstanding: b['pending'],
+      state:
+        (b['failed'] as number) > 0 ? 'FAILED' : (b['pending'] as number) > 0 ? 'pending' : 'done',
+    })),
+    ['batch', 'total', 'completed', 'failed', 'outstanding', 'state'],
+  );
 }
 
 async function cmdListOpportunities(args: Record<string, string | undefined>): Promise<Reply> {
@@ -407,6 +464,14 @@ const COMMANDS: Record<
     renderJobTransitions(
       await cmdJobTransitions(args.id, args.limit ? Number(args.limit) : undefined),
     );
+  },
+  'job-failures': async (args) => {
+    if (!args.id) throw new Error('usage: job-failures --id=<uuid> [--limit=N]');
+    renderJobFailures(await cmdJobFailures(args.id, args.limit ? Number(args.limit) : undefined));
+  },
+  'job-batches': async (args) => {
+    if (!args.id) throw new Error('usage: job-batches --id=<uuid>');
+    renderJobBatches(await cmdJobBatches(args.id));
   },
   'dump-db': async (args) => {
     const out = args.out ?? 'db-state.txt';
@@ -651,6 +716,22 @@ async function interactiveMenu(): Promise<void> {
         const id = await askUuid('  job id: ');
         const limit = await askNumber('  limit (blank = default)');
         renderJobTransitions(await cmdJobTransitions(id, limit));
+      },
+    },
+    {
+      key: 'jobbatches',
+      label: 'view bulk job batch progress',
+      run: async () => {
+        renderJobBatches(await cmdJobBatches(await askUuid('  job id: ')));
+      },
+    },
+    {
+      key: 'jobfails',
+      label: 'view why a bulk job failed',
+      run: async () => {
+        const id = await askUuid('  job id: ');
+        const limit = await askNumber('  max rows (blank = default)');
+        renderJobFailures(await cmdJobFailures(id, limit));
       },
     },
     {

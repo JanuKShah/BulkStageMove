@@ -153,6 +153,10 @@ export class TransitionService {
       targetStageId: job.target_stage_id,
       filter: job.filter,
       totalMatched: job.total_matched,
+      // Why a batch was refused. Without this a failed job reports only that it
+      // failed, which is the one thing the caller cannot act on.
+      error: job.error,
+      failedCount: job.failed_count,
       items: {
         pending: counts['pending'] ?? 0,
         running: counts['running'] ?? 0,
@@ -163,6 +167,30 @@ export class TransitionService {
       startedAt: job.started_at,
       completedAt: job.completed_at,
     };
+  }
+
+  /**
+   * The records that failed and why, grouped by the batch that carried them.
+   *
+   * A batch applies whole or not at all, so a refusal fails all of it. This is
+   * how a caller finds the record to fix before re-running.
+   */
+  async failures(workspaceId: string, jobId: string, limit?: string) {
+    const job = await this.jobs.findById(workspaceId, jobId);
+    if (!job) throw new NotFoundException(`bulk job ${jobId} not found`);
+    const parsed = Number(limit ?? DEFAULT_LIMIT);
+    return this.jobs.failures(
+      workspaceId,
+      jobId,
+      Math.min(Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_LIMIT, MAX_LIMIT),
+    );
+  }
+
+  /** Per-batch progress, which is the unit the work is actually done in. */
+  async batches(workspaceId: string, jobId: string) {
+    const job = await this.jobs.findById(workspaceId, jobId);
+    if (!job) throw new NotFoundException(`bulk job ${jobId} not found`);
+    return this.jobs.batchSummary(workspaceId, jobId);
   }
 
   /**

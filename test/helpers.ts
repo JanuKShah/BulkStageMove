@@ -103,6 +103,81 @@ export async function destroyWorkspace(workspaceId: string): Promise<void> {
   await pool.query('DELETE FROM workspace WHERE id = $1', [workspaceId]);
 }
 
+/**
+ * Builds a job and one batch of items without publishing anything.
+ *
+ * The worker tests need a batch to exist without the running worker container
+ * picking it up, so this writes the job, the items and the outbox row directly
+ * and the tests call processBatch themselves. It deliberately mirrors what
+ * TransitionService.submit does - same columns, same from_stage snapshot - so a
+ * change to the submit path shows up here as a difference rather than as a
+ * silently stale fixture.
+ */
+export async function createJobWithItems(
+  workspaceId: string,
+  targetStageId: string,
+  opportunityIds: string[],
+  options: { enqueue?: boolean } = {},
+): Promise<{ jobId: string; batchNo: number; itemIds: string[] }> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const job = await client.query<{ id: string }>(
+      `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id)
+       VALUES ($1, $2, '{}'::jsonb, $3) RETURNING id`,
+      [workspaceId, `test-${randomUUID()}`, targetStageId],
+    );
+    const jobId = job.rows[0]!.id;
+
+    // from_stage_id snapshots where each record is now, exactly as submit does.
+    const items = await client.query<{ id: string }>(
+      `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, from_stage_id, batch_no)
+       SELECT $1, $2, o.id, o.stage_id, 0 FROM opportunity o
+        WHERE o.id = ANY($3::uuid[]) AND o.workspace_id = $2
+       RETURNING id`,
+      [jobId, workspaceId, opportunityIds],
+    );
+    const itemIds = items.rows.map((r) => r.id);
+
+    await client.query('UPDATE bulk_job SET total_matched = $2 WHERE id = $1', [
+      jobId,
+      itemIds.length,
+    ]);
+
+    if (options.enqueue !== false) {
+      await client.query(
+        `INSERT INTO bulk_job_outbox (workspace_id, job_id, batch_no, item_count)
+         VALUES ($1, $2, 0, $3)`,
+        [workspaceId, jobId, itemIds.length],
+      );
+    }
+    await client.query('COMMIT');
+    return { jobId, batchNo: 0, itemIds };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/** Creates opportunities straight in one stage, for worker fixtures. */
+export async function seedOpportunitiesInStage(
+  workspaceId: string,
+  stageId: string,
+  count: number,
+): Promise<string[]> {
+  if (count === 0) return [];
+  const { rows } = await pool.query<{ id: string }>(
+    `INSERT INTO opportunity (workspace_id, stage_id, name, value)
+     SELECT $1, $2, 'w-' || (row_number() over () || $3), 100
+       FROM generate_series(1, $4)
+     RETURNING id`,
+    [workspaceId, stageId, randomUUID(), count],
+  );
+  return rows.map((r) => r.id);
+}
+
 export async function createOpportunity(
   workspaceId: string,
   stageId: string,
