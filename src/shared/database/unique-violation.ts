@@ -1,17 +1,12 @@
 /**
  * Recognises a unique constraint violation, by constraint name.
  *
- * This exists because letting the violation escape as a 500 is wrong in both
- * directions: the caller learns nothing about what collided, and a 500 reads as
- * a server fault rather than a request that cannot be satisfied as written.
- *
- * The constraint is named rather than any unique violation, because one table
- * can carry several and mapping all of them to one response would misreport
- * what actually collided. It is also why this is a predicate and not a
- * converter: a duplicate means different things at different call sites. A
- * duplicate user email is a plain conflict, while a duplicate idempotency key
- * is either a harmless replay or a genuine conflict depending on what the
- * second request actually asked for.
+ * Letting one escape as a 500 reports a server fault when the server knows
+ * exactly what happened. The name is matched rather than any unique violation
+ * because one table can carry several, and this is a predicate rather than a
+ * converter because a duplicate means different things at different call sites:
+ * a taken user email is a plain conflict, while a repeated idempotency key is
+ * either a harmless replay or a genuine conflict depending on the request.
  */
 const PG_UNIQUE_VIOLATION = '23505';
 

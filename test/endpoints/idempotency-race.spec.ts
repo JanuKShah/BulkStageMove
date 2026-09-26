@@ -9,29 +9,20 @@ import {
 } from '../helpers';
 
 /**
- * What the idempotency key guarantees under concurrency, and what it does not.
+ * What the idempotency key does and does not guarantee under concurrency.
  *
- * HOLDS: one key creates exactly one job. bulk_job_workspace_idempotency_uniq is
- * what enforces this, not application logic, so no number of concurrent callers
- * can produce a second job or a double move. Verified repeatedly here.
+ * HOLDS: one key creates exactly one job, enforced by the constraint rather than
+ * by application logic, so no number of racers can double-apply.
  *
- * DOES NOT HOLD: the response to the callers that lose. The pre-check in
- * TransitionService.submit reads "not found" for every racer, one insert wins,
- * and the rest surface the raw constraint violation as a 500. A client retrying
- * under concurrency is told the server broke when in fact its request already
- * succeeded. Measured at 14/20 runs, four 5xx responses each.
+ * DOES NOT HOLD: the response to the callers that lose. The pre-check cannot see
+ * them, so they surface the raw constraint violation as a 500. Deferred to a
+ * distributed lock.
  *
- * There is deliberately no regression test for the 500s. The race window is
- * closed and reopened by scheduling, not by input: measured across 12 runs it
- * fires 92%, 67% and 83% of the time for 5, 10 and 20 concurrent callers, since
- * node's fetch pools about six connections per origin and the requests queue
- * rather than overlap. Forcing it to be reliable would mean adding a delay
- * between the pre-check and the insert in production code, purely to characterise
- * a defect that is deferred anyway. A test that fails 10% of builds is worse
- * than no test, because it teaches people to re-run instead of read.
- *
- * Serialising submissions properly is deferred to a distributed lock. When that
- * lands, this file should gain the status-code assertions it cannot hold today.
+ * There is deliberately no status-code test for those 500s. The race fires 92%,
+ * 67% and 83% of the time for 5, 10 and 20 callers, because node's fetch pools
+ * about six connections per origin and requests queue rather than overlap. A
+ * test that fails one build in ten is worse than none. Add the assertions here
+ * when the lock lands.
  */
 describe('concurrent submissions on one idempotency key', () => {
   let ws: TestWorkspace;
