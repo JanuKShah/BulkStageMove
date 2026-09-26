@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   BASE,
   api,
@@ -92,6 +93,81 @@ describe('user-service', () => {
       body: JSON.stringify({}),
     });
     expect(res.status).toBe(400);
+  });
+
+  describe('a duplicate email is a conflict with existing state, not a bad request', () => {
+    // 409, not 400: the request is well-formed and reasonable, it conflicts with
+    // a row that already exists. Not 422 either, because the payload is not
+    // semantically invalid - the database already holds a colliding row.
+    it('answers 409 for a second user with the same email in the workspace', async () => {
+      const email = 'dup@example.test';
+      const first = await api<unknown>(BASE.user, '/users', {
+        method: 'POST',
+        workspaceId: ws.workspaceId,
+        body: JSON.stringify({ name: 'First', email }),
+      });
+      expect(first.status).toBe(201);
+
+      const second = await api<{ message: string }>(BASE.user, '/users', {
+        method: 'POST',
+        workspaceId: ws.workspaceId,
+        body: JSON.stringify({ name: 'Second', email }),
+      });
+      expect(second.status).toBe(409);
+      // the message must scope the conflict to the workspace, not imply the
+      // address is taken platform-wide
+      expect(second.body.message).toMatch(/in this workspace/);
+    });
+
+    it('does not leak a 5xx under concurrent creates on one email', async () => {
+      const email = `race-${randomUUID()}@example.test`;
+      const responses = await Promise.all(
+        Array.from({ length: 6 }, () =>
+          api<unknown>(BASE.user, '/users', {
+            method: 'POST',
+            workspaceId: ws.workspaceId,
+            body: JSON.stringify({ name: 'Racer', email }),
+          }),
+        ),
+      );
+      expect(responses.every((r) => r.status < 500)).toBe(true);
+      expect(responses.filter((r) => r.status === 201)).toHaveLength(1);
+    });
+
+    it('allows the same email in a different workspace', async () => {
+      // The constraint is UNIQUE (workspace_id, email), not UNIQUE (email). One
+      // person can be a user in several tenants' workspaces, and a conflict here
+      // would break that.
+      const email = 'shared@example.test';
+      const mine = await api<unknown>(BASE.user, '/users', {
+        method: 'POST',
+        workspaceId: ws.workspaceId,
+        body: JSON.stringify({ name: 'Mine', email }),
+      });
+      expect(mine.status).toBe(201);
+
+      const other = await provisionWorkspace('email-scope');
+      const theirs = await api<unknown>(BASE.user, '/users', {
+        method: 'POST',
+        workspaceId: other.workspaceId,
+        body: JSON.stringify({ name: 'Theirs', email }),
+      });
+      expect(theirs.status).toBe(201);
+      await destroyWorkspace(other.workspaceId);
+    });
+
+    it('allows several users with no email at all', async () => {
+      // Postgres treats NULLs as distinct in a unique index, so users created
+      // without an address must not collide with each other.
+      for (const name of ['No email one', 'No email two']) {
+        const res = await api<unknown>(BASE.user, '/users', {
+          method: 'POST',
+          workspaceId: ws.workspaceId,
+          body: JSON.stringify({ name }),
+        });
+        expect(res.status).toBe(201);
+      }
+    });
   });
 
   it('GET /users lists only the calling workspace users', async () => {

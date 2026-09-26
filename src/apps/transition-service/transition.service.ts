@@ -74,6 +74,14 @@ export class TransitionService {
 
     // The key identifies one logical submission. Reusing it for a different
     // request is a client bug, so it is rejected rather than silently accepted.
+    //
+    // This pre-check cannot see concurrent duplicates: callers racing on the
+    // same key all read "not found" and only one insert wins, so the losers fall
+    // through to the unique constraint and surface as a 500. Serialising
+    // submissions properly is deferred to a distributed lock. Until then the
+    // data-layer guarantee still holds - the constraint prevents the double
+    // move - but the status code is wrong, which test/endpoints/idempotency-race
+    // .spec.ts records.
     const existing = await this.jobs.findByIdempotencyKey(workspaceId, key);
     if (existing) {
       const sameTarget = existing.target_stage_id === targetStageId;
