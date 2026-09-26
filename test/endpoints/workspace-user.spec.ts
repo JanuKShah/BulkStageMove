@@ -43,6 +43,11 @@ describe('workspace-service', () => {
     await pool.query('DELETE FROM workspace WHERE id = $1', [created.body.id]);
   });
 
+  it('GET /workspaces is not exposed, so tenants cannot be enumerated', async () => {
+    const res = await api<{ message: string }>(BASE.workspace, '/workspaces');
+    expect(res.status).toBe(404);
+  });
+
   it('GET /workspaces/:id returns 404 for an unknown uuid', async () => {
     const res = await api<{ message: string }>(
       BASE.workspace,

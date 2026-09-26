@@ -77,6 +77,18 @@ describe('tenant isolation is enforced by the database', () => {
     expect(rows[0]!.n).toBe(2);
   });
 
+  it('does not expose an endpoint that enumerates every workspace', async () => {
+    // A caller must never be able to discover the other tenants on the
+    // platform. This passed all 88 tests at one point while GET /workspaces
+    // happily returned every workspace, so it is pinned here explicitly.
+    for (const header of [a.workspaceId, b.workspaceId, '']) {
+      const res = await fetch(`${BASE.workspace}/workspaces`, {
+        headers: header === '' ? {} : { 'x-workspace-id': header },
+      });
+      expect(res.status).toBe(404);
+    }
+  });
+
   it('does not leak rows across workspaces when reading through the API', async () => {
     const created = await api<{ id: string }>(BASE.opportunity, '/opportunities', {
       method: 'POST',
