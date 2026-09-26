@@ -36,10 +36,11 @@ crosses.
 | NestJS 11 + Express | HTTP framework |
 | PostgreSQL 16 | datastore |
 | `pg` 8 | driver, raw SQL, no ORM |
+| RabbitMQ 4 + `amqplib` 2 | batch dispatch between services |
 | Jest + ts-jest | tests |
 | tsx | runs the migrate and seed scripts |
 | ESLint + Prettier | lint and format |
-| Docker Compose | 4 services + Postgres |
+| Docker Compose | 5 services + Postgres + RabbitMQ |
 
 ## Project setup
 
@@ -47,23 +48,25 @@ crosses.
 npm run verify     # up + seed + dump + test, the one command
 ```
 
-`npm run up` is `docker compose up -d --build --wait` — it starts the 4 services, runs
+`npm run up` is `docker compose up -d --build --wait` — it starts the services, runs
 migrations, and blocks until all are healthy. Use `docker compose up -d --build` directly
 if you prefer; it just returns before the healthchecks pass.
 
-Ports `3001` workspace, `3002` user, `3003` stage, `3004` opportunity. Tenant scoping via
-`X-Workspace-Id`.
+Ports `3001` workspace, `3002` user, `3003` stage, `3004` opportunity, `3005` bulk jobs.
+`5672` RabbitMQ, `15672` its management UI. Tenant scoping via `X-Workspace-Id`.
 
 ## Exploring it
 
 There is no UI, so two commands cover it. Both need the stack up.
 
-**CLI — call the API by hand.** Use it to try a filter, move an opportunity, or read a
-transition history.
+**CLI — call the API by hand.** Use it to try a filter, move an opportunity, submit a bulk
+move, or read a transition history.
 
 ```bash
 npm run cli                                       # interactive menu
 npm run cli -- opportunities --workspace=<uuid> --outcome=won --limit=20
+npm run cli -- bulk-move --workspace=<uuid> --to=<stageId> --outcome=won
+npm run cli -- job-status --workspace=<uuid> --id=<jobId>
 ```
 
 A workspace id is required. `npm run seed` prints them; there is no endpoint that lists

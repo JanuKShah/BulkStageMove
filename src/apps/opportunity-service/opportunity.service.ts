@@ -88,6 +88,68 @@ export class OpportunityService {
   }
 
   /**
+   * Move a whole batch in one request and one transaction.
+   *
+   * Two things make this affordable at 1000 records. The permitted targets are
+   * resolved once per distinct source stage rather than once per record - a
+   * batch spans at most as many stages as the pipeline has, so that is a
+   * handful of calls instead of a thousand. And the writes are set-based, so the
+   * cost is a few statements rather than two per record.
+   *
+   * Refusals are separated from the applied set and reported, not thrown. A
+   * refused move is a permanent answer - the rules forbid it - so it must not be
+   * retried by the job that hit it, while a transient failure has to roll the
+   * whole batch back so the retry sees the same input. Collapsing those two into
+   * one exception is what would make the retry logic wrong.
+   */
+  async bulkMove(
+    workspaceId: string,
+    ids: string[],
+    toStageId: string,
+    jobId: string | null = null,
+  ): Promise<{ moved: string[]; refused: string[]; missing: string[] }> {
+    const found = await this.repository.findByIds(workspaceId, ids);
+    const stageOf = new Map(found.map((o) => [o.id, o.stage_id]));
+
+    const sourceStages = [...new Set(found.map((o) => o.stage_id))];
+    const allowedFrom = new Map<string, Set<string>>();
+    for (const from of sourceStages) {
+      const { to } = await this.stages.post<{ to: string[] }>(
+        'stage',
+        '/stages/allowed-targets',
+        workspaceId,
+        { from },
+      );
+      allowedFrom.set(from, new Set(to));
+    }
+
+    const movable: { opportunityId: string; from: string }[] = [];
+    const refused: string[] = [];
+    for (const row of found) {
+      if (allowedFrom.get(row.stage_id)?.has(toStageId)) {
+        movable.push({ opportunityId: row.id, from: row.stage_id });
+      } else {
+        refused.push(row.id);
+      }
+    }
+    const missing = ids.filter((id) => !stageOf.has(id));
+
+    if (movable.length > 0) {
+      await this.database.transaction(async (client) => {
+        await this.repository.updateStages(
+          client,
+          workspaceId,
+          movable.map((m) => m.opportunityId),
+          toStageId,
+        );
+        await this.repository.insertTransitions(client, workspaceId, movable, toStageId, jobId);
+      });
+    }
+
+    return { moved: movable.map((m) => m.opportunityId), refused, missing };
+  }
+
+  /**
    * Resolve an outcome filter to the stage ids carrying it. One call to
    * stage-service per request, never per record - the bulk job filters on these
    * same dimensions across tens of thousands of rows, so per-row resolution

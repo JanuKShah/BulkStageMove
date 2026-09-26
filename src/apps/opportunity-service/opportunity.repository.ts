@@ -157,4 +157,50 @@ export class OpportunityRepository {
       )
       .then(() => undefined);
   }
+
+  /** One query for the whole batch, rather than one per record. */
+  async findByIds(workspaceId: string, ids: string[]): Promise<{ id: string; stage_id: string }[]> {
+    return this.db.query<{ id: string; stage_id: string }>(
+      'SELECT id, stage_id FROM opportunity WHERE workspace_id = $1 AND id = ANY($2::uuid[])',
+      [workspaceId, ids],
+    );
+  }
+
+  updateStages(
+    client: PoolClient,
+    workspaceId: string,
+    ids: string[],
+    stageId: string,
+  ): Promise<number> {
+    return client
+      .query(
+        `UPDATE opportunity SET stage_id = $1, updated_at = now()
+          WHERE workspace_id = $2 AND id = ANY($3::uuid[])`,
+        [stageId, workspaceId, ids],
+      )
+      .then((r) => r.rowCount ?? 0);
+  }
+
+  /**
+   * One insert for the whole batch. job_id is passed so the transitions a bulk
+   * job caused are attributable to it; manual moves leave it null.
+   */
+  insertTransitions(
+    client: PoolClient,
+    workspaceId: string,
+    rows: { opportunityId: string; from: string }[],
+    toStageId: string,
+    jobId: string | null,
+  ): Promise<number> {
+    if (rows.length === 0) return Promise.resolve(0);
+    return client
+      .query(
+        `INSERT INTO opportunity_transition
+           (workspace_id, opportunity_id, from_stage_id, to_stage_id, job_id)
+         SELECT $1, o, f, $2, $3::uuid
+           FROM unnest($4::uuid[], $5::uuid[]) AS t(o, f)`,
+        [workspaceId, toStageId, jobId, rows.map((r) => r.opportunityId), rows.map((r) => r.from)],
+      )
+      .then((r) => r.rowCount ?? 0);
+  }
 }

@@ -10,6 +10,7 @@ import { parseListFilter, type Outcome } from '../../shared/filter/opportunity-f
 import { BulkJob, BulkJobRepository } from './bulk-job.repository';
 import { BulkJobItemRepository } from './bulk-job-item.repository';
 import { JobTransitionRepository } from './job-transition.repository';
+import { OutboxRepository } from './outbox.repository';
 
 const PAGE_SIZE = 1000;
 const DEFAULT_LIMIT = 50;
@@ -37,6 +38,7 @@ export class TransitionService {
   constructor(
     private readonly jobs: BulkJobRepository,
     private readonly items: BulkJobItemRepository,
+    private readonly outbox: OutboxRepository,
     private readonly database: DatabaseService,
     private readonly stages: ServiceClient,
     private readonly jobTransitions: JobTransitionRepository,
@@ -105,19 +107,35 @@ export class TransitionService {
 
     let cursor: { createdAt: Date; id: string } | null = null;
     let itemsCreated = 0;
+    let batchNo = 0;
     for (;;) {
       const page = await this.items.page(workspaceId, resolved, cursor, PAGE_SIZE);
       if (page.length === 0) break;
 
       const ids = page.map((p) => p.id);
-      const inserted = await this.database.transaction((client) =>
-        this.items.insertPage(client, workspaceId, job.id, ids),
-      );
+      // Items and the intent to dispatch them commit together. Publishing here
+      // instead would leave a page of pending items that no worker is ever told
+      // about if the process dies first, and the job would never leave pending.
+      const inserted = await this.database.transaction(async (client) => {
+        const count = await this.items.insertPage(client, workspaceId, job.id, batchNo, ids);
+        if (count > 0) {
+          await this.outbox.enqueue(client, {
+            id: '',
+            workspace_id: workspaceId,
+            job_id: job.id,
+            batch_no: batchNo,
+            item_count: count,
+            attempts: 0,
+          });
+        }
+        return count;
+      });
       itemsCreated += inserted;
       await this.jobs.addToTotal(workspaceId, job.id, inserted);
 
       const last = page[page.length - 1]!;
       cursor = { createdAt: last.created_at, id: last.id };
+      batchNo += 1;
       if (page.length < PAGE_SIZE) break;
     }
 

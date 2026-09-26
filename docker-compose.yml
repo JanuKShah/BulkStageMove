@@ -138,5 +138,28 @@ services:
       timeout: 5s
       retries: 10
 
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    container_name: bsm-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: app_dev_password
+      RABBITMQ_DEFAULT_VHOST: /
+    ports:
+      - '5672:5672'
+      - '15672:15672'
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    healthcheck:
+      # rabbitmq-diagnostics is the broker's own readiness check; a TCP connect
+      # succeeds while the node is still booting and would gate too early.
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'check_running']
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
 volumes:
   pgdata:
+  rabbitdata:
+

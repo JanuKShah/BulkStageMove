@@ -117,13 +117,16 @@ describe('bulk job safety', () => {
       const job = await submitBulkMove(other.workspaceId, {
         targetStageId: other.stages['newLead'],
       });
+      // batch_no is supplied so the failure is the composite FK, not the
+      // NOT NULL on batch_no - otherwise a generic toThrow() passes for the
+      // wrong reason.
       await expect(
         pool.query(
-          `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id)
-           VALUES ($1, $2, $3)`,
+          `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, batch_no)
+           VALUES ($1, $2, $3, 0)`,
           [job.body.jobId, other.workspaceId, randomUUID()],
         ),
-      ).rejects.toThrow();
+      ).rejects.toThrow(/bulk_job_item_job_fk|foreign key/);
       await destroyWorkspace(other.workspaceId);
     });
 
@@ -135,8 +138,8 @@ describe('bulk job safety', () => {
       );
       await expect(
         pool.query(
-          `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id)
-           VALUES ($1, $2, $3)`,
+          `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, batch_no)
+           VALUES ($1, $2, $3, 0)`,
           [job.body.jobId, ws.workspaceId, rows[0]!.opportunity_id],
         ),
       ).rejects.toThrow(/bulk_job_item_job_opportunity_uniq/);

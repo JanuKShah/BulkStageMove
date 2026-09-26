@@ -5,6 +5,7 @@ import { HealthController } from '../../shared/health/health.controller';
 import { BulkJobItemRepository } from './bulk-job-item.repository';
 import { BulkJobRepository } from './bulk-job.repository';
 import { JobTransitionRepository } from './job-transition.repository';
+import { OutboxRepository } from './outbox.repository';
 import { TransitionController } from './transition.controller';
 import { TransitionService } from './transition.service';
 
@@ -15,6 +16,7 @@ import { TransitionService } from './transition.service';
     BulkJobRepository,
     BulkJobItemRepository,
     JobTransitionRepository,
+    OutboxRepository,
     DatabaseService,
     {
       provide: ServiceClient,

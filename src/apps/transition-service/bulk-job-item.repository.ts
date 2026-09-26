@@ -81,15 +81,52 @@ export class BulkJobItemRepository {
     client: PoolClient,
     workspaceId: string,
     jobId: string,
+    batchNo: number,
     opportunityIds: string[],
   ): Promise<number> {
     if (opportunityIds.length === 0) return 0;
     const result = await client.query(
-      `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id)
-       SELECT $1, $2, o FROM unnest($3::uuid[]) AS o
+      `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, batch_no)
+       SELECT $1, $2, o, $4 FROM unnest($3::uuid[]) AS o
        ON CONFLICT (job_id, opportunity_id) DO NOTHING`,
-      [jobId, workspaceId, opportunityIds],
+      [jobId, workspaceId, opportunityIds, batchNo],
     );
     return result.rowCount ?? 0;
+  }
+
+  /**
+   * Claims a batch by moving its pending items to running and returning the
+   * opportunities that were actually claimed.
+   *
+   * This is the whole concurrency story: the status='pending' predicate makes
+   * the claim a compare-and-set, so a redelivered or duplicated message claims
+   * nothing and does no work. It is why batch-level retry is safe even though
+   * completion is tracked per item - a retried batch skips what already finished.
+   *
+   * Back on that partial index, which is why it exists.
+   */
+  async claimBatch(
+    client: PoolClient,
+    workspaceId: string,
+    jobId: string,
+    batchNo: number,
+  ): Promise<string[]> {
+    const result = await client.query<{ opportunity_id: string }>(
+      `UPDATE bulk_job_item
+          SET status = 'running', attempts = attempts + 1, updated_at = now()
+        WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3 AND status = 'pending'
+        RETURNING opportunity_id`,
+      [jobId, batchNo, workspaceId],
+    );
+    return result.rows.map((r) => r.opportunity_id);
+  }
+
+  /** Resolves a claimed batch back to its item ids, for completion reporting. */
+  async itemIdsForBatch(workspaceId: string, jobId: string, batchNo: number): Promise<string[]> {
+    const rows = await this.db.query<{ id: string }>(
+      'SELECT id FROM bulk_job_item WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3',
+      [jobId, batchNo, workspaceId],
+    );
+    return rows.map((r) => r.id);
   }
 }
