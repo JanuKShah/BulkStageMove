@@ -15,7 +15,10 @@ export type BatchDisposition = 'applied' | 'skipped' | 'dead' | 'retry';
 
 export interface BatchResult {
   disposition: BatchDisposition;
+  /** Records this batch actually moved. */
   moved: number;
+  /** Records this batch gave up on, each with its own reason. */
+  failed: number;
   attempts: number;
   reason?: string;
 }
@@ -64,7 +67,7 @@ export class WorkerRepository {
         [key],
       );
       if (!lock.rows[0]?.locked) {
-        return { disposition: 'skipped', moved: 0, attempts: 0 };
+        return { disposition: 'skipped', moved: 0, failed: 0, attempts: 0 };
       }
       try {
         return await this.runOn(client, workspaceId, jobId, batchNo);
@@ -102,7 +105,9 @@ export class WorkerRepository {
     );
     await client.query('COMMIT');
 
-    if (claimed.rows.length === 0) return { disposition: 'skipped', moved: 0, attempts: 0 };
+    if (claimed.rows.length === 0) {
+      return { disposition: 'skipped', moved: 0, failed: 0, attempts: 0 };
+    }
     const attempts = claimed.rows[0]!.attempts;
 
     if (attempts > this.config.maxAttempts) {
@@ -113,52 +118,81 @@ export class WorkerRepository {
         batchNo,
         'attempts exhausted',
       );
-      return { disposition: 'dead', moved: 0, attempts, reason: `${failed} item(s) failed` };
+      return {
+        disposition: 'dead',
+        moved: 0,
+        failed,
+        attempts,
+        reason: `${failed} item(s) failed`,
+      };
     }
 
-    // --- the work, one transaction: all of it or none of it
+    // --- the work, one transaction. Per-record outcomes are committed together,
+    // so a batch never leaves half its records marked done and half pending.
     await client.query('BEGIN');
     try {
-      const moved = await this.applyOn(client, workspaceId, jobId, batchNo);
+      const result = await this.applyOn(client, workspaceId, jobId, batchNo);
       await client.query('COMMIT');
-      return { disposition: 'applied', moved, attempts };
+      return { disposition: 'applied', ...result, attempts };
     } catch (error) {
       await client.query('ROLLBACK');
       const reason = error instanceof Error ? error.message : 'unexpected worker failure';
-      // The attempt that spends the budget is the one that records the failure.
-      // Reporting 'dead' without writing it dead-letters the message and leaves
-      // the items running and the job pending, with nothing left to revisit it.
+      // Only reached for conditions that are not per-record: a lost job row, or
+      // a concurrent write. Those are worth retrying, and only the attempt that
+      // spends the budget records the failure - reporting 'dead' without writing
+      // it would dead-letter the message and leave the items running forever.
       if (attempts >= this.config.maxAttempts) {
         const failed = await this.failBatch(client, workspaceId, jobId, batchNo, reason);
         return {
           disposition: 'dead',
           moved: 0,
+          failed,
           attempts,
           reason: `${failed} item(s) failed: ${reason}`,
         };
       }
-      return { disposition: 'retry', moved: 0, attempts, reason };
+      return { disposition: 'retry', moved: 0, failed: 0, attempts, reason };
     }
   }
 
   /**
-   * Applies the batch, or throws so the transaction rolls back. There is no
-   * partial outcome: either every record is still in the stage the job found it
-   * and the move is permitted, and all of them land, or nothing does.
+   * Applies the batch, one record at a time.
+   *
+   * The batch is the unit of dispatch and of retry, not of atomicity. A record
+   * that cannot move, or that a user has moved by hand since submission, fails
+   * on its own and the rest of the batch still lands. Refusing the whole batch
+   * for one blocked record would mean a single unmovable deal in 50,000 leaves
+   * 49,999 untouched, which is not a useful bulk move.
+   *
+   * The three outcomes:
+   *   moved      - still in the stage the job found it, and the move is permitted
+   *   stale      - a user changed it since submission, so it is not overwritten
+   *   unmovable  - no transition rule permits the move
+   *
+   * Throws only for conditions that are not per-record: a missing job row, or a
+   * concurrent write that lands between the read and the write below. Both mean
+   * the transaction should roll back and the batch be retried, because there is
+   * no correct partial answer to give.
    */
   private async applyOn(
     client: PoolClient,
     workspaceId: string,
     jobId: string,
     batchNo: number,
-  ): Promise<number> {
-    const items = await client.query<{ opportunity_id: string; from_stage_id: string }>(
-      `SELECT opportunity_id, from_stage_id FROM bulk_job_item
-        WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3 AND status = 'running'`,
+  ): Promise<{ moved: number; failed: number }> {
+    const items = await client.query<{
+      opportunity_id: string;
+      from_stage_id: string;
+      current_stage_id: string | null;
+    }>(
+      `SELECT i.opportunity_id, i.from_stage_id, o.stage_id AS current_stage_id
+         FROM bulk_job_item i
+         LEFT JOIN opportunity o ON o.id = i.opportunity_id AND o.workspace_id = i.workspace_id
+        WHERE i.job_id = $1 AND i.batch_no = $2 AND i.workspace_id = $3 AND i.status = 'running'`,
       [jobId, batchNo, workspaceId],
     );
     const claimed = items.rows;
-    if (claimed.length === 0) return 0;
+    if (claimed.length === 0) return { moved: 0, failed: 0 };
 
     // The target comes from the job row, not the message, so a hand-crafted
     // message cannot redirect a batch.
@@ -177,62 +211,101 @@ export class WorkerRepository {
     );
     const permitted = new Set(rules.rows.map((r) => `${r.from_stage_id}->${r.to_stage_id}`));
 
-    // Refuse the whole batch rather than applying the part that would work, so
-    // the counts on bulk_job describe a batch and not a mixture of two.
-    const unmovable = claimed.filter((c) => !permitted.has(`${c.from_stage_id}->${targetId}`));
-    if (unmovable.length > 0) {
-      throw new BatchRejected(
-        `${unmovable.length} of ${claimed.length} cannot move to the target stage`,
+    const movable: { id: string; from: string }[] = [];
+    // Keyed by reason so each distinct cause is recorded on its own records.
+    const failures = new Map<string, string[]>();
+    const fail = (reason: string, id: string): void => {
+      const list = failures.get(reason);
+      if (list) list.push(id);
+      else failures.set(reason, [id]);
+    };
+
+    for (const item of claimed) {
+      if (item.current_stage_id === null) {
+        fail('opportunity no longer exists', item.opportunity_id);
+      } else if (item.current_stage_id !== item.from_stage_id) {
+        fail('changed stage since the job was submitted', item.opportunity_id);
+      } else if (!permitted.has(`${item.from_stage_id}->${targetId}`)) {
+        fail('no permitted transition to the target stage', item.opportunity_id);
+      } else {
+        movable.push({ id: item.opportunity_id, from: item.from_stage_id });
+      }
+    }
+
+    // Compare-and-swap per record, pairing each id with the stage it was
+    // expected to be in. Comparing against a set of stages would let a record
+    // that had been moved to a *different* member of that set slip through.
+    let movedCount = 0;
+    if (movable.length > 0) {
+      const moved = await client.query<{ id: string }>(
+        `UPDATE opportunity o
+            SET stage_id = $2, updated_at = now()
+           FROM unnest($3::uuid[], $4::uuid[]) AS t(id, from_stage)
+          WHERE o.workspace_id = $1 AND o.id = t.id AND o.stage_id = t.from_stage
+        RETURNING o.id`,
+        [workspaceId, targetId, movable.map((m) => m.id), movable.map((m) => m.from)],
+      );
+      movedCount = moved.rows.length;
+      if (movedCount !== movable.length) {
+        // Someone wrote between the read above and this update. Rolling back and
+        // retrying is the only honest answer: the next attempt re-reads and will
+        // classify those records correctly.
+        throw new BatchRejected(
+          `${movable.length - movedCount} record(s) changed stage during the batch`,
+        );
+      }
+    }
+
+    const failedCount = [...failures.values()].reduce((a, l) => a + l.length, 0);
+
+    if (movable.length > 0) {
+      await client.query(
+        `INSERT INTO opportunity_transition
+           (workspace_id, opportunity_id, from_stage_id, to_stage_id, job_id)
+         SELECT $1, t.id, t.from_stage, $3, $2
+           FROM unnest($4::uuid[], $5::uuid[]) AS t(id, from_stage)`,
+        [workspaceId, jobId, targetId, movable.map((m) => m.id), movable.map((m) => m.from)],
+      );
+
+      await client.query(
+        `UPDATE bulk_job_item
+            SET status = 'completed', completed_at = now(), updated_at = now()
+          WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3
+            AND status = 'running' AND opportunity_id = ANY($4::uuid[])`,
+        [jobId, batchNo, workspaceId, movable.map((m) => m.id)],
       );
     }
 
-    const moved = await client.query<{ id: string }>(
-      `UPDATE opportunity o
-          SET stage_id = j.target_stage_id, updated_at = now()
-         FROM bulk_job_item i, bulk_job j
-        WHERE i.job_id = $1 AND i.batch_no = $2 AND i.workspace_id = $3
-          AND i.status = 'running'
-          AND o.id = i.opportunity_id AND o.workspace_id = i.workspace_id
-          AND o.stage_id = i.from_stage_id
-          AND j.id = i.job_id AND j.workspace_id = i.workspace_id
-      RETURNING o.id`,
-      [jobId, batchNo, workspaceId],
-    );
-
-    if (moved.rows.length !== claimed.length) {
-      throw new BatchRejected(
-        `${claimed.length - moved.rows.length} record(s) changed stage since submission`,
+    for (const [reason, ids] of failures) {
+      await client.query(
+        `UPDATE bulk_job_item
+            SET status = 'failed', error = $4, completed_at = now(), updated_at = now()
+          WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3
+            AND status = 'running' AND opportunity_id = ANY($5::uuid[])`,
+        [jobId, batchNo, workspaceId, reason.slice(0, 500), ids],
       );
     }
-
-    await client.query(
-      `INSERT INTO opportunity_transition
-         (workspace_id, opportunity_id, from_stage_id, to_stage_id, job_id)
-       SELECT $3, i.opportunity_id, i.from_stage_id, $4, $1
-         FROM bulk_job_item i
-        WHERE i.job_id = $1 AND i.batch_no = $2 AND i.workspace_id = $3 AND i.status = 'running'`,
-      [jobId, batchNo, workspaceId, targetId],
-    );
-
-    await client.query(
-      `UPDATE bulk_job_item
-          SET status = 'completed', completed_at = now(), updated_at = now()
-        WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3 AND status = 'running'`,
-      [jobId, batchNo, workspaceId],
-    );
 
     await client.query(
       `UPDATE bulk_job
           SET processed_count = processed_count + $2,
+              failed_count = failed_count + $3,
               status = CASE WHEN status = 'pending' THEN 'running' ELSE status END,
               started_at = COALESCE(started_at, now()),
+              error = CASE WHEN $3 > 0 THEN $4::text ELSE error END,
               updated_at = now()
-        WHERE id = $1 AND workspace_id = $3`,
-      [jobId, moved.rows.length, workspaceId],
+        WHERE id = $1 AND workspace_id = $5`,
+      [
+        jobId,
+        movedCount,
+        failedCount,
+        [...failures.keys()].join('; ').slice(0, 500) || null,
+        workspaceId,
+      ],
     );
 
     await this.settleJob(client, workspaceId, jobId);
-    return moved.rows.length;
+    return { moved: movedCount, failed: failedCount };
   }
 
   /**
@@ -257,7 +330,7 @@ export class WorkerRepository {
       );
       await client.query(
         `UPDATE bulk_job
-            SET failed_count = failed_count + $2, error = $4, updated_at = now()
+            SET failed_count = failed_count + $2, error = $4::text, updated_at = now()
           WHERE id = $1 AND workspace_id = $3`,
         [jobId, failed.rowCount ?? 0, workspaceId, reason.slice(0, 500)],
       );
@@ -271,10 +344,16 @@ export class WorkerRepository {
   }
 
   /**
-   * Moves the job to a terminal state once nothing is left to do. The NOT EXISTS
-   * is evaluated under the same row lock as the update, so two workers finishing
-   * the last two batches cannot both conclude the job is finished and both write
-   * a terminal state.
+   * Moves the job to a terminal state once nothing is left to do.
+   *
+   * A job that moved 980 of 1,000 has completed, not failed: the work finished
+   * and the 20 exceptions are reported through failed_count and the failures
+   * endpoint. Calling that 'failed' would make a 40,000-of-50,000 job read as a
+   * total loss. Only a job where every record failed is 'failed'.
+   *
+   * The NOT EXISTS is evaluated under the same row lock as the update, so two
+   * workers finishing the last two batches cannot both conclude the job is
+   * finished and both write a terminal state.
    */
   private async settleJob(client: PoolClient, workspaceId: string, jobId: string): Promise<void> {
     await client.query(
@@ -283,7 +362,7 @@ export class WorkerRepository {
                 WHEN EXISTS (SELECT 1 FROM bulk_job_item i
                               WHERE i.job_id = j.id AND i.status IN ('pending','running'))
                   THEN 'running'
-                WHEN j.failed_count > 0 THEN 'failed'
+                WHEN j.processed_count = 0 AND j.failed_count > 0 THEN 'failed'
                 ELSE 'completed'
               END,
               completed_at = CASE

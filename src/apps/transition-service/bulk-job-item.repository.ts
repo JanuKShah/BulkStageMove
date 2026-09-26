@@ -40,8 +40,16 @@ export class BulkJobItemRepository {
     if (filter.createdFrom) add('created_at >= $?', filter.createdFrom);
     if (filter.createdTo) add('created_at <= $?', filter.createdTo);
     if (after) {
-      params.push(after.createdAt, after.id);
-      where += ` AND (created_at, id) > ($${params.length - 1}, $${params.length})`;
+      // The cursor's position is resolved by a subquery, never by binding
+      // after.createdAt. created_at is timestamptz and carries microseconds
+      // while a JS Date carries milliseconds, so binding it truncates the value:
+      // every remaining row then compares greater than the truncated cursor, the
+      // same page comes back for ever, and every insert conflicts. The job spins
+      // and reports completed having moved a fraction of what it matched.
+      params.push(after.id);
+      where += ` AND (created_at, id) > (
+        SELECT created_at, id FROM opportunity WHERE id = $${params.length} AND workspace_id = $1
+      )`;
     }
     params.push(limit);
 

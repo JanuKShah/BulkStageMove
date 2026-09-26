@@ -275,9 +275,10 @@ function renderJobStatus(reply: Reply): void {
   const done = (b.items['completed'] ?? 0) + (b.items['failed'] ?? 0);
   console.log(`  progress: ${done}/${b.totalMatched}  status=${b.status}`);
   if (b.error) console.log(`  error:    ${b.error}`);
-  if ((b.items['failed'] ?? 0) > 0) {
-    console.log('\n  a batch is applied whole or not at all, so one blocked record');
-    console.log('  fails every record in its batch. See them with: job-failures');
+  const failed = b.items['failed'] ?? 0;
+  if (failed > 0) {
+    console.log(`\n  ${failed} record(s) did not move and are listed individually.`);
+    console.log('  The rest of each batch still applied. See them with: job-failures');
   }
 }
 

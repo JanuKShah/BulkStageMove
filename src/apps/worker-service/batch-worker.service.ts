@@ -54,9 +54,8 @@ export class BatchWorker implements OnModuleInit, OnModuleDestroy {
       batch = JSON.parse(message.content.toString()) as BatchMessage;
     } catch {
       // Unparseable will never succeed on a retry, so it goes straight to the DLQ.
-      const result: BatchResult = { disposition: 'dead', moved: 0, attempts: 0 };
       await this.deadLetter(message);
-      return result;
+      return { disposition: 'dead', moved: 0, failed: 0, attempts: 0 };
     }
 
     let result: BatchResult;
@@ -67,7 +66,7 @@ export class BatchWorker implements OnModuleInit, OnModuleDestroy {
       // the attempt budget: a database outage should not be what dead-letters a
       // batch. The reason this is safe is that the lock is released and the
       // items are still pending, so a redelivery starts cleanly.
-      result = { disposition: 'retry', moved: 0, attempts: 0 };
+      result = { disposition: 'retry', moved: 0, failed: 0, attempts: 0 };
     }
 
     if (result.disposition === 'retry' || result.disposition === 'dead') {
