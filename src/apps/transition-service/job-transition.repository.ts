@@ -6,6 +6,8 @@ export interface JobTransition {
   opportunity_id: string;
   from_stage: string | null;
   to_stage: string;
+  from_stage_name: string | null;
+  to_stage_name: string;
   from_outcome: string | null;
   to_outcome: string;
   created_at: Date;
@@ -48,6 +50,7 @@ export class JobTransitionRepository {
 
     const rows = await this.db.query<JobTransition>(
       `SELECT t.id, t.opportunity_id, t.from_stage_id AS from_stage, t.to_stage_id AS to_stage,
+              fs.name AS from_stage_name, ts.name AS to_stage_name,
               fs.outcome AS from_outcome, ts.outcome AS to_outcome, t.created_at
        FROM opportunity_transition t
        LEFT JOIN stage fs ON fs.id = t.from_stage_id

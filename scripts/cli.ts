@@ -8,6 +8,7 @@
  *
  * Uses node:util parseArgs and node:readline, so it adds no dependency.
  */
+import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
@@ -19,6 +20,7 @@ const BASE = {
   user: process.env.USER_URL ?? 'http://localhost:3002',
   stage: process.env.STAGE_URL ?? 'http://localhost:3003',
   opportunity: process.env.OPPORTUNITY_URL ?? 'http://localhost:3004',
+  transition: process.env.TRANSITION_URL ?? 'http://localhost:3005',
 } as const;
 
 type Service = keyof typeof BASE;
@@ -169,6 +171,96 @@ async function cmdHealth(): Promise<Reply[]> {
   return results;
 }
 
+async function cmdJobStatus(jobId: string): Promise<Reply> {
+  return request('transition', `/bulk-moves/${jobId}`);
+}
+
+async function cmdJobTransitions(jobId: string, limit?: number): Promise<Reply> {
+  const qs = limit ? `?limit=${limit}` : '';
+  return request('transition', `/bulk-moves/${jobId}/transitions${qs}`);
+}
+
+async function cmdSubmitBulkMove(
+  targetStageId: string,
+  idempotencyKey: string,
+  filter: Record<string, unknown>,
+): Promise<Reply> {
+  return request('transition', '/bulk-moves', {
+    method: 'POST',
+    body: JSON.stringify({ idempotencyKey, targetStageId, ...filter }),
+  });
+}
+
+/** Prompts for the filter dimensions, skipping anything left blank. */
+async function promptFilter(): Promise<Record<string, unknown>> {
+  const filter: Record<string, unknown> = {};
+  const stageId = await askOptional('  stageId (comma separated ok)');
+  if (stageId) filter['stageId'] = stageId;
+  const ownerId = await askOptional('  ownerId');
+  if (ownerId) filter['ownerId'] = ownerId;
+  const outcome = await askOptional('  outcome (open|won|lost|abandoned)');
+  if (outcome) filter['outcome'] = outcome;
+  const minValue = await askNumber('  minValue');
+  if (minValue !== undefined) filter['minValue'] = minValue;
+  const maxValue = await askNumber('  maxValue');
+  if (maxValue !== undefined) filter['maxValue'] = maxValue;
+  const createdFrom = await askOptional('  createdFrom (ISO date)');
+  if (createdFrom) filter['createdFrom'] = createdFrom;
+  const createdTo = await askOptional('  createdTo (ISO date)');
+  if (createdTo) filter['createdTo'] = createdTo;
+  return filter;
+}
+
+/**
+ * Collects the filter flags into a body. minValue/maxValue become real JSON
+ * numbers rather than strings, because that is what a UI would send, and the
+ * parser is expected to handle both.
+ */
+function filterFromArgs(args: Record<string, string | undefined>): Record<string, unknown> {
+  const filter: Record<string, unknown> = {};
+  for (const key of ['stageId', 'ownerId', 'outcome', 'createdFrom', 'createdTo'] as const) {
+    const value = args[key];
+    if (value !== undefined) filter[key] = value;
+  }
+  for (const key of ['minValue', 'maxValue'] as const) {
+    const value = args[key];
+    if (value === undefined) continue;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) throw new Error(`${key} must be a number, got "${value}"`);
+    filter[key] = parsed;
+  }
+  return filter;
+}
+
+/** Renders a job's transitions. Shared so the two modes cannot drift. */
+function renderJobTransitions(reply: Reply): void {
+  if (reply.status >= 400) {
+    print(reply, 'job transitions');
+    return;
+  }
+  const body = reply.body as { items: Row[]; nextCursor: string | null };
+  table(
+    body.items.map((t) => ({
+      opportunity: String(t['opportunity_id']).slice(0, 8),
+      from: t['from_stage_name'] ? String(t['from_stage_name']) : '(new)',
+      to: String(t['to_stage_name']),
+      outcome: t['to_outcome'] ?? '',
+      at: String(t['created_at']).slice(0, 19),
+    })),
+    ['opportunity', 'from', 'to', 'outcome', 'at'],
+  );
+  console.log(`  nextCursor: ${body.nextCursor ?? '(none)'}`);
+}
+
+/** Renders a job's counts. Shared so the two modes cannot drift. */
+function renderJobStatus(reply: Reply): void {
+  print(reply, 'bulk job');
+  if (reply.status >= 400) return;
+  const b = reply.body as { status: string; totalMatched: number; items: Record<string, number> };
+  const done = (b.items['completed'] ?? 0) + (b.items['failed'] ?? 0);
+  console.log(`  progress: ${done}/${b.totalMatched}  status=${b.status}`);
+}
+
 async function cmdListOpportunities(args: Record<string, string | undefined>): Promise<Reply> {
   const params = new URLSearchParams();
   const map: Record<string, string> = {
@@ -290,6 +382,32 @@ const COMMANDS: Record<
     if (!id) throw new Error('a workspace id is required');
     return request('workspace', `/workspaces/${id}`, { workspaceId: null });
   },
+  'bulk-move': async (args) => {
+    if (!args.to)
+      throw new Error(
+        'usage: bulk-move --to=<stageId> [--stageId=..] [--outcome=..] [--minValue=..]',
+      );
+    const key = args.key ?? randomUUID();
+    console.log(`  idempotencyKey: ${key}`);
+    console.log('  reuse it to retry this exact submission safely');
+    const result = await cmdSubmitBulkMove(args.to, key, filterFromArgs(args));
+    print(result, 'bulk-moves');
+    if (result.status < 400) {
+      const body = result.body as { jobId?: string };
+      if (body.jobId)
+        console.log(`\n  follow it with:  npm run cli -- job-status --id=${body.jobId}`);
+    }
+  },
+  'job-status': async (args) => {
+    if (!args.id) throw new Error('usage: job-status --id=<uuid>');
+    renderJobStatus(await cmdJobStatus(args.id));
+  },
+  'job-transitions': async (args) => {
+    if (!args.id) throw new Error('usage: job-transitions --id=<uuid> [--limit=N]');
+    renderJobTransitions(
+      await cmdJobTransitions(args.id, args.limit ? Number(args.limit) : undefined),
+    );
+  },
   'dump-db': async (args) => {
     const out = args.out ?? 'db-state.txt';
     const sample = Number(args.sample);
@@ -351,6 +469,7 @@ const OPTION_SPEC = {
   out: { type: 'string' },
   sample: { type: 'string' },
   id: { type: 'string' },
+  key: { type: 'string' },
 } as const;
 
 async function runDirect(argv: string[]): Promise<void> {
@@ -500,6 +619,38 @@ async function interactiveMenu(): Promise<void> {
         const from = await askUuid('  from stageId: ');
         const to = await askUuid('  to stageId: ');
         void (await cmdCanMove(from, to));
+      },
+    },
+    {
+      key: 'bulk',
+      label: 'submit a bulk stage move',
+      run: async () => {
+        const targetStageId = await askUuid('  to stageId: ');
+        console.log('  filter - leave blank to match every opportunity in the workspace');
+        const filter = await promptFilter();
+        const key = await askOptional('  idempotency key (blank to generate)');
+        const result = await cmdSubmitBulkMove(targetStageId, key ?? randomUUID(), filter);
+        print(result, 'bulk-moves');
+        const body = result.body as { jobId?: string; replay?: boolean } | null;
+        if (result.status < 400 && body?.jobId) {
+          console.log(`  track it with:  job-status  ${body.jobId}`);
+        }
+      },
+    },
+    {
+      key: 'jobstatus',
+      label: 'check bulk job status',
+      run: async () => {
+        renderJobStatus(await cmdJobStatus(await askUuid('  job id: ')));
+      },
+    },
+    {
+      key: 'jobtrans',
+      label: 'view a bulk job transitions',
+      run: async () => {
+        const id = await askUuid('  job id: ');
+        const limit = await askNumber('  limit (blank = default)');
+        renderJobTransitions(await cmdJobTransitions(id, limit));
       },
     },
     {

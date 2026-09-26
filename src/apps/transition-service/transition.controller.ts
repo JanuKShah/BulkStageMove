@@ -17,6 +17,20 @@ type Headers_ = Record<string, string | string[] | undefined>;
 export class TransitionController {
   constructor(private readonly service: TransitionService) {}
 
+  /**
+   * Always 201, including when the key replays an existing job.
+   *
+   * A replay is not a lesser success: the job exists and the client is holding
+   * it, exactly as if this request had created it. Answering 200 on the retry
+   * would make the contract only half idempotent - the body would be stable
+   * while the status changed - and a client branching on the status would then
+   * behave differently on the retry path than on the original.
+   *
+   * Whether this call created the job or found it is reported as `replay` in the
+   * body, so the two facts are never carried by two channels that can disagree.
+   * The different-key-same-as-another-request case is a genuine 409 and is
+   * raised in the service.
+   */
   @Post()
   async submit(
     @Headers() headers: Headers_,
@@ -37,7 +51,6 @@ export class TransitionController {
       jobId: result.job.id,
       status: result.job.status,
       itemsCreated: result.itemsCreated,
-      // true means this key had already been used for the same request
       replay: !result.created,
     };
   }
