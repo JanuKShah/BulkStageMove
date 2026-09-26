@@ -11,6 +11,9 @@
  * several whole batches in the consumer's memory.
  */
 
+/** Injection token. Provided by a factory, because it is read from the env. */
+export const RABBIT_CONFIG = 'RABBIT_CONFIG';
+
 export interface RabbitConfig {
   url: string;
   exchange: string;

@@ -1,7 +1,7 @@
-import { Injectable, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { OutboxRepository } from './outbox.repository';
 import { RabbitBatchPublisher } from './rabbit-batch.publisher';
-import { rabbitConfig, type RabbitConfig } from '../../shared/rabbit/rabbit.config';
+import { RABBIT_CONFIG, type RabbitConfig } from '../../shared/rabbit/rabbit.config';
 
 export interface RelayStats {
   published: number;
@@ -31,7 +31,7 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly outbox: OutboxRepository,
     private readonly publisher: RabbitBatchPublisher,
-    private readonly config: RabbitConfig = rabbitConfig(),
+    @Inject(RABBIT_CONFIG) private readonly config: RabbitConfig,
   ) {}
 
   onModuleInit(): void {

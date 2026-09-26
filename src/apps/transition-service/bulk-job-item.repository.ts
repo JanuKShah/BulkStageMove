@@ -5,6 +5,7 @@ import type { ParsedFilter } from '../../shared/filter/opportunity-filter';
 
 export interface OpportunityRef {
   id: string;
+  stage_id: string;
   created_at: Date;
 }
 
@@ -45,7 +46,7 @@ export class BulkJobItemRepository {
     params.push(limit);
 
     return this.db.query<OpportunityRef>(
-      `SELECT id, created_at FROM opportunity WHERE ${where}
+      `SELECT id, stage_id, created_at FROM opportunity WHERE ${where}
        ORDER BY created_at, id LIMIT $${params.length}`,
       params,
     );
@@ -77,19 +78,20 @@ export class BulkJobItemRepository {
    * so the composite foreign keys can enforce that each opportunity belongs to
    * the job's tenant.
    */
+  /** Records each opportunity with the stage it is in right now, as the snapshot. */
   async insertPage(
     client: PoolClient,
     workspaceId: string,
     jobId: string,
     batchNo: number,
-    opportunityIds: string[],
+    refs: { id: string; stage_id: string }[],
   ): Promise<number> {
-    if (opportunityIds.length === 0) return 0;
+    if (refs.length === 0) return 0;
     const result = await client.query(
-      `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, batch_no)
-       SELECT $1, $2, o, $4 FROM unnest($3::uuid[]) AS o
+      `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, from_stage_id, batch_no)
+       SELECT $1, $2, o, s, $4 FROM unnest($3::uuid[], $5::uuid[]) AS t(o, s)
        ON CONFLICT (job_id, opportunity_id) DO NOTHING`,
-      [jobId, workspaceId, opportunityIds, batchNo],
+      [jobId, workspaceId, refs.map((r) => r.id), batchNo, refs.map((r) => r.stage_id)],
     );
     return result.rowCount ?? 0;
   }

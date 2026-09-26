@@ -112,12 +112,12 @@ export class TransitionService {
       const page = await this.items.page(workspaceId, resolved, cursor, PAGE_SIZE);
       if (page.length === 0) break;
 
-      const ids = page.map((p) => p.id);
+      const refs = page.map((p) => ({ id: p.id, stage_id: p.stage_id }));
       // Items and the intent to dispatch them commit together. Publishing here
       // instead would leave a page of pending items that no worker is ever told
       // about if the process dies first, and the job would never leave pending.
       const inserted = await this.database.transaction(async (client) => {
-        const count = await this.items.insertPage(client, workspaceId, job.id, batchNo, ids);
+        const count = await this.items.insertPage(client, workspaceId, job.id, batchNo, refs);
         if (count > 0) {
           await this.outbox.enqueue(client, {
             id: '',

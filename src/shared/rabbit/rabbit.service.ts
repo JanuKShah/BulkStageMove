@@ -1,6 +1,6 @@
-import { Injectable, type OnModuleDestroy } from '@nestjs/common';
+import { Inject, Injectable, type OnModuleDestroy } from '@nestjs/common';
 import amqp, { type Channel, type ChannelModel, type ConfirmChannel } from 'amqplib';
-import { rabbitConfig, type RabbitConfig } from './rabbit.config';
+import { RABBIT_CONFIG, type RabbitConfig } from './rabbit.config';
 
 /** amqplib takes the heartbeat as a URL parameter, not as a socket option. */
 function withHeartbeat(url: string, seconds: number): string {
@@ -26,7 +26,7 @@ export class RabbitService implements OnModuleDestroy {
   private publisher: ConfirmChannel | null = null;
   private connecting: Promise<ChannelModel> | null = null;
 
-  constructor(readonly config: RabbitConfig = rabbitConfig()) {}
+  constructor(@Inject(RABBIT_CONFIG) readonly config: RabbitConfig) {}
 
   private async connect(): Promise<ChannelModel> {
     if (this.connection) return this.connection;
@@ -118,7 +118,9 @@ export class RabbitService implements OnModuleDestroy {
   retryQueueFor(attempt: number): string {
     const delays = this.config.retryDelaysMs;
     const index = Math.min(Math.max(attempt - 1, 0), delays.length - 1);
-    return delays.length === 1 ? this.config.retryQueue : `${this.config.retryQueue}.${delays[index]}`;
+    return delays.length === 1
+      ? this.config.retryQueue
+      : `${this.config.retryQueue}.${delays[index]}`;
   }
 
   async onModuleDestroy(): Promise<void> {

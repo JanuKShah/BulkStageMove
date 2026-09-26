@@ -5,7 +5,11 @@ import { HealthController } from '../../shared/health/health.controller';
 import { BulkJobItemRepository } from './bulk-job-item.repository';
 import { BulkJobRepository } from './bulk-job.repository';
 import { JobTransitionRepository } from './job-transition.repository';
+import { OutboxRelay } from './outbox-relay';
 import { OutboxRepository } from './outbox.repository';
+import { RabbitBatchPublisher } from './rabbit-batch.publisher';
+import { RabbitService } from '../../shared/rabbit/rabbit.service';
+import { RABBIT_CONFIG, rabbitConfig } from '../../shared/rabbit/rabbit.config';
 import { TransitionController } from './transition.controller';
 import { TransitionService } from './transition.service';
 
@@ -17,7 +21,11 @@ import { TransitionService } from './transition.service';
     BulkJobItemRepository,
     JobTransitionRepository,
     OutboxRepository,
+    OutboxRelay,
+    RabbitBatchPublisher,
+    RabbitService,
     DatabaseService,
+    { provide: RABBIT_CONFIG, useFactory: () => rabbitConfig() },
     {
       provide: ServiceClient,
       useFactory: () =>

@@ -14,6 +14,7 @@ name: bulk-stage-move
 
 x-db-env: &db-env
   DATABASE_URL: postgres://app:app_dev_password@postgres:5432/bulk_stage_move
+  # 6 processes x 10 = 60 against max_connections 100. Raise with care.
   PG_POOL_MAX: 10
 
 x-service-base: &service-base
@@ -57,6 +58,7 @@ services:
     environment:
       <<: *db-env
       PORT: 3001
+      PG_APP_NAME: workspace-service
     ports:
       - '3001:3001'
     healthcheck:
@@ -70,6 +72,7 @@ services:
     environment:
       <<: *db-env
       PORT: 3002
+      PG_APP_NAME: user-service
     ports:
       - '3002:3002'
     healthcheck:
@@ -83,6 +86,7 @@ services:
     environment:
       <<: *db-env
       PORT: 3003
+      PG_APP_NAME: stage-service
     ports:
       - '3003:3003'
     healthcheck:
@@ -96,6 +100,7 @@ services:
     environment:
       <<: *db-env
       PORT: 3004
+      PG_APP_NAME: opportunity-service
       STAGE_SERVICE_URL: http://stage-service:3003
       USER_SERVICE_URL: http://user-service:3002
       WORKSPACE_SERVICE_URL: http://workspace-service:3001
@@ -112,14 +117,45 @@ services:
     environment:
       <<: *db-env
       PORT: 3005
+      PG_APP_NAME: transition-service
       STAGE_SERVICE_URL: http://stage-service:3003
       USER_SERVICE_URL: http://user-service:3002
       WORKSPACE_SERVICE_URL: http://workspace-service:3001
+      RABBITMQ_URL: amqp://app:app_dev_password@rabbitmq:5672/%2f
     ports:
       - '3005:3005'
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     healthcheck:
       <<: *healthcheck
       test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3005/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+
+  # Consumes batches and writes them to the database. No HTTP surface and no
+  # health endpoint, so readiness is the consumer having subscribed - a process
+  # that cannot reach the broker exits and is restarted.
+  worker-service:
+    build:
+      context: .
+      target: runtime
+    container_name: bsm-worker
+    command: ["node", "dist/apps/worker-service/main.js"]
+    environment:
+      <<: *db-env
+      RABBITMQ_URL: amqp://app:app_dev_password@rabbitmq:5672/%2f
+      PG_APP_NAME: worker-service
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
 
   postgres:
     image: postgres:16-alpine

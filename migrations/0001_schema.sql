@@ -141,6 +141,11 @@ CREATE TABLE bulk_job (
 -- submission. That is what makes resume trivial - there is no cursor to keep
 -- consistent, because every item carries its own outcome.
 --
+-- from_stage_id is the stage the opportunity sat in when the job was submitted,
+-- not when the worker reaches it. The worker compare-and-swaps on it, so a
+-- record a user has moved by hand since submission is reported stale rather
+-- than silently overwritten.
+--
 -- batch_no names the 1000-record page the item was submitted in, because the
 -- page is the unit of dispatch and of retry. UNIQUE (job_id, opportunity_id)
 -- means batches are disjoint, so two workers on one job cannot collide and a
@@ -150,6 +155,7 @@ CREATE TABLE bulk_job_item (
     job_id         uuid        NOT NULL,
     workspace_id   uuid        NOT NULL,
     opportunity_id uuid        NOT NULL,
+    from_stage_id  uuid        NOT NULL,
     batch_no       integer     NOT NULL,
     status         text        NOT NULL DEFAULT 'pending',
     attempts       integer     NOT NULL DEFAULT 0,
@@ -166,7 +172,17 @@ CREATE TABLE bulk_job_item (
         REFERENCES bulk_job (id, workspace_id) ON DELETE CASCADE,
     CONSTRAINT bulk_job_item_opportunity_fk
         FOREIGN KEY (opportunity_id, workspace_id)
-        REFERENCES opportunity (id, workspace_id) ON DELETE CASCADE
+        REFERENCES opportunity (id, workspace_id) ON DELETE CASCADE,
+    -- DEFERRABLE, because from_stage_id is history rather than a live pointer.
+    -- Deleting a workspace cascades to both stage and bulk_job_item, and an
+    -- immediate check on either ordering fails: RESTRICT trips before the
+    -- cascade reaches the job items, NO ACTION still trips mid-cascade.
+    -- Deferred to commit, both are gone and the check passes. Tenant deletion
+    -- depends on this, not just test teardown.
+    CONSTRAINT bulk_job_item_from_stage_fk
+        FOREIGN KEY (from_stage_id, workspace_id)
+        REFERENCES stage (id, workspace_id) ON DELETE NO ACTION
+        DEFERRABLE INITIALLY DEFERRED
 );
 
 -- The dispatch outbox. A page of items and the intent to publish it commit

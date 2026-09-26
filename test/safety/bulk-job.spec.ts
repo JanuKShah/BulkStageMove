@@ -117,14 +117,18 @@ describe('bulk job safety', () => {
       const job = await submitBulkMove(other.workspaceId, {
         targetStageId: other.stages['newLead'],
       });
-      // batch_no is supplied so the failure is the composite FK, not the
-      // NOT NULL on batch_no - otherwise a generic toThrow() passes for the
-      // wrong reason.
+      // batch_no and from_stage_id are supplied so the failure is the composite
+      // FK, not a NOT NULL violation - otherwise a generic toThrow() passes for
+      // the wrong reason.
+      const { rows: stageRows } = await pool.query<{ id: string }>(
+        'SELECT id FROM stage WHERE workspace_id = $1 LIMIT 1',
+        [other.workspaceId],
+      );
       await expect(
         pool.query(
-          `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, batch_no)
-           VALUES ($1, $2, $3, 0)`,
-          [job.body.jobId, other.workspaceId, randomUUID()],
+          `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, from_stage_id, batch_no)
+           VALUES ($1, $2, $3, $4, 0)`,
+          [job.body.jobId, other.workspaceId, randomUUID(), stageRows[0]!.id],
         ),
       ).rejects.toThrow(/bulk_job_item_job_fk|foreign key/);
       await destroyWorkspace(other.workspaceId);
@@ -132,15 +136,15 @@ describe('bulk job safety', () => {
 
     it('refuses the same opportunity twice in one job, so a job cannot double-apply', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
-      const { rows } = await pool.query<{ opportunity_id: string }>(
-        'SELECT opportunity_id FROM bulk_job_item WHERE job_id = $1 LIMIT 1',
+      const { rows } = await pool.query<{ opportunity_id: string; from_stage_id: string }>(
+        'SELECT opportunity_id, from_stage_id FROM bulk_job_item WHERE job_id = $1 LIMIT 1',
         [job.body.jobId],
       );
       await expect(
         pool.query(
-          `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, batch_no)
-           VALUES ($1, $2, $3, 0)`,
-          [job.body.jobId, ws.workspaceId, rows[0]!.opportunity_id],
+          `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, from_stage_id, batch_no)
+           VALUES ($1, $2, $3, $4, 0)`,
+          [job.body.jobId, ws.workspaceId, rows[0]!.opportunity_id, rows[0]!.from_stage_id],
         ),
       ).rejects.toThrow(/bulk_job_item_job_opportunity_uniq/);
     });
