@@ -29,7 +29,7 @@ describe('opportunity-service', () => {
     const user = await api<{ id: string }>(BASE.user, '/users', {
       method: 'POST',
       workspaceId: ws.workspaceId,
-      body: JSON.stringify({ name: 'Owner One' }),
+      body: JSON.stringify({ name: 'Owner One', email: 'owner-one@opps.test' }),
     });
     ownerId = user.body.id;
   });

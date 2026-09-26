@@ -36,8 +36,8 @@ describe('tenant isolation is enforced by the database', () => {
 
   it('refuses an opportunity owned by a user from another workspace', async () => {
     const { rows } = await pool.query<{ id: string }>(
-      'INSERT INTO app_user (workspace_id, name) VALUES ($1, $2) RETURNING id',
-      [a.workspaceId, 'owner-in-a'],
+      'INSERT INTO app_user (workspace_id, name, email) VALUES ($1, $2, $3) RETURNING id',
+      [a.workspaceId, 'owner-in-a', 'owner-in-a@tenant.test'],
     );
     await expect(
       pool.query(

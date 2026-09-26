@@ -96,9 +96,9 @@ describe('user-service', () => {
   });
 
   describe('a duplicate email is a conflict with existing state, not a bad request', () => {
-    // 409, not 400: the request is well-formed and reasonable, it conflicts with
-    // a row that already exists. Not 422 either, because the payload is not
-    // semantically invalid - the database already holds a colliding row.
+    // 409, not 400: the request is well-formed, it conflicts with a row that
+    // already exists. Not 422 either - the payload is not semantically invalid,
+    // the database already holds a colliding row.
     it('answers 409 for a second user with the same email in the workspace', async () => {
       const email = 'dup@example.test';
       const first = await api<unknown>(BASE.user, '/users', {
@@ -156,17 +156,28 @@ describe('user-service', () => {
       await destroyWorkspace(other.workspaceId);
     });
 
-    it('allows several users with no email at all', async () => {
-      // Postgres treats NULLs as distinct in a unique index, so users created
-      // without an address must not collide with each other.
-      for (const name of ['No email one', 'No email two']) {
-        const res = await api<unknown>(BASE.user, '/users', {
+    it('requires an email, because a user the platform cannot reach is not a user', async () => {
+      // NOT NULL, so UNIQUE (workspace_id, email) has one meaning: NULLs are
+      // distinct, so nullable email let nameless users coexist unjudged.
+      for (const body of [{ name: 'No email' }, { name: 'Blank email', email: '   ' }]) {
+        const res = await api<{ message: string }>(BASE.user, '/users', {
           method: 'POST',
           workspaceId: ws.workspaceId,
-          body: JSON.stringify({ name }),
+          body: JSON.stringify(body),
         });
-        expect(res.status).toBe(201);
+        expect(res.status).toBe(400);
+        expect(res.body.message).toMatch(/email is required/);
       }
+    });
+
+    it('trims the stored address rather than storing the padding', async () => {
+      const res = await api<{ email: string }>(BASE.user, '/users', {
+        method: 'POST',
+        workspaceId: ws.workspaceId,
+        body: JSON.stringify({ name: 'Padded', email: '  padded@example.test  ' }),
+      });
+      expect(res.status).toBe(201);
+      expect(res.body.email).toBe('padded@example.test');
     });
   });
 

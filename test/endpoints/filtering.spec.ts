@@ -43,14 +43,17 @@ describe('GET /opportunities filtering', () => {
     wsId.value = ws.workspaceId;
     stages = ws.stages;
 
-    const mk = async (name: string) =>
-      (
+    let seq = 0;
+    const mk = async (name: string) => {
+      seq += 1;
+      return (
         await api<{ id: string }>(BASE.user, '/users', {
           method: 'POST',
           workspaceId: wsId.value,
-          body: JSON.stringify({ name }),
+          body: JSON.stringify({ name, email: `owner-${seq}@filter.test` }),
         })
       ).body.id;
+    };
     ownerA = await mk('Owner A');
     ownerB = await mk('Owner B');
 

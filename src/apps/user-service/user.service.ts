@@ -23,13 +23,15 @@ export class UserService {
   ): Promise<User> {
     const trimmed = name?.trim();
     if (!trimmed) throw new BadRequestException('name is required');
+    const address = email?.trim();
+    if (!address) throw new BadRequestException('email is required');
     try {
-      return await this.repository.create(workspaceId, trimmed, email ?? null);
+      return await this.repository.create(workspaceId, trimmed, address);
     } catch (error) {
       // The constraint is the authority, not a pre-check: two concurrent creates
       // with the same address can both pass a lookup, and only one can win.
       if (isUniqueViolation(error, EMAIL_UNIQUE)) {
-        throw new ConflictException(`email ${email} is already in use in this workspace`);
+        throw new ConflictException(`email ${address} is already in use in this workspace`);
       }
       throw error;
     }
