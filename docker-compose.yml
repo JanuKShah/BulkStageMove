@@ -5,22 +5,51 @@ name: bulk-stage-move
 # src/shared/database/database.service.ts for why the composite foreign keys that
 # enforce tenant isolation require it.
 #
-# One instance of each service. Services address each other by service name on
-# the compose network, not by published port.
+# Startup order is enforced, not hoped for: the `migrate` job runs to completion
+# first, and only then do the services start. Migrations are idempotent, so this
+# is safe on every `up`.
+#
+# Seeding is deliberately NOT automatic - it truncates, and `up` should not be
+# destructive. Use `npm run verify` for the full documented flow.
+
+x-db-env: &db-env
+  DATABASE_URL: postgres://app:app_dev_password@postgres:5432/bulk_stage_move
+  PG_POOL_MAX: 10
 
 x-service-base: &service-base
   build:
     context: .
     target: runtime
   depends_on:
+    migrate:
+      condition: service_completed_successfully
     postgres:
       condition: service_healthy
   restart: unless-stopped
-  environment: &db-env
-    DATABASE_URL: postgres://app:app_dev_password@postgres:5432/bulk_stage_move
-    PG_POOL_MAX: 10
+  environment: *db-env
+
+x-healthcheck: &healthcheck
+  # Readiness, not liveness: a database blip should stop traffic reaching this
+  # instance, not cause a restart loop across all four services.
+  test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:PORT/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  # migrations must land before the first probe is meaningful
+  start_period: 20s
 
 services:
+  migrate:
+    build:
+      context: .
+      target: migrate
+    container_name: bsm-migrate
+    environment: *db-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
   workspace-service:
     <<: *service-base
     container_name: bsm-workspace
@@ -28,16 +57,11 @@ services:
     environment:
       <<: *db-env
       PORT: 3001
-    # Readiness, not liveness: a database blip should stop traffic reaching this
-    # instance, not cause a restart loop across all four services.
-    healthcheck:
-      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3001/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
     ports:
       - '3001:3001'
+    healthcheck:
+      <<: *healthcheck
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3001/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
 
   user-service:
     <<: *service-base
@@ -46,16 +70,11 @@ services:
     environment:
       <<: *db-env
       PORT: 3002
-    # Readiness, not liveness: a database blip should stop traffic reaching this
-    # instance, not cause a restart loop across all four services.
-    healthcheck:
-      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3002/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
     ports:
       - '3002:3002'
+    healthcheck:
+      <<: *healthcheck
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3002/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
 
   stage-service:
     <<: *service-base
@@ -64,16 +83,11 @@ services:
     environment:
       <<: *db-env
       PORT: 3003
-    # Readiness, not liveness: a database blip should stop traffic reaching this
-    # instance, not cause a restart loop across all four services.
-    healthcheck:
-      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3003/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
     ports:
       - '3003:3003'
+    healthcheck:
+      <<: *healthcheck
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3003/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
 
   opportunity-service:
     <<: *service-base
@@ -85,16 +99,11 @@ services:
       STAGE_SERVICE_URL: http://stage-service:3003
       USER_SERVICE_URL: http://user-service:3002
       WORKSPACE_SERVICE_URL: http://workspace-service:3001
-    # Readiness, not liveness: a database blip should stop traffic reaching this
-    # instance, not cause a restart loop across all four services.
-    healthcheck:
-      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3004/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
     ports:
       - '3004:3004'
+    healthcheck:
+      <<: *healthcheck
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3004/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
 
   postgres:
     image: postgres:16-alpine

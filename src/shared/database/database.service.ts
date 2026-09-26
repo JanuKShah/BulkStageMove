@@ -48,8 +48,14 @@ export class DatabaseService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Readiness check. It touches a real table rather than running a bare
+   * SELECT 1, because SELECT 1 succeeds against an empty database and would
+   * report a freshly started stack as healthy while every endpoint returns 500
+   * for a missing schema. This fails until migrations have run.
+   */
   async ping(): Promise<void> {
-    await this.pool.query('SELECT 1');
+    await this.pool.query('SELECT 1 FROM workspace LIMIT 1');
   }
 
   async onModuleDestroy(): Promise<void> {

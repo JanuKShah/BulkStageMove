@@ -10,14 +10,12 @@ import { createHash } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Pool } from 'pg';
+import { databaseUrl } from './env';
 
 const MIGRATIONS_DIR = path.join(__dirname, '..', 'migrations');
 
 async function main(): Promise<void> {
-  const connectionString = process.env.DATABASE_URL;
-  if (!connectionString) {
-    throw new Error('DATABASE_URL is not set. Copy .env.example to .env first.');
-  }
+  const connectionString = databaseUrl();
 
   const pool = new Pool({ connectionString, max: 1 });
 

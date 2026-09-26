@@ -15,6 +15,7 @@
  *   npm run seed -- --scale=large --seed=42
  */
 import { Pool } from 'pg';
+import { databaseUrl } from './env';
 
 const STAGES: ReadonlyArray<{ name: string; weight: number; outcome: Outcome }> = [
   { name: 'New Lead', weight: 22, outcome: 'open' },
@@ -83,9 +84,7 @@ function pickStageIndex(rand: () => number, cumulative: readonly number[]): numb
 }
 
 async function main(): Promise<void> {
-  const connectionString = process.env.DATABASE_URL;
-  if (!connectionString)
-    throw new Error('DATABASE_URL is not set. Copy .env.example to .env first.');
+  const connectionString = databaseUrl();
 
   const { scale, seed } = parseArgs();
   const { largeWorkspace, smallWorkspace } = SCALES[scale];

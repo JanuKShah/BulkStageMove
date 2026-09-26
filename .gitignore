@@ -42,6 +42,9 @@ seeds/
 /tmp/
 .cache/
 
+# Generated database state snapshot, rewritten by `npm run dump`.
+db-state*.txt
+
 # ---------- docker ----------
 docker-compose.override.yml
 
