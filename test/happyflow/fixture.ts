@@ -10,7 +10,21 @@ import { pool } from '../helpers';
  * the job is genuinely movable and the job is not refused for a reason that has
  * nothing to do with scale.
  */
-export const HAPPY_FLOW_SIZE = 50_000;
+/**
+ * The brief's scale is 50,000. Override with BENCH_SIZE to measure past it -
+ * 500,000 is ten times the brief and is there to find where the design bends,
+ * not because it is required. The spec asserts against this value, so the tests
+ * only change shape when the override is deliberately set.
+ */
+export const HAPPY_FLOW_SIZE = (() => {
+  const raw = process.env.BENCH_SIZE;
+  if (raw === undefined || raw.trim() === '') return 50_000;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`BENCH_SIZE must be a positive integer, got "${raw}"`);
+  }
+  return parsed;
+})();
 const MARGIN = 2_000;
 
 export interface HappyFlowWorkspace {

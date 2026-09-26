@@ -63,7 +63,7 @@ function line(label: string, value: string): void {
 }
 
 async function main(): Promise<void> {
-  console.log(`building a ${HAPPY_FLOW_SIZE.toLocaleString()} opportunity fixture...`);
+  console.log(`building a ${HAPPY_FLOW_SIZE.toLocaleString('en-US')} opportunity fixture...`);
   const buildStart = Date.now();
   const ws = await createHappyFlowWorkspace('bench');
   line('fixture built in', ms(Date.now() - buildStart));
@@ -81,7 +81,7 @@ async function main(): Promise<void> {
     return;
   }
   const created = JSON.parse(submitted.body) as { jobId: string; itemsCreated: number };
-  line('items created', created.itemsCreated.toLocaleString());
+  line('items created', created.itemsCreated.toLocaleString('en-US'));
   line('SUBMISSION LATENCY (returns job id)', ms(submitted.ms));
   const jobId = created.jobId;
 
@@ -103,13 +103,13 @@ async function main(): Promise<void> {
   line('job status', final.status);
   line(
     'processed / failed',
-    `${final.processed_count.toLocaleString()} / ${final.failed_count.toLocaleString()}`,
+    `${final.processed_count.toLocaleString('en-US')} / ${final.failed_count.toLocaleString('en-US')}`,
   );
   line('END-TO-END after submission', ms(endToEndMs));
   line('END-TO-END from submit', ms(endToEndMs + submitted.ms));
   line(
     'throughput',
-    `${Math.round(final.processed_count / (endToEndMs / 1000)).toLocaleString()} opportunities/sec`,
+    `${Math.round(final.processed_count / (endToEndMs / 1000)).toLocaleString('en-US')} opportunities/sec`,
   );
 
   // Per-batch completion, read off the batch rows. A batch has one completed_at
@@ -163,9 +163,9 @@ async function main(): Promise<void> {
   );
   if (perItem.length > 0) {
     console.log(
-      `\nPER-OPPORTUNITY latency, submit to moved (${perItem[0]!.n.toLocaleString()} records)`,
+      `\nPER-OPPORTUNITY latency, submit to moved (${perItem[0]!.n.toLocaleString('en-US')} records)`,
     );
-    line('distinct timestamps', perItem[0]!.distinct_ts.toLocaleString());
+    line('distinct timestamps', perItem[0]!.distinct_ts.toLocaleString('en-US'));
     console.log(
       '  one per batch: a batch applies in one transaction, so its 1,000 records\n' +
         '  share a created_at. Percentiles over the expanded set are the batch\n' +
