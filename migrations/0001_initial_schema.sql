@@ -83,5 +83,23 @@ CREATE TABLE opportunity (
         FOREIGN KEY (stage_id, workspace_id) REFERENCES stage (id, workspace_id) ON DELETE RESTRICT,
     -- owner_id must belong to the same workspace as the opportunity
     CONSTRAINT opportunity_owner_fk
-        FOREIGN KEY (owner_id, workspace_id) REFERENCES app_user (id, workspace_id) ON DELETE SET NULL
+        FOREIGN KEY (owner_id, workspace_id) REFERENCES app_user (id, workspace_id) ON DELETE SET NULL,
+    -- FK target for the composite reference from opportunity_transition
+    CONSTRAINT opportunity_id_workspace_uniq UNIQUE (id, workspace_id)
+);
+
+-- Every stage change is recorded as a transition. from_stage_id is null for the
+-- row that records the opportunity's creation.
+--
+-- Owned by opportunity-service: a move writes the stage change and this row in
+-- one transaction, so the two can never diverge.
+CREATE TABLE opportunity_transition (
+    id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id   uuid        NOT NULL REFERENCES workspace (id) ON DELETE CASCADE,
+    opportunity_id uuid        NOT NULL,
+    from_stage_id  uuid,
+    to_stage_id    uuid        NOT NULL,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT opportunity_transition_opportunity_fk
+        FOREIGN KEY (opportunity_id, workspace_id) REFERENCES opportunity (id, workspace_id) ON DELETE CASCADE
 );

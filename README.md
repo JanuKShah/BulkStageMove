@@ -27,12 +27,28 @@ crosses.
   (open / won / lost / abandoned), an owner, and created/updated timestamps.
 - Every stage change is recorded as a **transition**.
 
+## Technology
+
+| | |
+|---|---|
+| Node.js 22 | runtime |
+| TypeScript 5.9 | `strict`, `noUncheckedIndexedAccess` |
+| NestJS 11 + Express | HTTP framework |
+| PostgreSQL 16 | datastore |
+| `pg` 8 | driver, raw SQL, no ORM |
+| Jest + ts-jest | tests |
+| tsx | runs the migrate and seed scripts |
+| ESLint + Prettier | lint and format |
+| Docker Compose | 4 services + Postgres |
+
 ## Project setup
 
-Node 22 · TypeScript · NestJS · `pg` (raw SQL, no ORM).
-
 ```bash
-docker compose up -d     # Postgres
-npm install
+docker compose up -d --build
+npm run migrate
+npm run seed
+npm test
 ```
+
+Ports `3001` workspace, `3002` user, `3003` stage, `3004` opportunity. Tenant scoping via `X-Workspace-Id`.
 

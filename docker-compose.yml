@@ -1,58 +1,114 @@
 name: bulk-stage-move
 
-# Datastores only. The app runs on the host in development (npm run start:dev);
-# the Dockerfile exists so the same compose file can also run the app in CI or
-# as a single-command demo. See README "Running it".
+# Four services plus a shared Postgres. The services are separate processes with
+# real HTTP boundaries, but they share one schema - see the note in
+# src/shared/database/database.service.ts for why the composite foreign keys that
+# enforce tenant isolation require it.
 #
-# Redis and RabbitMQ are intentionally NOT here yet. Bulk-job state currently
-# lives in Postgres alone, so the stack boots with one dependency. Revisit when
-# the queue and cache layer actually get built.
+# One instance of each service. Services address each other by service name on
+# the compose network, not by published port.
+
+x-service-base: &service-base
+  build:
+    context: .
+    target: runtime
+  depends_on:
+    postgres:
+      condition: service_healthy
+  restart: unless-stopped
+  environment: &db-env
+    DATABASE_URL: postgres://app:app_dev_password@postgres:5432/bulk_stage_move
+    PG_POOL_MAX: 10
 
 services:
-  app:
-    build:
-      context: .
-      target: runtime
-    container_name: bsm-app
-    depends_on:
-      postgres:
-        condition: service_healthy
+  workspace-service:
+    <<: *service-base
+    container_name: bsm-workspace
+    command: ["node", "dist/apps/workspace-service/main.js"]
     environment:
-      NODE_ENV: production
-      PORT: 3000
-      # Inside the compose network the host is the service name, not localhost.
-      DATABASE_URL: postgres://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app_dev_password}@postgres:5432/${POSTGRES_DB:-bulk_stage_move}
-      PG_POOL_MAX: 20
-    ports:
-      - '3000:3000'
-    restart: unless-stopped
+      <<: *db-env
+      PORT: 3001
+    # Readiness, not liveness: a database blip should stop traffic reaching this
+    # instance, not cause a restart loop across all four services.
     healthcheck:
-      # node's built-in fetch; alpine has no curl.
-      test:
-        [
-          'CMD',
-          'node',
-          '-e',
-          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
-        ]
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3001/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 15s
+    ports:
+      - '3001:3001'
+
+  user-service:
+    <<: *service-base
+    container_name: bsm-user
+    command: ["node", "dist/apps/user-service/main.js"]
+    environment:
+      <<: *db-env
+      PORT: 3002
+    # Readiness, not liveness: a database blip should stop traffic reaching this
+    # instance, not cause a restart loop across all four services.
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3002/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    ports:
+      - '3002:3002'
+
+  stage-service:
+    <<: *service-base
+    container_name: bsm-stage
+    command: ["node", "dist/apps/stage-service/main.js"]
+    environment:
+      <<: *db-env
+      PORT: 3003
+    # Readiness, not liveness: a database blip should stop traffic reaching this
+    # instance, not cause a restart loop across all four services.
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3003/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    ports:
+      - '3003:3003'
+
+  opportunity-service:
+    <<: *service-base
+    container_name: bsm-opportunity
+    command: ["node", "dist/apps/opportunity-service/main.js"]
+    environment:
+      <<: *db-env
+      PORT: 3004
+      STAGE_SERVICE_URL: http://stage-service:3003
+      USER_SERVICE_URL: http://user-service:3002
+      WORKSPACE_SERVICE_URL: http://workspace-service:3001
+    # Readiness, not liveness: a database blip should stop traffic reaching this
+    # instance, not cause a restart loop across all four services.
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3004/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    ports:
+      - '3004:3004'
 
   postgres:
     image: postgres:16-alpine
     container_name: bsm-postgres
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-bulk_stage_move}
-      POSTGRES_USER: ${POSTGRES_USER:-app}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app_dev_password}
+      POSTGRES_DB: bulk_stage_move
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app_dev_password
     ports:
       - '5432:5432'
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-bulk_stage_move}']
+      test: ['CMD-SHELL', 'pg_isready -U app -d bulk_stage_move']
       interval: 5s
       timeout: 5s
       retries: 10
