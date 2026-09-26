@@ -1,0 +1,65 @@
+# ---------- dependencies ----------
+node_modules/
+jspm_packages/
+.pnp
+.pnp.js
+
+# ---------- build output ----------
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# ---------- environment / secrets ----------
+# CRITICAL: never commit real credentials. .env.example is the tracked template.
+.env
+.env.*
+!.env.example
+
+# ---------- test / coverage ----------
+coverage/
+.nyc_output/
+*.lcov
+test-results/
+playwright-report/
+
+# ---------- logs ----------
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ---------- runtime / seed data ----------
+# Seeded datasets and generated fixtures can be hundreds of MB.
+# Recreate them with the seed script instead of committing them.
+data/
+seeds/
+*.dump
+*.sql.gz
+/tmp/
+.cache/
+
+# ---------- docker ----------
+docker-compose.override.yml
+
+# ---------- editors ----------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ---------- OS ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ---------- misc ----------
+*.pid
+*.seed
+.eslintcache

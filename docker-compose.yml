@@ -1,0 +1,61 @@
+name: bulk-stage-move
+
+# Datastores only. The app runs on the host in development (npm run start:dev);
+# the Dockerfile exists so the same compose file can also run the app in CI or
+# as a single-command demo. See README "Running it".
+#
+# Redis and RabbitMQ are intentionally NOT here yet. Bulk-job state currently
+# lives in Postgres alone, so the stack boots with one dependency. Revisit when
+# the queue and cache layer actually get built.
+
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    container_name: bsm-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      # Inside the compose network the host is the service name, not localhost.
+      DATABASE_URL: postgres://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app_dev_password}@postgres:5432/${POSTGRES_DB:-bulk_stage_move}
+      PG_POOL_MAX: 20
+    ports:
+      - '3000:3000'
+    restart: unless-stopped
+    healthcheck:
+      # node's built-in fetch; alpine has no curl.
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: bsm-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-bulk_stage_move}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app_dev_password}
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-bulk_stage_move}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:

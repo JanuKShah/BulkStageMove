@@ -1,0 +1,21 @@
+# Normalize text files to LF in both the repository and the working tree.
+# This overrides any local core.autocrlf setting, so behaviour is identical on
+# Windows, macOS and Linux instead of depending on each machine's git config.
+* text=auto eol=lf
+
+# Native Windows scripts must keep CRLF or they will not run.
+*.cmd eol=crlf
+*.bat eol=crlf
+*.ps1 eol=crlf
+
+# The lockfile stays diffable - dependency changes must be reviewable in a PR.
+package-lock.json text eol=lf
+
+# Never line-ending convert binaries.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
