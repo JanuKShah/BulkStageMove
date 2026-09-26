@@ -46,7 +46,12 @@ describe('submit pages over rows sharing a created_at', () => {
     const res = await fetch('http://localhost:3005/bulk-moves', {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-workspace-id': ws.workspaceId },
-      body: JSON.stringify({ idempotencyKey: `shared-${Date.now()}`, ...jobFilter(ws.to) }),
+      body: JSON.stringify({
+        idempotencyKey: `shared-${Date.now()}`,
+        // 2,500, not the 50,000 default: the fixture is 2,500 records plus a
+        // 2,000 margin that the filter must exclude.
+        ...jobFilter(ws.to, 2_500),
+      }),
     });
     const body = (await res.json()) as { jobId: string; itemsCreated: number };
     expect(res.status).toBe(201);

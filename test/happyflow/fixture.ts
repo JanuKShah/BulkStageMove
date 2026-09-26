@@ -72,15 +72,21 @@ async function createStage(workspaceId: string, name: string): Promise<string> {
 }
 
 /**
- * The happy-path job's filter: everything in the low band, moved to `to`.
+ * The happy-path job's filter: the low band, moved to `to`.
+ *
+ * Takes the band width rather than reading HAPPY_FLOW_SIZE, so a fixture built
+ * at a smaller size gets a filter that matches that size. Reading the constant
+ * here made a 2,500 record fixture submit a filter for 50,000, which selected
+ * the whole table including the margin and failed the assertion on a count the
+ * test had itself mis-specified.
  *
  * Disjoint bands matter for any second job run against the same fixture. A
  * growing prefix would re-select records an earlier job already moved, and those
  * are then correctly refused as stale - which looks like a bug in the worker and
  * is actually the compare-and-swap doing its job.
  */
-export function jobFilter(to: string): Record<string, unknown> {
-  return { targetStageId: to, maxValue: HAPPY_FLOW_SIZE };
+export function jobFilter(to: string, size = HAPPY_FLOW_SIZE): Record<string, unknown> {
+  return { targetStageId: to, maxValue: size };
 }
 
 /** A value band that no other job in the sweep touches. */
