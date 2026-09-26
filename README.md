@@ -55,6 +55,11 @@ if you prefer; it just returns before the healthchecks pass.
 Ports `3001` workspace, `3002` user, `3003` stage, `3004` opportunity, `3005` bulk jobs.
 `5672` RabbitMQ, `15672` its management UI. Tenant scoping via `X-Workspace-Id`.
 
+A submitted job is dispatched to RabbitMQ in batches of 1,000 and applied by the
+worker service, which registers **4 consumers**, each on its own channel so batches
+are processed in parallel. Set `RABBITMQ_CONSUMER_CONCURRENCY` to change it;
+`RABBITMQ_PREFETCH` (default 1) caps batches in flight per consumer.
+
 ## Exploring it
 
 There is no UI, so two commands cover it. Both need the stack up.
