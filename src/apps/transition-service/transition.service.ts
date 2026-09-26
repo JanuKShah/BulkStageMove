@@ -174,6 +174,7 @@ export class TransitionService {
     const job = await this.jobs.findById(workspaceId, jobId);
     if (!job) throw new NotFoundException(`bulk job ${jobId} not found`);
     const counts = await this.jobs.statusCounts(workspaceId, jobId);
+    const deadLettered = await this.jobs.deadLettered(workspaceId, jobId);
     return {
       id: job.id,
       status: job.status,
@@ -198,6 +199,12 @@ export class TransitionService {
         completed: counts['completed'] ?? 0,
         failed: counts['failed'] ?? 0,
       },
+      // Batches that ran out of attempts, which is what it means for a message to
+      // reach the dead letter queue. Separate from `batches.failed` in meaning
+      // even though both count the same rows, and from `failures` in kind: those
+      // are records a user has to fix, these are records the worker never got to.
+      // Zero for a healthy job, and worth alerting on.
+      deadLettered,
       createdAt: job.created_at,
       startedAt: job.started_at,
       completedAt: job.completed_at,

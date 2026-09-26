@@ -245,6 +245,104 @@ describe('batches hold records instead of rows', () => {
     expect(rows[0]!.processed_count).toBe(rows[0]!.total_matched);
   });
 
+  it('surfaces a batch that exhausted its attempts, and the reason', async () => {
+    const ids = await seedOpportunitiesInStage(ws.workspaceId, contacted(), 5);
+    const { jobId, batchNo } = await createJobWithItems(ws.workspaceId, closedWon(), ids, {
+      enqueue: false,
+    });
+
+    // Nothing consumes the dead letter queue, deliberately: a batch that has spent
+    // its budget should not be resurrected automatically. That makes the batch row
+    // the only durable record, so the status response has to carry it - otherwise
+    // these records are in neither the per-record failures nor the job counters
+    // and are simply not moved.
+    await pool.query(
+      `UPDATE bulk_job_outbox
+          SET status = 'failed', failed_count = cardinality(item_ids), error = $3,
+              attempts = 3, completed_at = now(), updated_at = now()
+        WHERE job_id = $1 AND batch_no = $2`,
+      [jobId, batchNo, 'attempts exhausted'],
+    );
+
+    const res = await api<{
+      totalMatched: number;
+      deadLettered: {
+        batches: number;
+        records: number;
+        reasons: { reason: string; batches: number }[];
+      };
+    }>('http://localhost:3005', `/bulk-moves/${jobId}`, { workspaceId: ws.workspaceId });
+
+    expect(res.status).toBe(200);
+    expect(res.body.deadLettered.batches).toBe(1);
+    expect(res.body.deadLettered.records).toBe(5);
+    expect(res.body.deadLettered.reasons).toEqual([
+      { reason: 'attempts exhausted', batches: 1 },
+    ]);
+    // These five records are unmoved, and totalMatched is the honest figure they
+    // are measured against - it is not quietly reduced to hide the loss.
+    expect(res.body.totalMatched).toBe(5);
+  });
+
+  it('does not call a partly-applied batch dead-lettered', async () => {
+    // The distinction that matters: 990 records moved and 10 could not be
+    // transitioned is a business answer the user acts on, reported per record by
+    // `failures`. It is not a batch that ran out of attempts, and conflating the
+    // two would page an operator for something nobody needs to fix.
+    //
+    // Only failBatch writes status='failed', and it is reached solely when the
+    // attempt budget is spent. A batch with unmovable records goes through
+    // settleBatch and lands on 'completed' with failed_count set.
+    const movable = await seedOpportunitiesInStage(ws.workspaceId, contacted(), 6);
+    const stuck = await seedOpportunitiesInStage(ws.workspaceId, newLead(), 3);
+    const { jobId, batchNo } = await createJobWithItems(
+      ws.workspaceId,
+      closedWon(),
+      [...movable, ...stuck],
+      { enqueue: false },
+    );
+
+    const result = await processBatchForTest(ws.workspaceId, jobId, batchNo);
+    expect(result.moved).toBe(6);
+    expect(result.failed).toBe(3);
+
+    const res = await api<{
+      deadLettered: { batches: number; records: number };
+      failedCount: number;
+    }>('http://localhost:3005', `/bulk-moves/${jobId}`, { workspaceId: ws.workspaceId });
+
+    expect(res.status).toBe(200);
+    expect(res.body.deadLettered.batches).toBe(0);
+    expect(res.body.deadLettered.records).toBe(0);
+    // The three are reported as failures instead, which is the actionable list.
+    expect(res.body.failedCount).toBe(3);
+
+    const batch = await pool.query<{ status: string; failed_count: number }>(
+      'SELECT status, failed_count FROM bulk_job_outbox WHERE job_id = $1 AND batch_no = $2',
+      [jobId, batchNo],
+    );
+    expect(batch.rows[0]!.status).toBe('completed');
+    expect(batch.rows[0]!.failed_count).toBe(3);
+  });
+
+  it('reports no dead-lettered batches for a healthy job', async () => {
+    const ids = await seedOpportunitiesInStage(ws.workspaceId, contacted(), 4);
+    const { jobId, batchNo } = await createJobWithItems(ws.workspaceId, closedWon(), ids, {
+      enqueue: false,
+    });
+    await processBatchForTest(ws.workspaceId, jobId, batchNo);
+
+    const res = await api<{ deadLettered: { batches: number; reasons: unknown[] } }>(
+      'http://localhost:3005',
+      `/bulk-moves/${jobId}`,
+      { workspaceId: ws.workspaceId },
+    );
+    expect(res.status).toBe(200);
+    // Zero is the value worth asserting: it is what makes a non-zero alertable.
+    expect(res.body.deadLettered.batches).toBe(0);
+    expect(res.body.deadLettered.reasons).toEqual([]);
+  });
+
   it('reports the watermark the job was submitted at', async () => {
     const res = await submitBulkMove(ws.workspaceId, {
       targetStageId: closedWon(),

@@ -81,6 +81,58 @@ export class BulkJobRepository {
   }
 
   /**
+   * Batches that exhausted their attempt budget, which is what it means for a
+   * message to reach the dead letter queue.
+   *
+   * The distinction matters because "failed" on a batch row is overloaded and the
+   * two cases call for different responses:
+   *
+   *   status = 'completed' with failed_count > 0
+   *     The batch did its job. Some records were unmovable, which is a business
+   *     answer, reported per record by `failures`.
+   *
+   *   status = 'failed'
+   *     The batch never completed. It was attempted RABBITMQ_MAX_ATTEMPTS times
+   *     and the worker gave up, and the message went to the DLQ. That is an
+   *     infrastructure or contention problem, and those records are in neither
+   *     per-record failures nor the job's counters - they are simply not moved.
+   *
+   * Nothing consumes the DLQ, deliberately: a batch that has exhausted its budget
+   * should not be resurrected automatically, and the queue's own TTL and length
+   * cap are how it is eventually discarded. So the batch row is the only durable
+   * record that it happened, and this is the only way a caller learns of it
+   * without paging all fifty batches.
+   */
+  async deadLettered(workspaceId: string, jobId: string): Promise<{
+    batches: number;
+    records: number;
+    reasons: { reason: string; batches: number }[];
+  }> {
+    const summary = await this.db.query<{ batches: number; records: number }>(
+      `SELECT count(*)::int AS batches, coalesce(sum(failed_count), 0)::int AS records
+         FROM bulk_job_outbox
+        WHERE job_id = $1 AND workspace_id = $2 AND status = 'failed'`,
+      [jobId, workspaceId],
+    );
+
+    const reasons = await this.db.query<{ reason: string; batches: number }>(
+      `SELECT coalesce(error, 'no reason recorded') AS reason, count(*)::int AS batches
+         FROM bulk_job_outbox
+        WHERE job_id = $1 AND workspace_id = $2 AND status = 'failed'
+        GROUP BY error
+        ORDER BY batches DESC, reason
+        LIMIT 10`,
+      [jobId, workspaceId],
+    );
+
+    return {
+      batches: summary[0]?.batches ?? 0,
+      records: summary[0]?.records ?? 0,
+      reasons: reasons.map((r) => ({ reason: r.reason, batches: r.batches })),
+    };
+  }
+
+  /**
    * The records that could not be moved, and why.
    *
    * A table of exceptions, not of the population: bulk_job_failure is empty for
