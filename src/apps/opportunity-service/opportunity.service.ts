@@ -34,9 +34,10 @@ export class OpportunityService {
     if (!name) throw new BadRequestException('name is required');
     if (!input.stageId) throw new BadRequestException('stageId is required');
 
-    return this.database.transaction(async (client) => {
+    const id = randomUUID();
+    await this.database.transaction(async (client) => {
       const created = await this.repository.insert(client, {
-        id: randomUUID(),
+        id,
         workspaceId,
         stageId: input.stageId!,
         name,
@@ -49,8 +50,13 @@ export class OpportunityService {
         from: null,
         to: input.stageId!,
       });
-      return created;
     });
+
+    // Re-read for the stage name and status, which an INSERT ... RETURNING
+    // cannot supply because it cannot join.
+    const created = await this.repository.findById(workspaceId, id);
+    if (!created) throw new NotFoundException(`opportunity ${id} not found`);
+    return created;
   }
 
   /**
@@ -74,7 +80,7 @@ export class OpportunityService {
       throw new ConflictException(`move from ${current.stage_id} to ${toStageId} is not allowed`);
     }
 
-    return this.database.transaction(async (client) => {
+    await this.database.transaction(async (client) => {
       const moved = await this.repository.updateStage(client, workspaceId, id, toStageId);
       if (!moved) throw new NotFoundException(`opportunity ${id} not found`);
       await this.repository.insertTransition(client, {
@@ -83,8 +89,14 @@ export class OpportunityService {
         from: current.stage_id,
         to: toStageId,
       });
-      return moved;
     });
+
+    // Re-read rather than return the UPDATE's row: RETURNING cannot join, so it
+    // carries no stage name or status. Reading it back is what makes the response
+    // report the status the move just gave it, instead of the one it had before.
+    const updated = await this.repository.findById(workspaceId, id);
+    if (!updated) throw new NotFoundException(`opportunity ${id} not found`);
+    return updated;
   }
 
   /**

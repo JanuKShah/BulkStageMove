@@ -12,6 +12,13 @@ export interface Opportunity {
   owner_id: string | null;
   created_at: Date;
   updated_at: Date;
+  /**
+   * The status configured on the stage this opportunity sits in, joined in
+   * rather than stored. A deal's status is the outcome of its stage, so the two
+   * cannot drift - which is the reason there is no status column to keep in sync
+   * when a move happens.
+   */
+  status: string;
 }
 
 export interface Transition {
@@ -34,7 +41,24 @@ export interface ListFilter {
   cursor?: string | undefined;
 }
 
+/**
+ * The opportunity's own columns. Used by INSERT/UPDATE ... RETURNING, which
+ * cannot reference another table, so those two cannot return the joined status
+ * and the service re-reads when it needs it.
+ */
 const COLUMNS = 'id, workspace_id, stage_id, name, value, owner_id, created_at, updated_at';
+
+/**
+ * The same columns plus the stage's name and outcome, for the read paths.
+ *
+ * status is the outcome of the stage the opportunity is in, selected through the
+ * join rather than looked up per record. That is what makes it impossible for a
+ * move to leave a stale status behind: there is no separate stored value to keep
+ * in sync, so a caller cannot observe a status that disagrees with the stage.
+ */
+const READ_COLUMNS = `o.id, o.workspace_id, o.stage_id, o.name, o.value, o.owner_id,
+       o.created_at, o.updated_at, s.name AS stage_name, s.outcome AS status`;
+const FROM_JOINED = 'FROM opportunity o JOIN stage s ON s.id = o.stage_id';
 
 @Injectable()
 export class OpportunityRepository {
@@ -42,7 +66,7 @@ export class OpportunityRepository {
 
   async findById(workspaceId: string, id: string): Promise<Opportunity | null> {
     const rows = await this.db.query<Opportunity>(
-      `SELECT ${COLUMNS} FROM opportunity WHERE id = $1 AND workspace_id = $2`,
+      `SELECT ${READ_COLUMNS} ${FROM_JOINED} WHERE o.id = $1 AND o.workspace_id = $2`,
       [id, workspaceId],
     );
     return rows[0] ?? null;
@@ -53,48 +77,48 @@ export class OpportunityRepository {
     filter: ListFilter,
   ): Promise<{ items: Opportunity[]; hasMore: boolean }> {
     const params: unknown[] = [workspaceId];
-    let where = 'workspace_id = $1';
+    let where = 'o.workspace_id = $1';
 
     // outcome is not stored on the row - it lives on the stage. The service
     // resolves it to stage ids first, so this stays a plain equality on
     // stage_id and keeps the query index-friendly.
     if (filter.stageIds?.length) {
       params.push(filter.stageIds);
-      where += ` AND stage_id = ANY($${params.length}::uuid[])`;
+      where += ` AND o.stage_id = ANY($${params.length}::uuid[])`;
     }
     if (filter.ownerIds?.length) {
       params.push(filter.ownerIds);
-      where += ` AND owner_id = ANY($${params.length}::uuid[])`;
+      where += ` AND o.owner_id = ANY($${params.length}::uuid[])`;
     }
     if (filter.minValue !== undefined) {
       params.push(filter.minValue);
-      where += ` AND value >= $${params.length}`;
+      where += ` AND o.value >= $${params.length}`;
     }
     if (filter.maxValue !== undefined) {
       params.push(filter.maxValue);
-      where += ` AND value <= $${params.length}`;
+      where += ` AND o.value <= $${params.length}`;
     }
     if (filter.createdFrom) {
       params.push(filter.createdFrom);
-      where += ` AND created_at >= $${params.length}`;
+      where += ` AND o.created_at >= $${params.length}`;
     }
     if (filter.createdTo) {
       params.push(filter.createdTo);
-      where += ` AND created_at <= $${params.length}`;
+      where += ` AND o.created_at <= $${params.length}`;
     }
     if (filter.cursor) {
       // Keyset pagination on (created_at, id) stays stable while rows are being
       // inserted, unlike OFFSET which can skip or repeat under concurrent writes.
       params.push(filter.cursor);
-      where += ` AND (created_at, id) < (
+      where += ` AND (o.created_at, o.id) < (
         SELECT created_at, id FROM opportunity WHERE id = $${params.length} AND workspace_id = $1
       )`;
     }
     params.push(filter.limit + 1);
 
     const rows = await this.db.query<Opportunity>(
-      `SELECT ${COLUMNS} FROM opportunity WHERE ${where}
-       ORDER BY created_at DESC, id DESC LIMIT $${params.length}`,
+      `SELECT ${READ_COLUMNS} ${FROM_JOINED} WHERE ${where}
+       ORDER BY o.created_at DESC, o.id DESC LIMIT $${params.length}`,
       params,
     );
     return { items: rows.slice(0, filter.limit), hasMore: rows.length > filter.limit };
