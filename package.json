@@ -16,6 +16,8 @@
     "seed": "tsx scripts/seed.ts",
     "seed:large": "tsx scripts/seed.ts --scale=large",
     "test": "jest --runInBand",
+    "test:safety": "jest --runInBand --selectProjects safety",
+    "test:endpoints": "jest --runInBand --selectProjects endpoints",
     "test:unit": "jest --runInBand --testPathIgnorePatterns=integration",
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage --runInBand",
