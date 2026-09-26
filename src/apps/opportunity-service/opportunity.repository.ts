@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import type { PoolClient } from 'pg';
 import { DatabaseService } from '../../shared/database/database.service';
-import type { Outcome } from './opportunity.filter';
+import type { Outcome } from '../../shared/filter/opportunity-filter';
 
 export interface Opportunity {
   id: string;

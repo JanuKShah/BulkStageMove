@@ -1,5 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
-import { parseListFilter } from '../../src/apps/opportunity-service/opportunity.filter';
+import { parseListFilter } from '../../src/shared/filter/opportunity-filter';
 
 /**
  * The safety mechanism: a filter the code does not understand must be rejected,

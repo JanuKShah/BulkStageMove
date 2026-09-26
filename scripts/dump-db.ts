@@ -27,6 +27,8 @@ const TABLES = [
   'stage_transition_rule',
   'opportunity',
   'opportunity_transition',
+  'bulk_job',
+  'bulk_job_item',
 ] as const;
 
 type Row = Record<string, unknown>;

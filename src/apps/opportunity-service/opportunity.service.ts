@@ -7,7 +7,7 @@ import {
 import { randomUUID } from 'node:crypto';
 import { DatabaseService } from '../../shared/database/database.service';
 import { ServiceClient } from '../../shared/http/service-client';
-import { parseListFilter, type Outcome } from './opportunity.filter';
+import { parseListFilter, type Outcome } from '../../shared/filter/opportunity-filter';
 import { Opportunity, OpportunityRepository, Transition } from './opportunity.repository';
 
 export interface CreateInput {
