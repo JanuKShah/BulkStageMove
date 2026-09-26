@@ -18,7 +18,7 @@ import { type BatchResult, WorkerRepository } from './worker.repository';
  */
 @Injectable()
 export class BatchWorker implements OnModuleInit, OnModuleDestroy {
-  private channel: Awaited<ReturnType<RabbitService['consumerChannel']>> | null = null;
+  private channels: Awaited<ReturnType<RabbitService['consumerChannel']>>[] = [];
   private stopping = false;
 
   constructor(
@@ -28,27 +28,51 @@ export class BatchWorker implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   async onModuleInit(): Promise<void> {
-    this.channel = await this.rabbit.consumerChannel();
-    await this.rabbit.declareTopology(this.channel);
-    // One batch in flight per consumer: a batch is 1000 records, so a higher
-    // prefetch does not add throughput, it just holds whole batches in memory.
-    await this.channel.prefetch(this.config.prefetch);
-    await this.channel.consume(this.config.queue, (message) => {
-      if (message) void this.handle(message);
-    });
+    // One channel per consumer slot. Multiple consumers on a single channel would
+    // not help: amqplib dispatches a channel's messages one callback at a time,
+    // so they would still be processed in series. Separate channels are what
+    // actually gives parallel delivery.
+    const slots = Math.max(1, this.config.consumerConcurrency);
+    for (let i = 0; i < slots; i++) {
+      const channel = await this.rabbit.consumerChannel();
+      if (i === 0) await this.rabbit.declareTopology(channel);
+      // One batch in flight per slot. A batch is 1000 records, so a higher
+      // prefetch does not add throughput, it just holds whole batches in memory
+      // and delays the redelivery of anything that has to be retried.
+      await channel.prefetch(this.config.prefetch);
+      await channel.consume(this.config.queue, (message) => {
+        if (message) void this.handle(message, channel);
+      });
+      this.channels.push(channel);
+    }
   }
 
   async onModuleDestroy(): Promise<void> {
     this.stopping = true;
-    try {
-      await this.channel?.close();
-    } catch {
-      // shutting down
-    }
+    await Promise.all(
+      this.channels.map(async (channel) => {
+        try {
+          await channel.close();
+        } catch {
+          // shutting down
+        }
+      }),
+    );
+    this.channels = [];
   }
 
-  /** Exposed so tests can drive one message without a live consumer. */
-  async handle(message: ConsumeMessage): Promise<BatchResult> {
+  /**
+   * Handles one message. Exposed so tests can drive it without a live consumer.
+   *
+   * The channel is the one the message arrived on, and is what the ack goes back
+   * on. Acking on a different channel is a protocol error, and with several
+   * consumers in flight a shared reference would ack the wrong delivery.
+   */
+  async handle(
+    message: ConsumeMessage,
+    channel?: Awaited<ReturnType<RabbitService['consumerChannel']>>,
+  ): Promise<BatchResult> {
+    const ackOn = channel ?? this.channels[0];
     let batch: BatchMessage;
     try {
       batch = JSON.parse(message.content.toString()) as BatchMessage;
@@ -72,7 +96,10 @@ export class BatchWorker implements OnModuleInit, OnModuleDestroy {
     if (result.disposition === 'retry' || result.disposition === 'dead') {
       await this.republish(message, result);
     }
-    this.channel?.ack(message);
+    // Acked last, and only once the outcome is durable. If this process dies
+    // before the ack, RabbitMQ redelivers, and the claim is a compare-and-set so
+    // the redelivery is harmless.
+    ackOn?.ack(message);
     return result;
   }
 
