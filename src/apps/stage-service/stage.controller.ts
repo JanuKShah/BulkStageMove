@@ -1,10 +1,29 @@
-import { BadRequestException, Body, Controller, Get, Headers, Param, Post } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  Headers,
+  HttpCode,
+  Param,
+  Post,
+} from '@nestjs/common';
 import { requireUuid, requireWorkspaceId } from '../../shared/tenancy/workspace-guard';
 import { Stage } from './stage.repository';
 import { StageService } from './stage.service';
 
 type Headers_ = Record<string, string | string[] | undefined>;
 
+/**
+ * Two read-only predicates, deliberately exposed as POST rather than GET.
+ *
+ * A predicate over two UUIDs has no natural resource URI, and a query string
+ * carrying two UUIDs is worse to read, log and cache than a small JSON body.
+ * That is a deliberate choice about ergonomics, not an oversight.
+ *
+ * The status is still 200: neither call creates nor modifies anything. NestJS
+ * defaults every POST to 201, which would be a lie here.
+ */
 @Controller('stages')
 export class StageController {
   constructor(private readonly service: StageService) {}
@@ -20,6 +39,7 @@ export class StageController {
   }
 
   @Post('can-move')
+  @HttpCode(200)
   canMove(
     @Headers() headers: Headers_,
     @Body() body: { from?: string; to?: string },
@@ -32,6 +52,7 @@ export class StageController {
   }
 
   @Post('allowed-targets')
+  @HttpCode(200)
   async allowedTargets(
     @Headers() headers: Headers_,
     @Body() body: { from?: string },

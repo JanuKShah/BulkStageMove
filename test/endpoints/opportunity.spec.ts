@@ -103,7 +103,7 @@ describe('opportunity-service', () => {
         workspaceId: ws.workspaceId,
         body: JSON.stringify({ toStageId: ws.stages['contacted'] }),
       });
-      expect(res.status).toBe(201);
+      expect(res.status).toBe(200);
       expect(res.body.stage_id).toBe(ws.stages['contacted']);
     });
 

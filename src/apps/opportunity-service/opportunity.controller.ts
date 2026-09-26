@@ -4,6 +4,7 @@ import {
   Controller,
   Get,
   Headers,
+  HttpCode,
   Param,
   Post,
   Query,
@@ -39,7 +40,10 @@ export class OpportunityController {
     return this.service.transitions(requireWorkspaceId(headers), requireUuid('id', id));
   }
 
+  // A move mutates an existing opportunity; it does not create one. 201 would
+  // tell the client a new resource now exists at this URI.
   @Post(':id/move')
+  @HttpCode(200)
   move(
     @Headers() headers: Headers_,
     @Param('id') id: string,

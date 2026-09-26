@@ -59,7 +59,7 @@ describe('stage-service', () => {
       workspaceId: ws.workspaceId,
       body: JSON.stringify({ from: ws.stages['newLead'], to: ws.stages['contacted'] }),
     });
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(200);
     expect(res.body.allowed).toBe(true);
   });
 
@@ -69,7 +69,7 @@ describe('stage-service', () => {
       workspaceId: ws.workspaceId,
       body: JSON.stringify({ from: ws.stages['contacted'], to: ws.stages['newLead'] }),
     });
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(200);
     expect(res.body.allowed).toBe(false);
   });
 
@@ -97,7 +97,7 @@ describe('stage-service', () => {
       workspaceId: ws.workspaceId,
       body: JSON.stringify({ from: ws.stages['newLead'] }),
     });
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(200);
     expect(res.body.to).toEqual([ws.stages['contacted']]);
   });
 
