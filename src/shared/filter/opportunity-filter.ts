@@ -44,6 +44,12 @@ export function parseListFilter(query: Record<string, unknown>): ParsedFilter {
         `unknown filter "${key}". supported: ${[...KNOWN_PARAMS].sort().join(', ')}`,
       );
     }
+    // An explicit null is not the same as an absent key. A JSON body can carry
+    // {"minValue": null}, and quietly treating that as "no bound" would run a
+    // job over every matching row instead of the subset the caller asked for.
+    if (query[key] === null) {
+      throw new BadRequestException(`${key} must not be null; omit it instead`);
+    }
   }
 
   const filter: ParsedFilter = { limit: parseLimit(query['limit']) };
@@ -83,8 +89,18 @@ export function parseListFilter(query: Record<string, unknown>): ParsedFilter {
   return filter;
 }
 
+/**
+ * Reduces a value to its first scalar form.
+ *
+ * Numbers are stringified rather than discarded. This parser is shared by the
+ * list endpoint, where every value arrives as a query string, and the bulk-move
+ * endpoint, where the same filter arrives in a JSON body and numbers stay
+ * numbers. Returning undefined for a non-string silently dropped `minValue`
+ * from a JSON body, so the filter matched everything.
+ */
 function first(value: unknown): string | undefined {
   if (Array.isArray(value)) return first(value[0]);
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : undefined;
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return trimmed === '' ? undefined : trimmed;

@@ -117,5 +117,22 @@ describe('filter validation', () => {
     it('treats an empty string as absent, not as a bad value', () => {
       expect(parseListFilter({ stageId: '', ownerId: '' }).stageIds).toBeUndefined();
     });
+
+    // The list endpoint receives query strings; the bulk-move endpoint receives
+    // a JSON body where numbers stay numbers. Both must parse identically.
+    it('accepts numbers, not just strings, so a JSON body filters correctly', () => {
+      expect(parseListFilter({ minValue: 100 }).minValue).toBe(100);
+      expect(parseListFilter({ minValue: 100 }).minValue).toBe(
+        parseListFilter({ minValue: '100' }).minValue,
+      );
+      expect(parseListFilter({ maxValue: 0 }).maxValue).toBe(0);
+    });
+
+    it('rejects an explicit null rather than treating it as no bound', () => {
+      // A JSON body can carry {"minValue": null}. Dropping it would run the job
+      // over every matching row instead of the requested subset.
+      expect(() => parseListFilter({ minValue: null })).toThrow(BadRequestException);
+      expect(() => parseListFilter({ minValue: null })).toThrow(/must not be null/);
+    });
   });
 });
