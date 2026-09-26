@@ -62,7 +62,7 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
             workspaceId: row.workspace_id,
             jobId: row.job_id,
             batchNo: row.batch_no,
-            itemCount: row.item_count,
+            itemCount: row.item_ids.length,
           });
           await this.outbox.markPublished(row.id);
           this.stats.published += 1;

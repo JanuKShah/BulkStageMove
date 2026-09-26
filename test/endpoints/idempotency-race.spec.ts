@@ -59,14 +59,17 @@ describe('concurrent submissions on one idempotency key', () => {
   });
 
   it('leaves no half-written job behind when callers lose the race', async () => {
-    // The losers must not have created items against a job that then failed, and
-    // a job that did win must still be internally consistent.
+    // The losers must not have written batches against a job that then failed, and
+    // a job that did win must still be internally consistent: total_matched is
+    // exactly what its batches hold, with no records claimed but never written.
     const key = randomUUID();
     await Promise.all(Array.from({ length: 8 }, () => submit(key)));
     const { rows } = await pool.query<{ n: number }>(
       `SELECT count(*)::int AS n FROM bulk_job j
        WHERE j.idempotency_key = $1
-         AND j.total_matched <> (SELECT count(*) FROM bulk_job_item i WHERE i.job_id = j.id)`,
+         AND j.total_matched <> coalesce(
+               (SELECT sum(cardinality(b.item_ids))::int
+                  FROM bulk_job_outbox b WHERE b.job_id = j.id), 0)`,
       [key],
     );
     expect(rows[0]!.n).toBe(0);

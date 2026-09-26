@@ -13,6 +13,7 @@ export interface BulkJob {
   failed_count: number;
   attempts: number;
   error: string | null;
+  snapshot_at: Date;
   created_at: Date;
   started_at: Date | null;
   completed_at: Date | null;
@@ -20,7 +21,8 @@ export interface BulkJob {
 
 const COLUMNS =
   'id, workspace_id, idempotency_key, filter, target_stage_id, status, total_matched, ' +
-  'processed_count, failed_count, attempts, error, created_at, started_at, completed_at';
+  'processed_count, failed_count, attempts, error, snapshot_at, created_at, started_at, ' +
+  'completed_at';
 
 @Injectable()
 export class BulkJobRepository {
@@ -46,20 +48,11 @@ export class BulkJobRepository {
     targetStageId: string;
   }): Promise<BulkJob> {
     const rows = await this.db.query<BulkJob>(
-      `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id)
-       VALUES ($1, $2, $3, $4) RETURNING ${COLUMNS}`,
+      `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id, snapshot_at)
+       VALUES ($1, $2, $3, $4, now()) RETURNING ${COLUMNS}`,
       [input.workspaceId, input.idempotencyKey, JSON.stringify(input.filter), input.targetStageId],
     );
     return rows[0]!;
-  }
-
-  async addToTotal(workspaceId: string, jobId: string, count: number): Promise<void> {
-    await this.db.query(
-      `UPDATE bulk_job
-       SET total_matched = total_matched + $3, updated_at = now()
-       WHERE id = $1 AND workspace_id = $2`,
-      [jobId, workspaceId, count],
-    );
   }
 
   async findById(workspaceId: string, id: string): Promise<BulkJob | null> {
@@ -70,10 +63,17 @@ export class BulkJobRepository {
     return rows[0] ?? null;
   }
 
-  /** Counts straight from the items, which is committed state rather than a counter. */
+  /**
+   * Batch counts by status, aggregated over the job's 50 batch rows.
+   *
+   * The unit is batches, not records, and that is the honest one now that there
+   * is no per-record state. Record counts live on the job row as
+   * processed_count and failed_count, and per batch as completed_count and
+   * failed_count on the batch row itself.
+   */
   async statusCounts(workspaceId: string, jobId: string): Promise<Record<string, number>> {
     const rows = await this.db.query<{ status: string; n: number }>(
-      `SELECT status, count(*)::int AS n FROM bulk_job_item
+      `SELECT status, count(*)::int AS n FROM bulk_job_outbox
        WHERE job_id = $1 AND workspace_id = $2 GROUP BY status`,
       [jobId, workspaceId],
     );
@@ -81,11 +81,15 @@ export class BulkJobRepository {
   }
 
   /**
-   * Failed items, with the reason and the batch they belonged to.
+   * The records that could not be moved, and why.
    *
-   * A batch is applied whole or not at all, so a refusal fails every record in
-   * it. That makes "which records do I fix" answerable only by naming the batch
-   * and the rule that blocked it, which is what this returns.
+   * A table of exceptions, not of the population: bulk_job_failure is empty for
+   * a clean job, so this is a small read where it used to be a filtered scan of
+   * 50,000 rows.
+   *
+   * The join to opportunity is a LEFT JOIN and the name is nullable, because a
+   * record can fail precisely by no longer existing. An inner join would drop
+   * exactly the failure most worth reporting.
    */
   async failures(
     workspaceId: string,
@@ -95,39 +99,57 @@ export class BulkJobRepository {
     {
       batch_no: number;
       opportunity_id: string;
-      name: string;
-      from_stage_id: string;
-      error: string | null;
+      name: string | null;
+      from_stage_id: string | null;
+      error: string;
       attempts: number;
     }[]
   > {
     return this.db.query(
-      `SELECT i.batch_no, i.opportunity_id, o.name, i.from_stage_id, i.error, i.attempts
-         FROM bulk_job_item i
-         JOIN opportunity o ON o.id = i.opportunity_id AND o.workspace_id = i.workspace_id
-        WHERE i.job_id = $1 AND i.workspace_id = $2 AND i.status = 'failed'
-        ORDER BY i.batch_no, o.name
+      `SELECT f.batch_no, f.opportunity_id, o.name, f.from_stage_id, f.error, f.attempts
+         FROM bulk_job_failure f
+         LEFT JOIN opportunity o ON o.id = f.opportunity_id AND o.workspace_id = f.workspace_id
+        WHERE f.job_id = $1 AND f.workspace_id = $2
+        ORDER BY f.batch_no, o.name NULLS LAST, f.opportunity_id
         LIMIT $3`,
       [jobId, workspaceId, limit],
     );
   }
 
-  /** Per-batch rollup, so a job of 50 batches can be read at a glance. */
+  /**
+   * Per-batch rollup, read straight off the batch rows.
+   *
+   * pending is derived as item_count - completed - failed rather than counted,
+   * so it is the work still outstanding. It can read low next to what the job
+   * row reports if records stopped matching the filter, which is the documented
+   * consequence of evaluating the predicate live.
+   */
   async batchSummary(
     workspaceId: string,
     jobId: string,
   ): Promise<
-    { batch_no: number; total: number; completed: number; failed: number; pending: number }[]
+    {
+      batch_no: number;
+      total: number;
+      completed: number;
+      failed: number;
+      pending: number;
+      status: string;
+      attempts: number;
+      error: string | null;
+    }[]
   > {
     return this.db.query(
       `SELECT batch_no,
-              count(*)::int AS total,
-              count(*) FILTER (WHERE status = 'completed')::int AS completed,
-              count(*) FILTER (WHERE status = 'failed')::int    AS failed,
-              count(*) FILTER (WHERE status IN ('pending','running'))::int AS pending
-         FROM bulk_job_item
+              item_count AS total,
+              completed_count AS completed,
+              failed_count AS failed,
+              GREATEST(item_count - completed_count - failed_count, 0)::int AS pending,
+              status,
+              attempts,
+              error
+         FROM bulk_job_outbox
         WHERE job_id = $1 AND workspace_id = $2
-        GROUP BY batch_no
         ORDER BY batch_no`,
       [jobId, workspaceId],
     );

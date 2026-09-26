@@ -59,8 +59,8 @@ describe('submit pages over rows sharing a created_at', () => {
     expect(body.itemsCreated).toBe(2_500);
 
     const { rows } = await pool.query<{ n: number; batches: number }>(
-      `SELECT count(*)::int AS n, count(DISTINCT batch_no)::int AS batches
-         FROM bulk_job_item WHERE job_id = $1`,
+      `SELECT coalesce(sum(cardinality(item_ids)), 0)::int AS n, count(*)::int AS batches
+         FROM bulk_job_outbox WHERE job_id = $1`,
       [body.jobId],
     );
     expect(rows[0]).toEqual({ n: 2_500, batches: 3 });
@@ -124,39 +124,72 @@ describe('happy flow: 50,000 opportunities in one job', () => {
 
   it('splits the work into 50 batches of 1,000', async () => {
     // Batches are the unit of dispatch and of retry, so the count is the
-    // contract, not an implementation detail.
+    // contract, not an implementation detail. A batch holds its records as ids
+    // rather than one row each, so this checks the ids it holds.
     const { rows } = await pool.query<{ n: number }>(
-      'SELECT count(DISTINCT batch_no)::int AS n FROM bulk_job_item WHERE job_id = $1',
+      'SELECT count(*)::int AS n FROM bulk_job_outbox WHERE job_id = $1',
       [jobId],
     );
     expect(rows[0]!.n).toBe(50);
 
-    const per = await pool.query<{ batch_no: number; n: number }>(
-      'SELECT batch_no, count(*)::int AS n FROM bulk_job_item WHERE job_id = $1 GROUP BY batch_no',
+    const per = await pool.query<{ n: number }>(
+      'SELECT cardinality(item_ids)::int AS n FROM bulk_job_outbox WHERE job_id = $1',
       [jobId],
     );
     expect(per.rows.every((r) => r.n === 1_000)).toBe(true);
     expect(per.rows.reduce((a, r) => a + r.n, 0)).toBe(HAPPY_FLOW_SIZE);
   });
 
-  it('completes every item and never retries one', async () => {
+  it('completes every batch and never retries one', async () => {
     const { rows } = await pool.query<{ status: string; n: number; max_attempts: number }>(
       `SELECT status, count(*)::int AS n, max(attempts)::int AS max_attempts
-         FROM bulk_job_item WHERE job_id = $1 GROUP BY status`,
+         FROM bulk_job_outbox WHERE job_id = $1 GROUP BY status`,
       [jobId],
     );
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ status: 'completed', n: HAPPY_FLOW_SIZE, max_attempts: 1 });
+    expect(rows[0]).toMatchObject({ status: 'completed', n: 50, max_attempts: 1 });
+    // Every batch settled the full thousand it was given, and none recorded a
+    // failure. The job's own counters are derived from these, so this is where a
+    // short batch would show up first.
+    const settled = await pool.query<{ completed: number; failed: number }>(
+      `SELECT sum(completed_count)::int AS completed, sum(failed_count)::int AS failed
+         FROM bulk_job_outbox WHERE job_id = $1`,
+      [jobId],
+    );
+    expect(settled.rows[0]).toEqual({ completed: HAPPY_FLOW_SIZE, failed: 0 });
   });
 
   it('moves all 50,000 to the target stage', async () => {
+    // The transitions this job caused are the record of what it moved, and they
+    // carry the ids, so this checks the count without scanning a 50,000-element
+    // array per row. The stage check is done in application terms: the transition
+    // row's to_stage_id is what the worker wrote, and the job's target is fixed.
     const { rows } = await pool.query<{ n: number }>(
-      `SELECT count(*)::int AS n FROM bulk_job_item i
-         JOIN opportunity o ON o.id = i.opportunity_id AND o.workspace_id = i.workspace_id
-        WHERE i.job_id = $1 AND o.stage_id = $2`,
+      `SELECT count(*)::int AS n FROM opportunity_transition
+        WHERE job_id = $1 AND to_stage_id = $2`,
       [jobId, ws.to],
     );
     expect(rows[0]!.n).toBe(HAPPY_FLOW_SIZE);
+  });
+
+  it('gives every record its own batch, with no overlap', async () => {
+    // A record appearing in two batches would be moved twice and counted twice.
+    // This is the property that makes paging by keyset safe, and it is the only
+    // place a duplicate could hide now that membership is stored.
+    //
+    // Two subqueries, because joining a set-returning function to the batch rows
+    // duplicates them: cardinality(item_ids) would be summed once per id it
+    // contains, squaring the total.
+    const { rows } = await pool.query<{ records: number; distinct_ids: number }>(
+      `SELECT (SELECT coalesce(sum(cardinality(item_ids)), 0)::int
+                 FROM bulk_job_outbox WHERE job_id = $1) AS records,
+              (SELECT count(DISTINCT opportunity_id)::int
+                 FROM bulk_job_outbox, unnest(item_ids) AS u(opportunity_id)
+                WHERE job_id = $1) AS distinct_ids`,
+      [jobId],
+    );
+    expect(rows[0]!.records).toBe(HAPPY_FLOW_SIZE);
+    expect(rows[0]!.distinct_ids).toBe(HAPPY_FLOW_SIZE);
   });
 
   it('records one attributable transition per record', async () => {

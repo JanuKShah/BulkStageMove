@@ -39,21 +39,22 @@ describe('bulk-moves endpoints', () => {
       expect(res.body.itemsCreated).toBe(expected.rows[0]!.n);
 
       const items = await pool.query<{ n: number }>(
-        'SELECT count(*)::int AS n FROM bulk_job_item WHERE job_id = $1',
+        'SELECT coalesce(sum(cardinality(item_ids)), 0)::int AS n FROM bulk_job_outbox WHERE job_id = $1',
         [res.body.jobId],
       );
       expect(items.rows[0]!.n).toBe(res.body.itemsCreated);
     });
 
-    it('total_matched agrees with the items written', async () => {
+    it('total_matched agrees with the records written into batches', async () => {
       const res = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
-      const job = await pool.query<{ total_matched: number; items: number }>(
-        `SELECT j.total_matched, count(i.id)::int AS items
-         FROM bulk_job j LEFT JOIN bulk_job_item i ON i.job_id = j.id
-         WHERE j.id = $1 GROUP BY j.total_matched`,
+      const job = await pool.query<{ total_matched: number; records: number }>(
+        `SELECT j.total_matched,
+                coalesce((SELECT sum(cardinality(b.item_ids))::int
+                            FROM bulk_job_outbox b WHERE b.job_id = j.id), 0) AS records
+           FROM bulk_job j WHERE j.id = $1`,
         [res.body.jobId],
       );
-      expect(job.rows[0]!.total_matched).toBe(job.rows[0]!.items);
+      expect(job.rows[0]!.total_matched).toBe(job.rows[0]!.records);
     });
 
     it('filters the snapshot rather than taking the whole workspace', async () => {
@@ -140,32 +141,42 @@ describe('bulk-moves endpoints', () => {
   });
 
   describe('GET /bulk-moves/:id', () => {
-    it('reports counts taken from the items', async () => {
+    it('reports batch counts, and the watermark the counts are as of', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
       const { rows } = await pool.query<{ opportunity_id: string }>(
-        'SELECT opportunity_id FROM bulk_job_item WHERE job_id = $1 ORDER BY opportunity_id LIMIT 2',
+        'SELECT unnest(item_ids) AS opportunity_id FROM bulk_job_outbox WHERE job_id = $1 LIMIT 2',
         [job.body.jobId],
       );
       for (const r of rows) {
-        await recordJobTransition(
-          ws.workspaceId,
-          job.body.jobId,
-          r.opportunity_id,
-          null,
-          newLead(),
-        );
+        await recordJobTransition(ws.workspaceId, job.body.jobId, r.opportunity_id, null, newLead());
       }
 
       const res = await api<{
         status: string;
         totalMatched: number;
-        items: Record<string, number>;
+        snapshotAt: string;
+        batches: Record<string, number>;
       }>(BASE.transition, `/bulk-moves/${job.body.jobId}`, { workspaceId: ws.workspaceId });
 
       expect(res.status).toBe(200);
       expect(res.body.totalMatched).toBe(job.body.itemsCreated);
-      expect(res.body.items['completed']).toBe(rows.length);
-      expect(res.body.items['pending']).toBe(job.body.itemsCreated - rows.length);
+      expect(Number.isNaN(Date.parse(res.body.snapshotAt))).toBe(false);
+
+      // The counts are batches, not records: there is no per-record state left to
+      // report. total_matched is the record count and is authoritative, because it
+      // is the size of what was written into the batches.
+      //
+      // Deliberately not asserting that anything is still pending. The live worker
+      // is running against this job, and on a fixture this small it can drain the
+      // one batch before the status call lands, which made the assertion a race -
+      // it passed twice and failed once out of three runs. What is stable is that
+      // every batch is accounted for in exactly one state.
+      const total = Object.values(res.body.batches).reduce((a, b) => a + b, 0);
+      const expectedBatches = await pool.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM bulk_job_outbox WHERE job_id = $1',
+        [job.body.jobId],
+      );
+      expect(total).toBe(expectedBatches.rows[0]!.n);
     });
 
     it('returns 404 for an unknown id', async () => {
@@ -199,7 +210,7 @@ describe('bulk-moves endpoints', () => {
     it('returns stage names and outcomes, not bare ids', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
       const { rows } = await pool.query<{ opportunity_id: string }>(
-        'SELECT opportunity_id FROM bulk_job_item WHERE job_id = $1 LIMIT 1',
+        'SELECT unnest(item_ids) AS opportunity_id FROM bulk_job_outbox WHERE job_id = $1 LIMIT 1',
         [job.body.jobId],
       );
       await recordJobTransition(
@@ -229,7 +240,7 @@ describe('bulk-moves endpoints', () => {
     it('paginates without repeating a row when timestamps share a millisecond', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
       const { rows } = await pool.query<{ opportunity_id: string }>(
-        'SELECT opportunity_id FROM bulk_job_item WHERE job_id = $1 ORDER BY opportunity_id LIMIT 5',
+        'SELECT unnest(item_ids) AS opportunity_id FROM bulk_job_outbox WHERE job_id = $1 ORDER BY opportunity_id LIMIT 5',
         [job.body.jobId],
       );
       // Sub-millisecond spacing, which a JS Date cannot represent.
@@ -264,7 +275,7 @@ describe('bulk-moves endpoints', () => {
       const mine = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
       const theirs = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
       const { rows } = await pool.query<{ opportunity_id: string }>(
-        'SELECT opportunity_id FROM bulk_job_item WHERE job_id = $1 LIMIT 1',
+        'SELECT unnest(item_ids) AS opportunity_id FROM bulk_job_outbox WHERE job_id = $1 LIMIT 1',
         [theirs.body.jobId],
       );
       const theirsTransition = await insertTransitionWithMicros(

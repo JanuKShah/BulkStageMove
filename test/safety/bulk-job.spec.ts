@@ -2,14 +2,18 @@ import { randomUUID } from 'node:crypto';
 import {
   BASE,
   api,
+  createJobWithItems,
   destroyWorkspace,
   pool,
   provisionWorkspace,
   recordJobTransition,
+  resetBatchTo,
   seedOpportunities,
+  seedOpportunitiesInStage,
   submitBulkMove,
   type TestWorkspace,
 } from '../helpers';
+import { closeWorkerHarness, processBatchForTest } from './worker-harness';
 
 /**
  * The mechanisms that make a bulk job safe to retry and safe to attribute.
@@ -25,6 +29,7 @@ describe('bulk job safety', () => {
   });
 
   afterAll(async () => {
+    await closeWorkerHarness();
     await destroyWorkspace(ws.workspaceId);
     await pool.end();
   });
@@ -111,52 +116,95 @@ describe('bulk job safety', () => {
     });
   });
 
-  describe('items are scoped to the job tenant', () => {
-    it('refuses an item whose opportunity belongs to another workspace', async () => {
+  describe('batches are scoped to the job tenant', () => {
+    it('refuses a batch whose job belongs to another workspace', async () => {
       const other = await provisionWorkspace('bulkjob-xw');
       const job = await submitBulkMove(other.workspaceId, {
         targetStageId: other.stages['newLead'],
       });
-      // batch_no and from_stage_id are supplied so the failure is the composite
-      // FK, not a NOT NULL violation - otherwise a generic toThrow() passes for
-      // the wrong reason.
-      const { rows: stageRows } = await pool.query<{ id: string }>(
-        'SELECT id FROM stage WHERE workspace_id = $1 LIMIT 1',
-        [other.workspaceId],
-      );
+      // A real id is supplied so the failure is the composite FK, not a NOT NULL
+      // or type violation - otherwise a generic toThrow() passes for the wrong
+      // reason. bulk_job_outbox carries (job_id, workspace_id) as a composite
+      // reference, which is what makes a cross-tenant batch impossible to write.
       await expect(
         pool.query(
-          `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, from_stage_id, batch_no)
-           VALUES ($1, $2, $3, $4, 0)`,
-          [job.body.jobId, other.workspaceId, randomUUID(), stageRows[0]!.id],
+          `INSERT INTO bulk_job_outbox (workspace_id, job_id, batch_no, item_ids)
+           VALUES ($1, $2, 99, $3::uuid[])`,
+          [ws.workspaceId, job.body.jobId, [randomUUID()]],
         ),
-      ).rejects.toThrow(/bulk_job_item_job_fk|foreign key/);
+      ).rejects.toThrow(/bulk_job_outbox_job_fk|foreign key/);
       await destroyWorkspace(other.workspaceId);
     });
 
-    it('refuses the same opportunity twice in one job, so a job cannot double-apply', async () => {
-      const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
-      const { rows } = await pool.query<{ opportunity_id: string; from_stage_id: string }>(
-        'SELECT opportunity_id, from_stage_id FROM bulk_job_item WHERE job_id = $1 LIMIT 1',
-        [job.body.jobId],
+    it('a retry does not write a second transition for a record it already moved', async () => {
+      // Not a constraint test. Retry safety comes from the batch being one
+      // transaction and from the worker skipping records already at the target,
+      // so it has to be exercised by running processBatch twice. There is no
+      // unique index here to assert against, deliberately - see 0001_schema.sql
+      // for why one is not needed and what would have to change to bring it back.
+      // contacted -> closedWon, because the fixture only permits forward moves
+      // and a backward one would correctly fail as unmovable, testing nothing
+      // about retry.
+      const ids = await seedOpportunitiesInStage(ws.workspaceId, contacted(), 5);
+      const target = ws.stages['closedWon'];
+      const { jobId, batchNo } = await createJobWithItems(ws.workspaceId, target, ids, {
+        enqueue: false,
+      });
+
+      const first = await processBatchForTest(ws.workspaceId, jobId, batchNo);
+      expect(first.moved).toBe(5);
+      expect(first.failed).toBe(0);
+
+      // Put the batch back to claimable, exactly as a redelivered message would
+      // find one whose worker died after committing.
+      await resetBatchTo(jobId, batchNo, 'pending');
+      const second = await processBatchForTest(ws.workspaceId, jobId, batchNo);
+
+      const { rows } = await pool.query<{ n: number; dupes: number }>(
+        `SELECT count(*)::int AS n,
+                (SELECT count(*)::int FROM (
+                   SELECT opportunity_id FROM opportunity_transition
+                    WHERE job_id = $1
+                    GROUP BY opportunity_id HAVING count(*) > 1
+                 ) d) AS dupes
+           FROM opportunity_transition WHERE job_id = $1`,
+        [jobId],
       );
-      await expect(
-        pool.query(
-          `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, from_stage_id, batch_no)
-           VALUES ($1, $2, $3, $4, 0)`,
-          [job.body.jobId, ws.workspaceId, rows[0]!.opportunity_id, rows[0]!.from_stage_id],
-        ),
-      ).rejects.toThrow(/bulk_job_item_job_opportunity_uniq/);
+      expect(rows[0]!.n).toBe(5);
+      expect(rows[0]!.dupes).toBe(0);
+      // The retry finds every record already where it wanted them, so it reports
+      // them as its own settled work rather than as new moves or as failures.
+      expect(second.moved).toBe(5);
+      expect(second.failed).toBe(0);
+
+      // And the job's counters do not double-count. They are re-derived from the
+      // batch rows rather than incremented, precisely so a batch that settles
+      // twice still reports its records once - an increment here reported 10 for
+      // a 5 record job.
+      const counters = await pool.query<{ processed_count: number; total_matched: number }>(
+        'SELECT processed_count, total_matched FROM bulk_job WHERE id = $1',
+        [jobId],
+      );
+      expect(counters.rows[0]!.processed_count).toBe(5);
+      expect(counters.rows[0]!.processed_count).toBe(counters.rows[0]!.total_matched);
     });
 
-    it('deleting a job removes its items', async () => {
+    it('deleting a job removes its batches and its failures', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
+      await pool.query(
+        `INSERT INTO bulk_job_failure (workspace_id, job_id, batch_no, opportunity_id, error)
+         SELECT $1, $2, 0, unnest(item_ids), 'forced' FROM bulk_job_outbox
+          WHERE job_id = $2 LIMIT 1`,
+        [ws.workspaceId, job.body.jobId],
+      );
       await pool.query('DELETE FROM bulk_job WHERE id = $1', [job.body.jobId]);
-      const { rows } = await pool.query<{ n: number }>(
-        'SELECT count(*)::int AS n FROM bulk_job_item WHERE job_id = $1',
+      const { rows } = await pool.query<{ batches: number; failures: number }>(
+        `SELECT (SELECT count(*)::int FROM bulk_job_outbox WHERE job_id = $1) AS batches,
+                (SELECT count(*)::int FROM bulk_job_failure WHERE job_id = $1) AS failures`,
         [job.body.jobId],
       );
-      expect(rows[0]!.n).toBe(0);
+      expect(rows[0]!.batches).toBe(0);
+      expect(rows[0]!.failures).toBe(0);
     });
   });
 
@@ -164,7 +212,7 @@ describe('bulk job safety', () => {
     it('a job transition is listed and a manual move is not', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
       const { rows } = await pool.query<{ opportunity_id: string }>(
-        'SELECT opportunity_id FROM bulk_job_item WHERE job_id = $1 LIMIT 2',
+        'SELECT unnest(item_ids) AS opportunity_id FROM bulk_job_outbox WHERE job_id = $1 LIMIT 2',
         [job.body.jobId],
       );
       const first = rows[0]!;
@@ -208,7 +256,7 @@ describe('bulk job safety', () => {
     it('deleting a job keeps the transition and clears job_id', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
       const { rows } = await pool.query<{ opportunity_id: string }>(
-        'SELECT opportunity_id FROM bulk_job_item WHERE job_id = $1 LIMIT 1',
+        'SELECT unnest(item_ids) AS opportunity_id FROM bulk_job_outbox WHERE job_id = $1 LIMIT 1',
         [job.body.jobId],
       );
       const opportunityId = rows[0]!.opportunity_id;

@@ -2,13 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import type { PoolClient } from 'pg';
 import { DatabaseService } from '../../shared/database/database.service';
 import { RABBIT_CONFIG, type RabbitConfig } from '../../shared/rabbit/rabbit.config';
-
-export interface ClaimedItem {
-  id: string;
-  opportunity_id: string;
-  from_stage_id: string;
-  attempts: number;
-}
+import { type OpportunityRef } from '../../shared/filter/snapshot-query';
 
 /** What the worker tells the broker about a batch. */
 export type BatchDisposition = 'applied' | 'skipped' | 'dead' | 'retry';
@@ -19,19 +13,44 @@ export interface BatchResult {
   moved: number;
   /** Records this batch gave up on, each with its own reason. */
   failed: number;
+  /**
+   * Records that had left the filtered set by the time the batch reached them.
+   *
+   * Reported rather than folded into either of the others, because it is the
+   * number that explains why a job's processed and failed counts do not add up to
+   * its match count. Without it the difference looks like lost work.
+   */
+  skipped: number;
   attempts: number;
   reason?: string;
+}
+
+interface JobSpec {
+  target_stage_id: string;
+  /** The filter's stage list, or null when the filter did not name stages. */
+  filter_stage_ids: string[] | null;
 }
 
 /**
  * All SQL the batch worker runs.
  *
- * The compare-and-swap lives in the UPDATE rather than in a prior SELECT. Reading
- * the current stages, deciding in application code and then writing would leave a
- * window where a user moves a record between the read and the write, and the
- * write would silently clobber it. Joining bulk_job_item into the UPDATE makes
- * Postgres itself refuse unless every record is still where the job found it,
- * and rowCount then says whether it did.
+ * A batch is a position, not a stored set. Batch N is the Nth page of the job's
+ * filter evaluated against its watermark, so nothing had to be written per record
+ * at submission and the worker re-derives the same page on every attempt.
+ *
+ * Two consequences worth stating, because they are the design and not an
+ * accident:
+ *
+ * Retrying re-examines the whole page rather than only what is outstanding, so
+ * the transition insert needs UNIQUE (job_id, opportunity_id) and ON CONFLICT
+ * DO NOTHING to stay idempotent - otherwise a redelivered batch would write a
+ * second audit row for every record it already moved.
+ *
+ * And there is no per-record status, so a record that a user moved by hand
+ * between submission and processing is simply no longer in the page. It is not
+ * overwritten and not reported as a failure; it was out of scope by the time the
+ * job reached it. That is the trade that removed 50,000 rows per job, and it is
+ * why total_matched means "matched at submission".
  */
 @Injectable()
 export class WorkerRepository {
@@ -58,24 +77,38 @@ export class WorkerRepository {
    * Postgres drops the advisory lock when the connection dies, so a killed
    * worker leaves nothing stranded.
    */
-  async processBatch(workspaceId: string, jobId: string, batchNo: number): Promise<BatchResult> {
+  async processBatch(
+    workspaceId: string,
+    jobId: string,
+    batchNo: number,
+  ): Promise<BatchResult> {
     const key = `${jobId}:${batchNo}`;
     const client = await this.db.connect();
+    // If the unlock below fails, this connection still holds a session-scoped
+    // advisory lock. Releasing it back to the pool would leak that key for the
+    // life of the process and no worker could ever lock that batch again, so the
+    // connection is destroyed instead. Destroying it closes the socket, and
+    // Postgres drops the lock with it.
+    let destroy = false;
     try {
       const lock = await client.query<{ locked: boolean }>(
         'SELECT pg_try_advisory_lock(hashtext($1)) AS locked',
         [key],
       );
       if (!lock.rows[0]?.locked) {
-        return { disposition: 'skipped', moved: 0, failed: 0, attempts: 0 };
+        return { disposition: 'skipped', moved: 0, failed: 0, skipped: 0, attempts: 0 };
       }
       try {
         return await this.runOn(client, workspaceId, jobId, batchNo);
       } finally {
-        await client.query('SELECT pg_advisory_unlock(hashtext($1))', [key]);
+        try {
+          await client.query('SELECT pg_advisory_unlock(hashtext($1))', [key]);
+        } catch {
+          destroy = true;
+        }
       }
     } finally {
-      client.release();
+      client.release(destroy);
     }
   }
 
@@ -87,28 +120,53 @@ export class WorkerRepository {
   ): Promise<BatchResult> {
     // --- attempt counter, committed on its own so a rollback cannot erase it
     //
-    // The predicate takes 'running' as well as 'pending'. Setting running is
-    // committed here, before the work, so a rejected batch would otherwise leave
-    // its items running forever and the redelivered message - which looks for
-    // pending - would skip them, stranding the job. Re-claiming is safe only
-    // because the advisory lock means one worker is ever in here for a batch.
-    // A batch that already committed has its items completed, so it matches
-    // neither and is skipped, which is what makes redelivery harmless.
+    // The predicate takes 'running' as well as 'pending', exactly as the old
+    // per-item claim did. A batch whose worker died mid-flight has to be
+    // re-claimable, or the redelivered message would find nothing pending and
+    // the job would hang. The advisory lock is what makes re-claiming safe: one
+    // worker is ever inside here for a batch. A batch that already committed is
+    // 'completed' and matches neither, so redelivery does nothing.
+    // The rollback matters: without it a failure here leaves an open, aborted
+    // transaction on a session-scoped connection. The next statement on it fails
+    // too, the connection returns to the pool still dirty, and every later user
+    // of that pooled connection inherits the wreckage. Observed exactly that way
+    // when this statement named a column that did not exist: four workers sat on
+    // `idle in transaction (aborted)` and the batches looped through the retry
+    // queue for ever, because the failure never reached the attempt counter.
     await client.query('BEGIN');
-    const claimed = await client.query<ClaimedItem>(
-      `UPDATE bulk_job_item
-          SET status = 'running', attempts = attempts + 1, updated_at = now()
-        WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3
-          AND status IN ('pending', 'running')
-        RETURNING id, opportunity_id, from_stage_id, attempts`,
-      [jobId, batchNo, workspaceId],
-    );
-    await client.query('COMMIT');
+    let claimed;
+    try {
+      // completed_count and failed_count come back too, and they are what makes
+      // the job counters an increment rather than a sum. They hold whatever this
+      // batch last settled - zero on a first attempt, its previous totals on a
+      // retry - so the delta can be applied instead of the absolute count.
+      claimed = await client.query<{
+        attempts: number;
+        completed_count: number;
+        failed_count: number;
+      }>(
+        `UPDATE bulk_job_outbox
+            SET status = 'running', attempts = attempts + 1,
+                started_at = COALESCE(started_at, now()), updated_at = now()
+          WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3
+            AND status IN ('pending', 'running')
+          RETURNING attempts, completed_count, failed_count`,
+        [jobId, batchNo, workspaceId],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    }
 
     if (claimed.rows.length === 0) {
-      return { disposition: 'skipped', moved: 0, failed: 0, attempts: 0 };
+      return { disposition: 'skipped', moved: 0, failed: 0, skipped: 0, attempts: 0 };
     }
     const attempts = claimed.rows[0]!.attempts;
+    const prior = {
+      completed: claimed.rows[0]!.completed_count,
+      failed: claimed.rows[0]!.failed_count,
+    };
 
     if (attempts > this.config.maxAttempts) {
       const failed = await this.failBatch(
@@ -117,21 +175,23 @@ export class WorkerRepository {
         jobId,
         batchNo,
         'attempts exhausted',
+        prior.failed,
       );
       return {
         disposition: 'dead',
         moved: 0,
         failed,
+        skipped: 0,
         attempts,
-        reason: `${failed} item(s) failed`,
+        reason: `${failed} record(s) failed`,
       };
     }
 
     // --- the work, one transaction. Per-record outcomes are committed together,
-    // so a batch never leaves half its records marked done and half pending.
+    // so a batch never leaves half its records moved and half not.
     await client.query('BEGIN');
     try {
-      const result = await this.applyOn(client, workspaceId, jobId, batchNo);
+      const result = await this.applyOn(client, workspaceId, jobId, batchNo, attempts, prior);
       await client.query('COMMIT');
       return { disposition: 'applied', ...result, attempts };
     } catch (error) {
@@ -140,18 +200,19 @@ export class WorkerRepository {
       // Only reached for conditions that are not per-record: a lost job row, or
       // a concurrent write. Those are worth retrying, and only the attempt that
       // spends the budget records the failure - reporting 'dead' without writing
-      // it would dead-letter the message and leave the items running forever.
+      // it would dead-letter the message and leave the batch running forever.
       if (attempts >= this.config.maxAttempts) {
-        const failed = await this.failBatch(client, workspaceId, jobId, batchNo, reason);
+        const failed = await this.failBatch(client, workspaceId, jobId, batchNo, reason, prior.failed);
         return {
           disposition: 'dead',
           moved: 0,
           failed,
+          skipped: 0,
           attempts,
-          reason: `${failed} item(s) failed: ${reason}`,
+          reason: `${failed} record(s) failed: ${reason}`,
         };
       }
-      return { disposition: 'retry', moved: 0, failed: 0, attempts, reason };
+      return { disposition: 'retry', moved: 0, failed: 0, skipped: 0, attempts, reason };
     }
   }
 
@@ -159,59 +220,84 @@ export class WorkerRepository {
    * Applies the batch, one record at a time.
    *
    * The batch is the unit of dispatch and of retry, not of atomicity. A record
-   * that cannot move, or that a user has moved by hand since submission, fails
-   * on its own and the rest of the batch still lands. Refusing the whole batch
-   * for one blocked record would mean a single unmovable deal in 50,000 leaves
-   * 49,999 untouched, which is not a useful bulk move.
+   * that cannot move fails on its own and the rest of the batch still lands.
+   * Refusing the whole batch for one blocked record would mean a single
+   * unmovable deal in 50,000 leaves 49,999 untouched, which is not a useful bulk
+   * move.
    *
-   * The three outcomes:
-   *   moved      - still in the stage the job found it, and the move is permitted
-   *   stale      - a user changed it since submission, so it is not overwritten
-   *   unmovable  - no transition rule permits the move
+   * Four outcomes, and the distinction between the middle two is the whole point
+   * of re-reading live state rather than trusting the stored membership:
+   *
+   *   moved     - in the filtered set, still there, and the move is permitted
+   *   left      - a user moved it out of the filtered set since submission. It is
+   *               not moved and not reported as an error, because undoing
+   *               someone's deliberate change is worse than not finishing the
+   *               job. This is the case the design trades a frozen-set guarantee
+   *               for, and it is why processed_count can land below total_matched.
+   *   unmovable - no transition rule permits the move from where it sits
+   *   gone      - the record no longer exists
    *
    * Throws only for conditions that are not per-record: a missing job row, or a
-   * concurrent write that lands between the read and the write below. Both mean
-   * the transaction should roll back and the batch be retried, because there is
-   * no correct partial answer to give.
+   * concurrent write landing between the read and the write below. Both mean
+   * there is no correct partial answer, so the transaction rolls back and the
+   * batch is retried.
    */
   private async applyOn(
     client: PoolClient,
     workspaceId: string,
     jobId: string,
     batchNo: number,
-  ): Promise<{ moved: number; failed: number }> {
-    const items = await client.query<{
-      opportunity_id: string;
-      from_stage_id: string;
-      current_stage_id: string | null;
-    }>(
-      `SELECT i.opportunity_id, i.from_stage_id, o.stage_id AS current_stage_id
-         FROM bulk_job_item i
-         LEFT JOIN opportunity o ON o.id = i.opportunity_id AND o.workspace_id = i.workspace_id
-        WHERE i.job_id = $1 AND i.batch_no = $2 AND i.workspace_id = $3 AND i.status = 'running'`,
-      [jobId, batchNo, workspaceId],
-    );
-    const claimed = items.rows;
-    if (claimed.length === 0) return { moved: 0, failed: 0 };
-
-    // The target comes from the job row, not the message, so a hand-crafted
-    // message cannot redirect a batch.
-    const target = await client.query<{ target_stage_id: string }>(
-      'SELECT target_stage_id FROM bulk_job WHERE id = $1 AND workspace_id = $2',
+    attempts: number,
+    prior: { completed: number; failed: number },
+  ): Promise<{ moved: number; failed: number; skipped: number }> {
+    // The target and the batch's membership both come from the database, not the
+    // message, so a hand-crafted message cannot redirect a batch or hand it
+    // records it was not given. The filter's stage list comes along too, because
+    // "has this record left the set the job was asked to move" is the question
+    // that decides whether to touch it at all.
+    const job = await client.query<JobSpec>(
+      `SELECT target_stage_id, filter->'stageId' AS filter_stage_ids
+         FROM bulk_job WHERE id = $1 AND workspace_id = $2`,
       [jobId, workspaceId],
     );
-    const targetId = target.rows[0]?.target_stage_id;
-    if (!targetId) throw new BatchRejected('job row is gone, so the target stage is unknown');
+    const spec = job.rows[0];
+    if (!spec) throw new BatchRejected('job row is gone, so the target stage is unknown');
+    const targetId = spec.target_stage_id;
+    // Null means the filter did not name stages, so every record is in scope and
+    // there is nothing to compare against.
+    const filterStages = new Set<string>(spec.filter_stage_ids ?? []);
+
+    const batch = await client.query<{ item_ids: string[] }>(
+      `SELECT item_ids FROM bulk_job_outbox
+        WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3`,
+      [jobId, batchNo, workspaceId],
+    );
+    const ids = batch.rows[0]?.item_ids ?? [];
+    if (ids.length === 0) {
+      await this.settleBatch(client, jobId, batchNo, workspaceId, 0, 0);
+      await this.settleJob(client, workspaceId, jobId);
+      return { moved: 0, failed: 0, skipped: 0 };
+    }
+
+    // The live stage for every record in the batch. This is the baseline the
+    // decision is made against - the stored membership says which records to
+    // consider, and this says where they actually are now.
+    const live = await client.query<OpportunityRef>(
+      `SELECT id, stage_id FROM opportunity
+        WHERE workspace_id = $1 AND id = ANY($2::uuid[])`,
+      [workspaceId, ids],
+    );
+    const present = new Map(live.rows.map((r) => [r.id, r.stage_id]));
 
     // One query for the rules of every stage this batch starts from, not 1000.
     const rules = await client.query<{ from_stage_id: string; to_stage_id: string }>(
       `SELECT from_stage_id, to_stage_id FROM stage_transition_rule
         WHERE workspace_id = $1 AND from_stage_id = ANY($2::uuid[])`,
-      [workspaceId, [...new Set(claimed.map((c) => c.from_stage_id))]],
+      [workspaceId, [...new Set(present.values())]],
     );
     const permitted = new Set(rules.rows.map((r) => `${r.from_stage_id}->${r.to_stage_id}`));
 
-    const movable: { id: string; from: string }[] = [];
+    const movable: { id: string; stage_id: string }[] = [];
     // Keyed by reason so each distinct cause is recorded on its own records.
     const failures = new Map<string, string[]>();
     const fail = (reason: string, id: string): void => {
@@ -220,21 +306,41 @@ export class WorkerRepository {
       else failures.set(reason, [id]);
     };
 
-    for (const item of claimed) {
-      if (item.current_stage_id === null) {
-        fail('opportunity no longer exists', item.opportunity_id);
-      } else if (item.current_stage_id !== item.from_stage_id) {
-        fail('changed stage since the job was submitted', item.opportunity_id);
-      } else if (!permitted.has(`${item.from_stage_id}->${targetId}`)) {
-        fail('no permitted transition to the target stage', item.opportunity_id);
-      } else {
-        movable.push({ id: item.opportunity_id, from: item.from_stage_id });
+    // Iterate the stored membership, not what came back. A record that has since
+    // been deleted is in neither set, and dropping it silently would hide a real
+    // loss; a record that has left the filtered set is in one and must be
+    // recognised as out of scope rather than moved.
+    let alreadyThere = 0;
+    let leftScope = 0;
+    for (const id of ids) {
+      const stageId = present.get(id);
+      if (stageId === undefined) {
+        fail('opportunity no longer exists', id);
+        continue;
       }
+      if (stageId === targetId) {
+        // Already where the job wanted it. Counted as moved rather than failed,
+        // because on a retry that is exactly what it is - the previous attempt
+        // did this record before dying. Treating it as a failure would turn every
+        // successful record into a failure on the second attempt.
+        alreadyThere += 1;
+        continue;
+      }
+      if (filterStages.size > 0 && !filterStages.has(stageId)) {
+        // Moved out of the stages this job was asked to act on. Left alone.
+        leftScope += 1;
+        continue;
+      }
+      if (!permitted.has(`${stageId}->${targetId}`)) {
+        fail('no permitted transition to the target stage', id);
+        continue;
+      }
+      movable.push({ id, stage_id: stageId });
     }
 
-    // Compare-and-swap per record, pairing each id with the stage it was
-    // expected to be in. Comparing against a set of stages would let a record
-    // that had been moved to a *different* member of that set slip through.
+    // Compare-and-swap per record, pairing each id with the stage it was read in.
+    // Comparing against a set of stages would let a record that had been moved to
+    // a *different* member of that set slip through.
     let movedCount = 0;
     if (movable.length > 0) {
       const moved = await client.query<{ id: string }>(
@@ -243,7 +349,7 @@ export class WorkerRepository {
            FROM unnest($3::uuid[], $4::uuid[]) AS t(id, from_stage)
           WHERE o.workspace_id = $1 AND o.id = t.id AND o.stage_id = t.from_stage
         RETURNING o.id`,
-        [workspaceId, targetId, movable.map((m) => m.id), movable.map((m) => m.from)],
+        [workspaceId, targetId, movable.map((m) => m.id), movable.map((m) => m.stage_id)],
       );
       movedCount = moved.rows.length;
       if (movedCount !== movable.length) {
@@ -254,63 +360,120 @@ export class WorkerRepository {
           `${movable.length - movedCount} record(s) changed stage during the batch`,
         );
       }
-    }
 
-    const failedCount = [...failures.values()].reduce((a, l) => a + l.length, 0);
-
-    if (movable.length > 0) {
+      // A plain insert, with no ON CONFLICT. The batch is one transaction, so a
+      // failed attempt rolls its transitions back with its updates and a retry
+      // starts from nothing; and a record already at the target was excluded from
+      // `movable` above, so it is never inserted for twice. There is no unique
+      // constraint behind this - see the note in 0001_schema.sql for why one is
+      // not needed and what would have to change for it to be.
       await client.query(
         `INSERT INTO opportunity_transition
            (workspace_id, opportunity_id, from_stage_id, to_stage_id, job_id)
          SELECT $1, t.id, t.from_stage, $3, $2
            FROM unnest($4::uuid[], $5::uuid[]) AS t(id, from_stage)`,
-        [workspaceId, jobId, targetId, movable.map((m) => m.id), movable.map((m) => m.from)],
-      );
-
-      await client.query(
-        `UPDATE bulk_job_item
-            SET status = 'completed', completed_at = now(), updated_at = now()
-          WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3
-            AND status = 'running' AND opportunity_id = ANY($4::uuid[])`,
-        [jobId, batchNo, workspaceId, movable.map((m) => m.id)],
+        [workspaceId, jobId, targetId, movable.map((m) => m.id), movable.map((m) => m.stage_id)],
       );
     }
 
-    for (const [reason, ids] of failures) {
+    // Records already at the target count as this batch's work, whether this
+    // attempt moved them or an earlier one did. Records that left scope count as
+    // neither: they were in the match at submission and are not any more, which
+    // is the documented reason processed_count can land below total_matched.
+    const settled = movedCount + alreadyThere;
+    const failedCount = [...failures.values()].reduce((a, l) => a + l.length, 0);
+
+    for (const [reason, failedIds] of failures) {
       await client.query(
-        `UPDATE bulk_job_item
-            SET status = 'failed', error = $4, completed_at = now(), updated_at = now()
-          WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3
-            AND status = 'running' AND opportunity_id = ANY($5::uuid[])`,
-        [jobId, batchNo, workspaceId, reason.slice(0, 500), ids],
+        `INSERT INTO bulk_job_failure
+           (workspace_id, job_id, batch_no, opportunity_id, from_stage_id, error, attempts)
+         SELECT $1, $2, $3, t.id, t.from_stage, $5, $6
+           FROM unnest($4::uuid[], $7::uuid[]) AS t(id, from_stage)
+         ON CONFLICT (job_id, opportunity_id) DO UPDATE
+           SET attempts = bulk_job_failure.attempts + 1, error = EXCLUDED.error`,
+        [
+          workspaceId,
+          jobId,
+          batchNo,
+          failedIds,
+          reason.slice(0, 500),
+          attempts,
+          // A deleted record has no live stage, so its from_stage is null. The
+          // column allows it for exactly this case.
+          failedIds.map((id) => present.get(id) ?? null),
+        ],
       );
     }
 
+    await this.settleBatch(client, jobId, batchNo, workspaceId, settled, failedCount, [
+      ...failures.keys(),
+    ]);
+
+    // The job's record counters take a delta, not an absolute and not a sum.
+    //
+    // A plain increment double-counts, because a retry settles the same batch
+    // twice - the claim takes 'running' as well as 'pending' precisely so a dead
+    // worker's batch can be re-taken. Five records run twice reported 10.
+    //
+    // Summing the batch rows was tried instead, and is wrong for a reason worth
+    // recording: every worker updates this same row, so they serialise on it, and
+    // a statement that blocks on a row lock has already taken its snapshot from
+    // before the worker ahead of it committed. Its sum is stale by one batch, and
+    // because it commits last the stale value is the one that survives. Observed
+    // as processed_count of 49,000 on a 50,000 record job whose fifty batch rows
+    // were all correct at 50,000.
+    //
+    // A delta is the way out: settled minus what this batch last contributed.
+    // Additions commute, so the order workers commit in stops mattering, and a
+    // retry that settles the same totals again contributes zero.
     await client.query(
       `UPDATE bulk_job
-          SET processed_count = processed_count + $2,
-              failed_count = failed_count + $3,
+          SET processed_count = processed_count + $3,
+              failed_count = failed_count + $4,
               status = CASE WHEN status = 'pending' THEN 'running' ELSE status END,
               started_at = COALESCE(started_at, now()),
-              error = CASE WHEN $3 > 0 THEN $4::text ELSE error END,
+              error = CASE WHEN $4 > 0 THEN $5::text ELSE error END,
               updated_at = now()
-        WHERE id = $1 AND workspace_id = $5`,
+        WHERE id = $1 AND workspace_id = $2`,
       [
         jobId,
-        movedCount,
-        failedCount,
-        [...failures.keys()].join('; ').slice(0, 500) || null,
         workspaceId,
+        settled - prior.completed,
+        failedCount - prior.failed,
+        [...failures.keys()].join('; ').slice(0, 500) || null,
       ],
     );
 
     await this.settleJob(client, workspaceId, jobId);
-    return { moved: movedCount, failed: failedCount };
+    return { moved: settled, failed: failedCount, skipped: leftScope };
+  }
+
+  /** Records what became of the batch, on the batch row. */
+  private async settleBatch(
+    client: PoolClient,
+    jobId: string,
+    batchNo: number,
+    workspaceId: string,
+    completed: number,
+    failed: number,
+    reasons: string[] = [],
+  ): Promise<void> {
+    await client.query(
+      `UPDATE bulk_job_outbox
+          SET status = 'completed',
+              completed_count = $4,
+              failed_count = $5,
+              error = $6::text,
+              completed_at = now(),
+              updated_at = now()
+        WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3`,
+      [jobId, batchNo, workspaceId, completed, failed, reasons.join('; ').slice(0, 500) || null],
+    );
   }
 
   /**
    * Marks a batch permanently failed. Only reached once the attempt limit is
-   * spent, so it is the one place items leave as 'failed' rather than pending.
+   * spent, so it is the one place a batch gives up rather than settling.
    */
   private async failBatch(
     client: PoolClient,
@@ -318,25 +481,34 @@ export class WorkerRepository {
     jobId: string,
     batchNo: number,
     reason: string,
+    priorFailed: number,
   ): Promise<number> {
     await client.query('BEGIN');
     try {
-      const failed = await client.query(
-        `UPDATE bulk_job_item
-            SET status = 'failed', error = $4, completed_at = now(), updated_at = now()
-          WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3
-            AND status IN ('pending','running')`,
-        [jobId, batchNo, workspaceId, reason.slice(0, 500)],
+      const size = await client.query<{ n: number }>(
+        'SELECT cardinality(item_ids)::int AS n FROM bulk_job_outbox WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3',
+        [jobId, batchNo, workspaceId],
       );
+      const failed = size.rows[0]?.n ?? 0;
+      await client.query(
+        `UPDATE bulk_job_outbox
+            SET status = 'failed', failed_count = $4, error = $5::text,
+                completed_at = now(), updated_at = now()
+          WHERE job_id = $1 AND batch_no = $2 AND workspace_id = $3`,
+        [jobId, batchNo, workspaceId, failed, reason.slice(0, 500)],
+      );
+      // Delta, not a sum, for the same reason as in applyOn: this path can be
+      // reached on a later attempt than the one that counted the records, and a
+      // sum read under a row lock is stale by whatever committed while it waited.
       await client.query(
         `UPDATE bulk_job
-            SET failed_count = failed_count + $2, error = $4::text, updated_at = now()
+            SET failed_count = greatest(failed_count + $2, 0), error = $4::text, updated_at = now()
           WHERE id = $1 AND workspace_id = $3`,
-        [jobId, failed.rowCount ?? 0, workspaceId, reason.slice(0, 500)],
+        [jobId, failed - priorFailed, workspaceId, reason.slice(0, 500)],
       );
       await this.settleJob(client, workspaceId, jobId);
       await client.query('COMMIT');
-      return failed.rowCount ?? 0;
+      return failed;
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -351,23 +523,25 @@ export class WorkerRepository {
    * endpoint. Calling that 'failed' would make a 40,000-of-50,000 job read as a
    * total loss. Only a job where every record failed is 'failed'.
    *
-   * The NOT EXISTS is evaluated under the same row lock as the update, so two
-   * workers finishing the last two batches cannot both conclude the job is
-   * finished and both write a terminal state.
+   * The EXISTS is over 50 batch rows rather than 50,000 items, which is both far
+   * cheaper and no longer a point where every finishing batch contends on the
+   * same scan. It is still evaluated under the row lock as the update takes it,
+   * so two workers finishing the last two batches cannot both conclude the job
+   * is finished.
    */
   private async settleJob(client: PoolClient, workspaceId: string, jobId: string): Promise<void> {
     await client.query(
       `UPDATE bulk_job j
           SET status = CASE
-                WHEN EXISTS (SELECT 1 FROM bulk_job_item i
-                              WHERE i.job_id = j.id AND i.status IN ('pending','running'))
+                WHEN EXISTS (SELECT 1 FROM bulk_job_outbox b
+                              WHERE b.job_id = j.id AND b.status IN ('pending','running'))
                   THEN 'running'
                 WHEN j.processed_count = 0 AND j.failed_count > 0 THEN 'failed'
                 ELSE 'completed'
               END,
               completed_at = CASE
-                WHEN EXISTS (SELECT 1 FROM bulk_job_item i
-                              WHERE i.job_id = j.id AND i.status IN ('pending','running'))
+                WHEN EXISTS (SELECT 1 FROM bulk_job_outbox b
+                              WHERE b.job_id = j.id AND b.status IN ('pending','running'))
                   THEN NULL
                 ELSE now()
               END,

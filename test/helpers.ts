@@ -99,19 +99,48 @@ export async function provisionWorkspace(label: string): Promise<TestWorkspace> 
   }
 }
 
+/**
+ * Retries a statement that Postgres rolled back with a deadlock.
+ *
+ * Deleting a workspace cascades into bulk_job_outbox and bulk_job, and the live
+ * worker container is still applying that job's batches when a test tears its
+ * fixture down. The two transactions grab the same rows in opposite orders, so
+ * one is chosen as the deadlock victim and the statement fails. It is transient:
+ * the loser has already rolled back, so retrying succeeds.
+ *
+ * Without this, teardown fails intermittently and the suite reports a failed run
+ * with every test passing, which is a misleading signal.
+ */
+export async function withDeadlockRetry<T>(
+  fn: () => Promise<T>,
+  attempts = 6,
+): Promise<T> {
+  for (let i = 1; ; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code !== '40P01' || i >= attempts) throw error;
+      await new Promise((r) => setTimeout(r, 150 * i));
+    }
+  }
+}
+
 export async function destroyWorkspace(workspaceId: string): Promise<void> {
-  await pool.query('DELETE FROM workspace WHERE id = $1', [workspaceId]);
+  await withDeadlockRetry(() =>
+    pool.query('DELETE FROM workspace WHERE id = $1', [workspaceId]),
+  );
 }
 
 /**
  * Builds a job and one batch of items without publishing anything.
  *
  * The worker tests need a batch to exist without the running worker container
- * picking it up, so this writes the job, the items and the outbox row directly
- * and the tests call processBatch themselves. It deliberately mirrors what
- * TransitionService.submit does - same columns, same from_stage snapshot - so a
- * change to the submit path shows up here as a difference rather than as a
- * silently stale fixture.
+ * picking it up, so this writes the job and the batch row directly and the tests
+ * call processBatch themselves. It deliberately mirrors what
+ * TransitionService.submit does - same columns, same watermark - so a change to
+ * the submit path shows up here as a difference rather than as a silently stale
+ * fixture.
  */
 export async function createJobWithItems(
   workspaceId: string,
@@ -123,34 +152,36 @@ export async function createJobWithItems(
   try {
     await client.query('BEGIN');
     const job = await client.query<{ id: string }>(
-      `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id)
-       VALUES ($1, $2, '{}'::jsonb, $3) RETURNING id`,
+      `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id, snapshot_at)
+       VALUES ($1, $2, '{}'::jsonb, $3, now()) RETURNING id`,
       [workspaceId, `test-${randomUUID()}`, targetStageId],
     );
     const jobId = job.rows[0]!.id;
 
-    // from_stage_id snapshots where each record is now, exactly as submit does.
-    const items = await client.query<{ id: string }>(
-      `INSERT INTO bulk_job_item (job_id, workspace_id, opportunity_id, from_stage_id, batch_no)
-       SELECT $1, $2, o.id, o.stage_id, 0 FROM opportunity o
-        WHERE o.id = ANY($3::uuid[]) AND o.workspace_id = $2
-       RETURNING id`,
-      [jobId, workspaceId, opportunityIds],
-    );
-    const itemIds = items.rows.map((r) => r.id);
+    // The batch carries the records, as a set. Nothing snapshots where each record
+    // sits: the worker reads the live stage and decides from that, so a fixture
+    // recording a from_stage would assert a field the schema no longer has.
+    const itemIds = [...opportunityIds];
 
     await client.query('UPDATE bulk_job SET total_matched = $2 WHERE id = $1', [
       jobId,
       itemIds.length,
     ]);
 
-    if (options.enqueue !== false) {
-      await client.query(
-        `INSERT INTO bulk_job_outbox (workspace_id, job_id, batch_no, item_count)
-         VALUES ($1, $2, 0, $3)`,
-        [workspaceId, jobId, itemIds.length],
-      );
-    }
+    // The batch row is always created - without it the worker has nothing to
+    // claim, so `enqueue: false` would produce a job that can never run rather
+    // than one the test drives itself.
+    //
+    // What `enqueue: false` actually controls is whether the relay may publish
+    // it. Stamping published_at marks it as already announced, so the live
+    // worker container leaves it alone and the test's own processBatch call is
+    // the only thing that touches it. Without the stamp, the relay picks it up
+    // within a tick and two workers race for the same batch.
+    await client.query(
+      `INSERT INTO bulk_job_outbox (workspace_id, job_id, batch_no, item_ids, published_at)
+       VALUES ($1, $2, 0, $3::uuid[], CASE WHEN $4 THEN NULL ELSE now() END)`,
+      [workspaceId, jobId, itemIds, options.enqueue !== false],
+    );
     await client.query('COMMIT');
     return { jobId, batchNo: 0, itemIds };
   } catch (error) {
@@ -159,6 +190,25 @@ export async function createJobWithItems(
   } finally {
     client.release();
   }
+}
+
+/**
+ * Puts a batch back into a claimable state.
+ *
+ * Only for tests that need to run the same batch twice. A real retry arrives as a
+ * redelivered message against a batch left 'running' by a worker that died, so
+ * 'pending' is the closest faithful reproduction.
+ */
+export async function resetBatchTo(
+  jobId: string,
+  batchNo: number,
+  status: 'pending' | 'running',
+): Promise<void> {
+  await pool.query(
+    `UPDATE bulk_job_outbox SET status = $3, updated_at = now()
+      WHERE job_id = $1 AND batch_no = $2`,
+    [jobId, batchNo, status],
+  );
 }
 
 /** Creates opportunities straight in one stage, for worker fixtures. */
@@ -271,11 +321,11 @@ export async function recordJobTransition(
      VALUES ($1, $2, $3, $4, $5) RETURNING id`,
     [workspaceId, opportunityId, fromStageId, toStageId, jobId],
   );
-  await pool.query(
-    `UPDATE bulk_job_item SET status = 'completed', completed_at = now()
-     WHERE job_id = $1 AND opportunity_id = $2`,
-    [jobId, opportunityId],
-  );
+  // Deliberately does not touch the batch row. The previous version marked an
+  // item completed, which was meaningful when a batch held a thousand of them.
+  // A batch is now the smallest thing with a status, so marking one batch
+  // complete for a single record would claim a thousand records were done. Tests
+  // that need a settled batch should settle it explicitly.
   return rows[0]!.id;
 }
 

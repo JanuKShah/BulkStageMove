@@ -39,11 +39,10 @@ async function main(): Promise<void> {
 
   const { rows } = await pool.query<{ batch_no: number; done_ms: number; n: number }>(
     `SELECT i.batch_no,
-            (EXTRACT(EPOCH FROM (max(i.completed_at) - j.created_at)) * 1000)::bigint AS done_ms,
-            count(*)::int AS n
-       FROM bulk_job_item i JOIN bulk_job j ON j.id = i.job_id
+            (EXTRACT(EPOCH FROM (i.completed_at - j.created_at)) * 1000)::bigint AS done_ms,
+            cardinality(i.item_ids)::int AS n
+       FROM bulk_job_outbox i JOIN bulk_job j ON j.id = i.job_id
       WHERE i.job_id = $1 AND i.completed_at IS NOT NULL
-      GROUP BY i.batch_no
       ORDER BY i.batch_no`,
     [job.id],
   );

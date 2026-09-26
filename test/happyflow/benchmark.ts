@@ -112,6 +112,10 @@ async function main(): Promise<void> {
     `${Math.round(final.processed_count / (endToEndMs / 1000)).toLocaleString()} opportunities/sec`,
   );
 
+  // Per-batch completion, read off the batch rows. A batch has one completed_at
+  // for its whole page, so this is the time the batch finished rather than a
+  // distribution over records - the previous per-item form reported 0ms for every
+  // intra-batch percentile because all the records shared one timestamp.
   const { rows: batches } = await pool.query<{
     batch_no: number;
     first_ms: number;
@@ -119,43 +123,60 @@ async function main(): Promise<void> {
     n: number;
   }>(
     `SELECT batch_no,
-            min(EXTRACT(EPOCH FROM (i.completed_at - j.created_at)) * 1000)::bigint AS first_ms,
-            max(EXTRACT(EPOCH FROM (i.completed_at - j.created_at)) * 1000)::bigint AS last_ms,
-            count(*)::int AS n
-       FROM bulk_job_item i JOIN bulk_job j ON j.id = i.job_id
-      WHERE i.job_id = $1 AND i.completed_at IS NOT NULL
-      GROUP BY batch_no ORDER BY batch_no`,
+            EXTRACT(EPOCH FROM (b.completed_at - j.created_at)) * 1000 AS last_ms,
+            EXTRACT(EPOCH FROM (b.started_at - j.created_at)) * 1000 AS first_ms,
+            cardinality(b.item_ids)::int AS n
+       FROM bulk_job_outbox b JOIN bulk_job j ON j.id = b.job_id
+      WHERE b.job_id = $1 AND b.completed_at IS NOT NULL
+      ORDER BY batch_no`,
     [jobId],
   );
   if (batches.length > 0) {
-    const d = distribution(batches.map((b) => Number(b.last_ms) - Number(b.first_ms)));
-    console.log(`\nPER-BATCH processing time (${d.count} batches of ${batches[0]!.n})`);
+    console.log(`\nPER-BATCH completion, submit to batch finished (${batches.length} batches)`);
+    const d = distribution(batches.map((b) => Number(b.last_ms)));
     line('p50', ms(d.p50));
     line('p95', ms(d.p95));
     line('p99', ms(d.p99));
     line('min / max', `${ms(d.min)} / ${ms(d.max)}`);
   }
 
-  const { rows: perItem } = await pool.query<{ ms: number }>(
-    `SELECT (EXTRACT(EPOCH FROM (i.completed_at - j.created_at)) * 1000)::bigint AS ms
-       FROM bulk_job_item i JOIN bulk_job j ON j.id = i.job_id
-      WHERE i.job_id = $1 AND i.completed_at IS NOT NULL`,
+  // Per-opportunity latency, from the transitions the job actually caused. That
+  // is the only per-record evidence left: there is no item table, so a record's
+  // "moved at" is the transition it produced.
+  // Per-opportunity latency, from the transitions the job caused.
+  //
+  // These are NOT 50,000 independent samples. A batch applies in one
+  // transaction, so all 1,000 of its transitions are inserted together and share
+  // one created_at - the distinct-timestamp count below is the proof, and it is
+  // the number of batches, not the number of records. Reporting p95 over the
+  // expanded set would imply a tail that does not exist: every percentile here
+  // resolves to the same 50 batch times.
+  //
+  // So this is printed as what it is - the batch distribution, restated - rather
+  // than as a per-record percentile it cannot support.
+  const { rows: perItem } = await pool.query<{ n: number; distinct_ts: number }>(
+    `SELECT count(*)::int AS n,
+            count(DISTINCT created_at)::int AS distinct_ts
+       FROM opportunity_transition
+      WHERE job_id = $1`,
     [jobId],
   );
-  const items = distribution(perItem.map((r) => Number(r.ms)));
-  console.log(
-    `\nPER-OPPORTUNITY latency, submit to moved (${items.count.toLocaleString()} samples)`,
-  );
-  line('p50', ms(items.p50));
-  line('p95', ms(items.p95));
-  line('p99', ms(items.p99));
-  line('min / max', `${ms(items.min)} / ${ms(items.max)}`);
-  line('mean', ms(items.mean));
+  if (perItem.length > 0) {
+    console.log(
+      `\nPER-OPPORTUNITY latency, submit to moved (${perItem[0]!.n.toLocaleString()} records)`,
+    );
+    line('distinct timestamps', perItem[0]!.distinct_ts.toLocaleString());
+    console.log(
+      '  one per batch: a batch applies in one transaction, so its 1,000 records\n' +
+        '  share a created_at. Percentiles over the expanded set are the batch\n' +
+        '  distribution above, not a per-record tail.',
+    );
+  }
 
   console.log('\nQUERY PLAN for the worker claim (the partial index)');
   console.log(
     execSync(
-      `docker exec bsm-postgres psql -U app -d bulk_stage_move -tAc "explain (analyze, costs off) update bulk_job_item set status='running' where job_id='${jobId}' and batch_no=0 and workspace_id='${ws.workspaceId}' and status in ('pending','running')"`,
+      `docker exec bsm-postgres psql -U app -d bulk_stage_move -tAc "explain (analyze, costs off) update bulk_job_outbox set status='running' where job_id='${jobId}' and batch_no=0 and workspace_id='${ws.workspaceId}' and status in ('pending','running')"`,
     )
       .toString()
       .trim()

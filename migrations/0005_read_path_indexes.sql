@@ -41,17 +41,19 @@ CREATE INDEX opportunity_transition_opportunity_created_idx
 CREATE INDEX opportunity_transition_job_created_id_idx
     ON opportunity_transition (job_id, created_at, id);
 
--- The worker's claim. bulk_job_item_pending_idx from 0001 is
--- WHERE status = 'pending', which the claim cannot use: its predicate is
--- status IN ('pending', 'running') so that a redelivered message can re-take a
--- batch whose previous attempt rolled back, and a partial index only applies
--- when the query predicate implies the index predicate. The planner was falling
--- back to bulk_job_item_job_opportunity_uniq, filtering on job_id alone. This
--- index matches the predicate the claim actually issues.
-CREATE INDEX bulk_job_item_claimable_idx
-    ON bulk_job_item (job_id, batch_no)
+-- The worker's claim, and the status endpoint's rollup, both against the batch
+-- rows. WHERE job_id = $1 AND batch_no = $2 AND status IN ('pending','running').
+--
+-- The predicate is IN ('pending','running') rather than = 'pending' on purpose.
+-- 'running' has to be re-claimable so a redelivered message can re-take a batch
+-- whose previous attempt rolled back, and a partial index only applies when the
+-- query predicate implies the index predicate - an index on = 'pending' would
+-- sit unused while the planner fell back to scanning on job_id alone. That
+-- mistake was made once already and is what this index exists to correct.
+--
+-- There is no separate pending-only index. The status endpoint aggregates over a
+-- whole job's batches, which a partial index on a single status cannot serve;
+-- it was measured at zero scans before the per-item table was removed.
+CREATE INDEX bulk_job_outbox_claimable_idx
+    ON bulk_job_outbox (job_id, batch_no)
     WHERE status IN ('pending', 'running');
-
--- bulk_job_item_pending_idx is left in place rather than dropped: it serves the
--- status endpoint's count of still-pending work, which filters on
--- status = 'pending' exactly. Both are one line each and each matches one query.

@@ -7,19 +7,19 @@ export interface OutboxRow {
   workspace_id: string;
   job_id: string;
   batch_no: number;
-  item_count: number;
+  item_ids: string[];
   attempts: number;
 }
 
 /**
- * The dispatch outbox.
+ * The dispatch outbox, and the record of what each batch covers.
  *
- * A page of items and the intent to publish it are written in one transaction,
- * so a crash cannot leave a page that exists but was never announced. The relay
+ * A batch's records and the intent to publish it are written in one transaction,
+ * so a crash cannot leave a batch that exists but was never announced. The relay
  * publishes and stamps published_at, which makes delivery at-least-once; the
- * worker claiming pending items is what makes processing effectively-once. The
- * alternative - publishing straight after the insert - has a window where a
- * crash strands a page of pending items and the job never leaves pending.
+ * worker's claim is what makes processing effectively-once. The alternative -
+ * publishing straight after the insert - has a window where a crash strands a
+ * batch and the job never leaves pending.
  */
 @Injectable()
 export class OutboxRepository {
@@ -29,17 +29,17 @@ export class OutboxRepository {
   async enqueue(client: PoolClient, row: OutboxRow): Promise<void> {
     await client.query(
       `INSERT INTO bulk_job_outbox
-         (workspace_id, job_id, batch_no, item_count, attempts)
-       VALUES ($1, $2, $3, $4, $5)
+         (workspace_id, job_id, batch_no, item_ids, attempts)
+       VALUES ($1, $2, $3, $4::uuid[], $5)
        ON CONFLICT (job_id, batch_no) DO NOTHING`,
-      [row.workspace_id, row.job_id, row.batch_no, row.item_count, row.attempts],
+      [row.workspace_id, row.job_id, row.batch_no, row.item_ids, row.attempts],
     );
   }
 
   /** Unsent rows, oldest first, so batches are published in submission order. */
   async unpublished(limit: number): Promise<OutboxRow[]> {
     return this.db.query<OutboxRow>(
-      `SELECT id, workspace_id, job_id, batch_no, item_count, attempts
+      `SELECT id, workspace_id, job_id, batch_no, item_ids, attempts
          FROM bulk_job_outbox
         WHERE published_at IS NULL
         ORDER BY created_at

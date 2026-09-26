@@ -2,7 +2,6 @@ import { Module } from '@nestjs/common';
 import { DatabaseService } from '../../shared/database/database.service';
 import { ServiceClient } from '../../shared/http/service-client';
 import { HealthController } from '../../shared/health/health.controller';
-import { BulkJobItemRepository } from './bulk-job-item.repository';
 import { BulkJobRepository } from './bulk-job.repository';
 import { JobTransitionRepository } from './job-transition.repository';
 import { OutboxRelay } from './outbox-relay';
@@ -18,7 +17,6 @@ import { TransitionService } from './transition.service';
   providers: [
     TransitionService,
     BulkJobRepository,
-    BulkJobItemRepository,
     JobTransitionRepository,
     OutboxRepository,
     OutboxRelay,
