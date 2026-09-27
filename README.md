@@ -32,7 +32,7 @@ crosses.
   carries at least: a name, a monetary value, a status
   (open / won / lost / abandoned), an owner, and created/updated timestamps.
 - Every stage change is recorded as a **transition**.
-- `opportunity.stage_decided_at` is a **logical clock**, see *Design decisions*.
+- `opportunity.stage_decided_at` is a **logical clock**, see `DESIGN.md` section 9.
 
 ## Technology
 
@@ -133,23 +133,9 @@ npm run cli
 npm run cli -- bulk-move --workspace=<uuid> --to=<stageId> --stageId=<uuid> --outcome=won
 ```
 
-Every menu action has a command equivalent, for when the menu cannot be used. A
-mistyped name lists them all.
-
-A workspace id is required. `npm run seed` prints them, and bare `npm run cli` lists them from the database directly, there is no endpoint that does, because a caller must not be able to enumerate other tenants.
-
-**`bulk-move` prints the job id and the command to watch it,** and `--key` makes a retry safe: the same key returns the original job rather than starting a second one.
-
-**`job-watch` polls every 2 seconds until the job settles**, in place on a terminal, appended when piped, so it reads live and in a log. `--interval=ms` and `--timeout=ms` override the defaults; a timeout gives up watching **without cancelling the job**, since there is no cancel endpoint.
-
-```bash
-     0.1s  running     21/50 batches  11 running  18 pending    -
-     2.1s  completed   50/50 batches  0 running  0 pending  23.9 batches/s
-
-  completed in 2.1s  50 batch(es), 50000 matched, 0 failed
-```
-
-Progress is in batches, not records, because the API exposes no records-moved count, see *Left for later*.
+Every menu action has a command equivalent, and the CLI carries the full list of
+them, so nothing here has to be repeated to be discoverable. Run one that does not
+exist and it prints the list back.
 
 **Dump, write the database to a file,** to check by eye that a bulk move or a filter touched exactly the rows you expected. It reads Postgres directly, so it reflects what is actually stored.
 
