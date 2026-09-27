@@ -133,12 +133,4 @@ One line each; the sections above are the reasoning.
   picked up by whichever replica is alive.
 - **One exchange and one queue.** No dead letter queue and no retry queues: a
   batch that runs out of attempts is marked `failed` in `bulk_job_outbox` with its
-  reason, plus a `bulk_job_failure` row per record, and the message is acked. A
-  queue would only repeat what the batch row already says and could not be
-  queried. The attempt count is that row's own `attempts` column, incremented by
-  the same transaction that claims the batch, so the number that stops a retry and
-  the row that records why are the same fact. `POST /bulk-moves/:id/retry-failed`
-  puts a given-up batch back, by clearing `published_at` so the relay republishes
-  it.
-- **A dash in a benchmark table** means the instrumentation did not exist for
-  that configuration, not that the figure is zero.
+  reason, plus a `bulk_job_failure` row per record, and the message is acked.
