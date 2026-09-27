@@ -37,6 +37,21 @@ export interface RabbitConfig {
    * its first batch being written, not a background nicety.
    */
   snapshotSweepIntervalMs: number;
+  /**
+   * How many unfinished jobs one sweep looks at.
+   *
+   * This, not the replica count, is what bounds how many jobs can be built at
+   * once. A sweep walks its candidates in order and skips the ones another
+   * process already holds, so N replicas spread across N of them - but only if
+   * the limit is at least N. At the default of 25, five replicas find five
+   * distinct jobs; leave it at 5 and a sixth replica has nothing left to claim
+   * and idles.
+   *
+   * Sized above the expected replica count rather than equal to it, because a
+   * candidate that is mid-build stays 'preparing' for the whole walk. Too tight
+   * and every replica spends its pass skipping jobs the others are already on.
+   */
+  snapshotSweepLimit: number;
   /** How often the outbox relay looks for unpublished batches. */
   relayIntervalMs: number;
   relayBatchSize: number;
@@ -57,6 +72,7 @@ const DEFAULTS: RabbitConfig = {
   heartbeatSeconds: 30,
   consumerConcurrency: 12,
   snapshotSweepIntervalMs: 250,
+  snapshotSweepLimit: 25,
   relayIntervalMs: 250,
   relayBatchSize: 50,
 };
@@ -98,6 +114,7 @@ export function rabbitConfig(): RabbitConfig {
     heartbeatSeconds: int('RABBITMQ_HEARTBEAT', DEFAULTS.heartbeatSeconds),
     consumerConcurrency: int('RABBITMQ_CONSUMER_CONCURRENCY', DEFAULTS.consumerConcurrency),
     snapshotSweepIntervalMs: int('SNAPSHOT_SWEEP_INTERVAL_MS', DEFAULTS.snapshotSweepIntervalMs),
+    snapshotSweepLimit: int('SNAPSHOT_SWEEP_LIMIT', DEFAULTS.snapshotSweepLimit),
     relayIntervalMs: int('RABBITMQ_RELAY_INTERVAL_MS', DEFAULTS.relayIntervalMs),
     relayBatchSize: int('RABBITMQ_RELAY_BATCH_SIZE', DEFAULTS.relayBatchSize),
   };

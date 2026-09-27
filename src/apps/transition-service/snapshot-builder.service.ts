@@ -47,12 +47,31 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Finishes every job still preparing.
+   * Builds whatever is still preparing, one job at a time.
    *
-   * A sweep that is already running is left alone rather than queued: a second
-   * concurrent sweep would walk the same cursor and write the same batch numbers,
-   * and the advisory lock would turn that into wasted work rather than a
-   * correctness problem - but there is no reason to do it.
+   * Two different concurrency questions live here, and only one of them has a
+   * limit that matters.
+   *
+   * Within a job, the walk cannot be parallelised at all. Page N+1's predicate
+   * contains page N's last row as its keyset cursor, so there is no way to ask
+   * for page 2 before page 1 has returned. One job, one walker, always.
+   *
+   * Across jobs there is no such coupling - each job has its own filter, its own
+   * watermark and its own cursor - so building three jobs at once is not merely
+   * safe but the only way to keep up when three arrive together. That is what the
+   * advisory lock below arranges: it makes "one walker per job" a rule the
+   * database enforces rather than a property of there happening to be one
+   * replica.
+   *
+   * Without it, a second replica is *correct* and *wasteful*: the batch insert is
+   * ON CONFLICT DO NOTHING and both walkers compute the same cursor, so the
+   * stored result is right either way. But every page is read and written twice,
+   * and the waste scales with the replica count. Correct enough to ship is not
+   * the same as working.
+   *
+   * A sweep already running is left alone rather than queued, for the same
+   * reason: a second concurrent sweep in one process would walk the same cursors
+   * for no gain.
    */
   async sweep(): Promise<void> {
     if (this.running || this.stopped) return;
@@ -62,12 +81,13 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
         `SELECT id, workspace_id FROM bulk_job
           WHERE status = 'preparing'
           ORDER BY created_at
-          LIMIT 5`,
+          LIMIT $1`,
+        [this.config.snapshotSweepLimit],
       );
       for (const job of jobs) {
         if (this.stopped) return;
         try {
-          await this.build(job.id, job.workspace_id);
+          await this.withClaim(job.id, () => this.build(job.id, job.workspace_id));
         } catch (error) {
           // Left preparing on purpose. The next sweep retries from the cursor, and
           // a job that cannot be built is one an operator should see rather than
@@ -79,6 +99,56 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
       }
     } finally {
       this.running = false;
+    }
+  }
+
+  /**
+   * Runs fn while holding this job's build lock, or returns false if another
+   * process already holds it.
+   *
+   * The same primitive the worker uses to keep two consumers off one batch, for
+   * the same reason: it binds to the session rather than the transaction, so it
+   * has to be taken on a connection held open for the duration, and it has to be
+   * released on that same connection.
+   *
+   * Two properties make it the right tool here rather than a lease column. It
+   * needs no expiry logic, which is where lease-based claims go wrong - a builder
+   * that stalls long enough for its lease to expire gets a second walker, and the
+   * lease is now describing a process that is still running. And Postgres drops
+   * the lock when the connection dies, so a replica that is killed mid-build
+   * releases its jobs immediately instead of holding them for a timeout.
+   *
+   * A skip is not logged. It is the expected outcome whenever another replica is
+   * already building that job, which is every job on every tick while a build is
+   * in flight - at a 250ms interval that would be several lines a second saying
+   * nothing. A job that nobody is building shows up as status='preparing' with no
+   * completion line, which is the signal worth having.
+   */
+  private async withClaim(jobId: string, fn: () => Promise<void>): Promise<boolean> {
+    const client = await this.db.connect();
+    // If the unlock fails this connection still holds the lock, and handing it
+    // back to the pool would leak the key for the life of the process - no
+    // builder could ever walk that job again. Destroying it closes the socket and
+    // Postgres drops the lock with it.
+    let destroy = false;
+    try {
+      const lock = await client.query<{ locked: boolean }>(
+        'SELECT pg_try_advisory_lock(hashtext($1)) AS locked',
+        [jobId],
+      );
+      if (!lock.rows[0]?.locked) return false;
+      try {
+        await fn();
+      } finally {
+        try {
+          await client.query('SELECT pg_advisory_unlock(hashtext($1))', [jobId]);
+        } catch {
+          destroy = true;
+        }
+      }
+      return true;
+    } finally {
+      client.release(destroy);
     }
   }
 
@@ -101,7 +171,16 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
     }>(
       `SELECT filter, snapshot_at, snapshot_cursor, snapshot_cursor_id,
               created_at, correlation_id
-         FROM bulk_job WHERE id = $1 AND workspace_id = $2`,
+         FROM bulk_job
+        WHERE id = $1 AND workspace_id = $2
+          -- Preparing, and only preparing. The claim normally guarantees this
+          -- walk is the only one, but the lock is released *after* the job row is
+          -- finalised, so there is a window where the previous builder has already
+          -- set the status to pending and has not yet let go. A second builder
+          -- that acquires the key in that window would otherwise start the whole
+          -- walk again from batch 0 - every page read and every insert discarded
+          -- by ON CONFLICT. Reading the status here turns that into a no-op.
+          AND status = 'preparing'`,
       [jobId, workspaceId],
     );
     const job = spec[0];
@@ -214,7 +293,17 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
                 updated_at = now()
            FROM (SELECT count(*)::int AS batches, coalesce(sum(cardinality(item_ids)), 0)::int AS records
                    FROM bulk_job_outbox WHERE job_id = $1 AND workspace_id = $2) agg
-          WHERE j.id = $1 AND j.workspace_id = $2`,
+          WHERE j.id = $1 AND j.workspace_id = $2
+            -- Preparing, and only preparing, for the same reason the read above
+            -- checks it. A walk that started while this job was genuinely
+            -- preparing can still be running when something else finalises it -
+            -- an operator resetting the job, or a second builder that got in
+            -- before the entry check existed. Without this the finalise would
+            -- drag a job the workers had already moved to running back to
+            -- pending, and clear a completed_at that was set. The worker would
+            -- eventually settle it again, but in between a caller polling the
+            -- status would be told a running job had not started.
+            AND j.status = 'preparing'`,
         [jobId, workspaceId],
       );
     });
