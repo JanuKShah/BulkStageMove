@@ -11,6 +11,7 @@ import {
   seedOpportunities,
   seedOpportunitiesInStage,
   submitBulkMove,
+  waitForSnapshot,
   type TestWorkspace,
 } from '../helpers';
 import { closeWorkerHarness, processBatchForTest } from './worker-harness';
@@ -211,6 +212,11 @@ describe('bulk job safety', () => {
   describe('transitions are attributable to a job', () => {
     it('a job transition is listed and a manual move is not', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
+      // The batches have to exist before their ids can be read. Submission returns
+      // as soon as the job row does, so the outbox is still empty at this point -
+      // this read used to find nothing and fail on rows[1] being undefined, or
+      // silently assert against a single id.
+      await waitForSnapshot(ws.workspaceId, job.body.jobId);
       const { rows } = await pool.query<{ opportunity_id: string }>(
         'SELECT unnest(item_ids) AS opportunity_id FROM bulk_job_outbox WHERE job_id = $1 LIMIT 2',
         [job.body.jobId],
@@ -255,6 +261,7 @@ describe('bulk job safety', () => {
 
     it('deleting a job keeps the transition and clears job_id', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
+      await waitForSnapshot(ws.workspaceId, job.body.jobId);
       const { rows } = await pool.query<{ opportunity_id: string }>(
         'SELECT unnest(item_ids) AS opportunity_id FROM bulk_job_outbox WHERE job_id = $1 LIMIT 1',
         [job.body.jobId],

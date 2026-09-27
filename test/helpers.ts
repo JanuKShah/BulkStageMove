@@ -218,7 +218,32 @@ export async function resetBatchTo(
   );
 }
 
-/** Creates opportunities straight in one stage, for worker fixtures. */
+/**
+ * Creates a stage belonging to no other test, and returns its id.
+ *
+ * Bulk jobs drain asynchronously, so a stage shared between tests is not a stable
+ * starting condition. An earlier test's job is still moving records when the next
+ * test's snapshot is taken, and the filter that named that stage legitimately
+ * matches zero rows by then. The product is right and the test is wrong: it
+ * assumed a shared stage would still hold what it put there.
+ *
+ * Each test that filters on a stage wants a stage of its own, so nothing else can
+ * move its records out from under it. The name is random because
+ * stage_workspace_name_uniq is per workspace, and two tests in the same file
+ * would otherwise collide.
+ */
+export async function createPrivateStage(
+  workspaceId: string,
+  label = 'private',
+): Promise<string> {
+  const { rows } = await pool.query<{ id: string }>(
+    `INSERT INTO stage (workspace_id, name, outcome)
+     VALUES ($1, $2, 'open') RETURNING id`,
+    [workspaceId, `${label}-${randomUUID().slice(0, 8)}`],
+  );
+  return rows[0]!.id;
+}
+
 export async function seedOpportunitiesInStage(
   workspaceId: string,
   stageId: string,

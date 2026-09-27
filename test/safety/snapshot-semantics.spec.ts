@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   api,
   createJobWithItems,
+  createPrivateStage,
   pool,
   provisionWorkspace,
   resetBatchTo,
@@ -41,10 +42,16 @@ describe('batches hold records instead of rows', () => {
   const newLead = () => ws.stages['newLead'];
 
   it('writes one row per batch, not one row per record', async () => {
-    await seedOpportunitiesInStage(ws.workspaceId, contacted(), 2_500);
+    // A stage of this test's own, and a count that does not depend on what other
+    // tests left behind. Both were previously shared, which made the expected
+    // figure a moving target: jobs drain in the background, so by the time this
+    // snapshot was taken an earlier test's job had already moved the records out
+    // of the filtered stage and the walk correctly matched nothing.
+    const stageId = await createPrivateStage(ws.workspaceId, 'rows-per-batch');
+    await seedOpportunitiesInStage(ws.workspaceId, stageId, 2_530);
     const res = await submitBulkMove(ws.workspaceId, {
       targetStageId: closedWon(),
-      stageId: contacted(),
+      stageId,
     });
     expect(res.status).toBe(201);
     const snap = await waitForSnapshot(ws.workspaceId, res.body.jobId);
@@ -61,11 +68,20 @@ describe('batches hold records instead of rows', () => {
   });
 
   it('gives every record to exactly one batch', async () => {
+    // Private stage again: this asserts an invariant over whatever the job
+    // matched, so it holds for any count, but it needs the walk to have matched
+    // something for the invariant to be about anything.
+    const stageId = await createPrivateStage(ws.workspaceId, 'one-batch-each');
+    await seedOpportunitiesInStage(ws.workspaceId, stageId, 2_530);
     const res = await submitBulkMove(ws.workspaceId, {
       targetStageId: closedWon(),
-      stageId: contacted(),
+      stageId,
     });
     expect(res.status).toBe(201);
+    // Before reading the outbox, which is empty until the walk writes it. Without
+    // this the totals are 0 against 0 and the invariant below is vacuously true -
+    // it would pass without ever having checked a batch.
+    const snap = await waitForSnapshot(ws.workspaceId, res.body.jobId);
     // Two subqueries rather than one over a lateral unnest: joining a set-returning
     // function to the table duplicates the batch rows, so cardinality(item_ids)
     // would be summed once per id it contains - 2,280,900 rather than 2,530.
@@ -81,23 +97,36 @@ describe('batches hold records instead of rows', () => {
     expect(rows[0]!.total).toBe(rows[0]!.distinct_ids);
     // And the count agrees with what the job reports, which is the number that
     // actually landed in batches rather than one taken before the walk.
-    const snap = await waitForSnapshot(ws.workspaceId, res.body.jobId);
     expect(rows[0]!.total).toBe(snap.totalMatched);
+    // Non-zero, so the two assertions above are about real batches rather than
+    // about an empty outbox satisfying both sides of an equality.
+    expect(rows[0]!.total).toBe(2_530);
   });
 
   it('excludes an opportunity created after the watermark', async () => {
-    const before = await seedOpportunitiesInStage(ws.workspaceId, contacted(), 10);
+    const stageId = await createPrivateStage(ws.workspaceId, 'watermark');
+    const before = await seedOpportunitiesInStage(ws.workspaceId, stageId, 10);
     const res = await submitBulkMove(ws.workspaceId, {
       targetStageId: closedWon(),
-      stageId: contacted(),
+      stageId,
     });
     expect(res.status).toBe(201);
 
     // Created after submission, so it must never appear in this job's batches even
     // though it matches the filter. This is the guarantee the brief asks for, and
     // it is what the watermark is for.
-    const after = await seedOpportunitiesInStage(ws.workspaceId, contacted(), 5);
+    //
+    // The watermark is bound when the job row is written, not when the walk runs,
+    // so these five are excluded however long after submission they appear - which
+    // is why this ordering is safe even though the build is now asynchronous.
+    const after = await seedOpportunitiesInStage(ws.workspaceId, stageId, 5);
     expect(after).toHaveLength(5);
+
+    // The batches have to exist before membership can be queried at all. Reading
+    // them straight after submission found nothing and reported zero swept, which
+    // is the same answer this test gets when the watermark works and when the
+    // outbox is simply still empty.
+    await waitForSnapshot(ws.workspaceId, res.body.jobId);
 
     const { rows } = await pool.query<{ swept: number }>(
       `SELECT count(*)::int AS swept
@@ -186,7 +215,11 @@ describe('batches hold records instead of rows', () => {
         outcome: 'won',
       });
       expect(res.status).toBe(201);
-      expect((await waitForSnapshot(ws.workspaceId, res.body.jobId)).totalMatched).toBe(0);
+      // Read against the job's own workspace. It was previously passed this
+      // suite's workspace id, and the status endpoint checks the header against
+      // the job row - so the wait was polling for a job it was not allowed to see
+      // and timed out rather than returning.
+      expect((await waitForSnapshot(empty.workspaceId, res.body.jobId)).totalMatched).toBe(0);
 
       // No batches means nothing would ever settle it, so it is finished on
       // creation. A job stuck at pending for ever is the failure mode here.
@@ -349,11 +382,18 @@ describe('batches hold records instead of rows', () => {
   });
 
   it('reports the watermark the job was submitted at', async () => {
+    // Private stage, because the assertion below is that the reported count
+    // reconciles with real batches - which requires the walk to have matched
+    // something, and a shared filtered stage cannot promise that once earlier
+    // jobs are draining in the background.
+    const stageId = await createPrivateStage(ws.workspaceId, 'reports-watermark');
+    await seedOpportunitiesInStage(ws.workspaceId, stageId, 12);
     const res = await submitBulkMove(ws.workspaceId, {
       targetStageId: closedWon(),
-      stageId: contacted(),
+      stageId,
     });
     expect(res.status).toBe(201);
+    await waitForSnapshot(ws.workspaceId, res.body.jobId);
     const body = await api<{
       snapshotAt: string;
       totalMatched: number;

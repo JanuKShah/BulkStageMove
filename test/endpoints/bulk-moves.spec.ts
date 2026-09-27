@@ -10,6 +10,7 @@ import {
   recordJobTransition,
   seedOpportunities,
   submitBulkMove,
+  waitForJobSettled,
   waitForSnapshot,
   type TestWorkspace,
 } from '../helpers';
@@ -150,6 +151,11 @@ describe('bulk-moves endpoints', () => {
   describe('GET /bulk-moves/:id', () => {
     it('reports batch counts, and the watermark the counts are as of', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
+      // Before reading any batch row. Submission returns as soon as the job row
+      // exists, so the outbox is still empty at this point - these tests used to
+      // read it immediately and were relying on the walk having already happened.
+      const snap = await waitForSnapshot(ws.workspaceId, job.body.jobId);
+
       const { rows } = await pool.query<{ opportunity_id: string }>(
         'SELECT unnest(item_ids) AS opportunity_id FROM bulk_job_outbox WHERE job_id = $1 LIMIT 2',
         [job.body.jobId],
@@ -166,7 +172,9 @@ describe('bulk-moves endpoints', () => {
       }>(BASE.transition, `/bulk-moves/${job.body.jobId}`, { workspaceId: ws.workspaceId });
 
       expect(res.status).toBe(200);
-      expect(res.body.totalMatched).toBe((await waitForSnapshot(ws.workspaceId, job.body.jobId)).totalMatched);
+      // The same figure the wait above settled on, so this compares the endpoint
+      // against the built batches rather than against a moving target.
+      expect(res.body.totalMatched).toBe(snap.totalMatched);
       expect(Number.isNaN(Date.parse(res.body.snapshotAt))).toBe(false);
 
       // The counts are batches, not records: there is no per-record state left to
@@ -204,6 +212,12 @@ describe('bulk-moves endpoints', () => {
   describe('GET /bulk-moves/:id/transitions', () => {
     it('is empty before any work has run', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
+      // Waited for, not because the assertion needs the batches, but because
+      // "before any work has run" is only true if the build is finished. The live
+      // worker can start moving this job while the test is still setting up, and
+      // then the endpoint is legitimately non-empty and the test fails for a
+      // reason that has nothing to do with pagination.
+      await waitForJobSettled(ws.workspaceId, job.body.jobId, 30_000);
       const res = await api<{ items: unknown[]; nextCursor: string | null }>(
         BASE.transition,
         `/bulk-moves/${job.body.jobId}/transitions`,
@@ -216,6 +230,9 @@ describe('bulk-moves endpoints', () => {
 
     it('returns stage names and outcomes, not bare ids', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
+      // The batch has to exist before its ids can be read - see the note in the
+      // status test above.
+      await waitForSnapshot(ws.workspaceId, job.body.jobId);
       const { rows } = await pool.query<{ opportunity_id: string }>(
         'SELECT unnest(item_ids) AS opportunity_id FROM bulk_job_outbox WHERE job_id = $1 LIMIT 1',
         [job.body.jobId],
@@ -246,6 +263,7 @@ describe('bulk-moves endpoints', () => {
 
     it('paginates without repeating a row when timestamps share a millisecond', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
+      await waitForSnapshot(ws.workspaceId, job.body.jobId);
       const { rows } = await pool.query<{ opportunity_id: string }>(
         'SELECT unnest(item_ids) AS opportunity_id FROM bulk_job_outbox WHERE job_id = $1 ORDER BY opportunity_id LIMIT 5',
         [job.body.jobId],
@@ -281,6 +299,7 @@ describe('bulk-moves endpoints', () => {
     it('rejects a cursor that belongs to a different job', async () => {
       const mine = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
       const theirs = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
+      await waitForSnapshot(ws.workspaceId, theirs.body.jobId);
       const { rows } = await pool.query<{ opportunity_id: string }>(
         'SELECT unnest(item_ids) AS opportunity_id FROM bulk_job_outbox WHERE job_id = $1 LIMIT 1',
         [theirs.body.jobId],
