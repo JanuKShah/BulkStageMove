@@ -1,115 +1,66 @@
-# Test strategy
+# Test Strategy
 
-253 tests, 24 suites, in four projects. `npm test` runs all; `npm run test:safety`
-is the one to read first.
+The test suite contains 253 tests across 24 suites, divided into four projects:
 
-| project | files | tests | scope |
+| Project | Files | Tests | Purpose |
 |---|---|---|---|
-| `unit` | 2 | 17 | pure functions, no database |
-| `safety` | 13 | 132 | the mechanisms below |
-| `endpoints` | 8 | 94 | routes, failure paths, tenant scoping |
-| `happyflow` | 1 | 10 | one 50,000-record job through the broker |
+| unit | 2 | 17 | Fast checks for pure functions without a database |
+| safety | 13 | 132 | Concurrency, race conditions, and data safety guards |
+| endpoints | 8 | 94 | HTTP API contracts, status codes, and input validation |
+| happyflow | 1 | 10 | End-to-end 50,000-record run through RabbitMQ and PostgreSQL |
 
-## Delivery is at-least-once, so duplicates are the normal case
+To run everything: npm test. To inspect the core safety logic, run npm run test:safety.
 
-A batch row is marked published only after the broker confirms, so a crash between
-the two re-publishes. Duplicates are therefore expected traffic, not an edge case,
-and the naive fix, read the status, act on it, is wrong in a way that is
-invisible until two consumers collide.
+## 1. Handling At-Least-Once Delivery and Retries
 
-- **Two workers claiming one batch concurrently, where the status predicate cannot help**, both read `pending`, so only the per-batch advisory lock stops the second. **[non-vacuous]**
-- A redelivered message finds a `completed` batch, claims nothing, and does no work.
-- A redelivered message that finds a batch still `running` re-takes it, and one worker is ever inside it, which is what makes re-taking safe.
-- A retry writes no second transition for a record it already moved, and there is no unique index that would have caught it.
-- A retry counts records already at the target as **moved, not failed**, otherwise every record a half-finished batch completed becomes a failure on the second attempt.
-- **Job counters take a delta rather than a sum.** A batch that legitimately settles twice reported 10 records for a 5-record job before this.
-- N callers racing one `idempotencyKey` create exactly one job. **[non-vacuous]**
-- A caller losing that race leaves no half-written job behind.
-- The database refuses a duplicate key even with the service check removed. **[non-vacuous]**
-- The same key with a different filter, or a different target stage, is rejected, otherwise a client retrying a *changed* request silently reuses the old job.
-- A lost batch must hang the job at pending, not complete it. Losing a batch is the one failure worse than duplicating one.
+Because we only mark an outbox batch as published after the broker acknowledges it, network blips can cause duplicate deliveries. Duplicates are normal traffic, not rare anomalies.
 
-## A job's walk cannot be parallelised, and a second replica must not duplicate it
+* *Concurrent worker claims:* If two workers pick up the same batch at the same time, both see the status as pending. Only a session-scoped PostgreSQL advisory lock stops the second worker.
+* *Redelivered batches:* If a message is redelivered after a batch has already finished, the worker recognizes the completed status and does nothing.
+* *Idempotent record moves:* Retrying a batch never inserts duplicate transitions. Records already at the target stage count as successfully moved, not failed.
+* *Delta counters:* Bulk job counters use deltas rather than total sums or naive increments. This prevents retried batches from inflating the total moved count.
+* *Idempotency races:* Multiple concurrent API submissions using the same idempotency key create exactly one job. Callers that lose the race receive the existing job ID rather than an internal server error.
+* *Key reuse validation:* Reusing an idempotency key with a different filter or target stage is rejected with HTTP 409 Conflict.
 
-Page N+1's keyset cursor is page N's last row, so one job is inherently serial.
-That is fine, but it means a second builder is pure waste, and the default of "it's
-idempotent, it'll be fine" is wrong in a way that scales with replica count.
+## 2. Keyset Walking and Safe Resumption
 
-- **Two builders on one job leave exactly one set of batches.** **[non-vacuous]**
-- A builder skips a job another builder is already walking.
-- One job held by a builder does not block a *different* job from building, the claim is per job, not global.
-- The claim is released when the walk finishes, and also when it throws.
-- A job no longer `preparing` is not re-walked.
-- A partial cursor **resumes** rather than restarting, the batch and the cursor commit in one transaction, so the cursor can never claim progress the data does not have.
-- A `preparing` job is never left marked `completed`, which is what the wrong default for that column produced: a silent hang with no batches and nothing to notice it.
+Building batches for a single job cannot be parallelized because each page needs the cursor from the previous page. Multiple worker nodes must not duplicate this work.
 
-## Two actors, one record: the ordering problem
+* *Single builder per job:* Builders use advisory locks per job. A second replica skips any job currently being processed.
+* *Resuming from failures:* The keyset cursor (created_at, id) commits in the exact same transaction as the batch itself. If a node crashes mid-walk, the next worker resumes from that cursor without skipping or duplicating records.
+* *State defaults:* A new job starts in preparing status so the system knows batches are still being generated, avoiding false timeouts.
 
-`stage_decided_at` is a logical clock rather than a timestamp of change, because
-the naive version, "did anyone touch this row since I started?", loses to a
-slower older job. Every row here is a case where the wrong answer is silent.
+## 3. Concurrency Between Users and Background Jobs
 
-- **A person moves a record after submission; the job leaves it alone.** **[non-vacuous]**
-- Left alone even when the person moved it *within* the filtered stage, the clock, not the stage list, is what protects it.
-- **Not** left alone when the person moved it *before* submission.
-- **An older job defers to a newer one** that already moved the record, even if the older job is still draining.
-- **A newer job still moves a record an older job already moved**, the mirror case, and the one that proves the comparison is on submission order and not completion order.
-- A rename does not remove a record from an in-flight job; nor does a value edit. Both are the same class of bug: any write that touches the row must not look like a stage decision.
-- A job write is stamped with the **job's** time, not the write's, or an older job could overwrite a newer one.
-- **Check order is load-bearing**, already-at-target is tested *before* the clock. A person who moves a record *to* the target has stamped it newer, so testing the clock first reports a skip and under-counts a job that achieved its intent. **[non-vacuous]**
-- A job that skipped records still settles rather than hanging.
-- A job over records a person edited afterwards reports the shortfall, rather than quietly reporting success.
+When a user edits an opportunity while a bulk job is running, the human edit must take priority. We use a logical clock (stage_decided_at) instead of a wall clock to track decision order.
 
-## The clock trigger, and the clause that lets a job opt out
+* *Human edits win:* If a user moves an opportunity after the job was submitted, the bulk worker skips that record and reports the shortfall.
+* *Submission order matters:* An older job yielding to a newer job depends on submission time (snapshot_at), not completion time.
+* *Check order in worker:* The worker checks whether a record is already at the target stage before checking the clock. This ensures that records already moved by users or earlier attempts are counted as moved rather than skipped.
+* *Atomic updates:* The stage update and transition audit insertion run in a single SQL CTE. If a record is edited during the statement execution, the batch rolls back and retries cleanly.
 
-- A stage change stamps the wall clock. **[non-vacuous]**
-- The trigger **stands down when the writer sets the clock itself**, without that clause a bulk job would stamp 1,000 rows with the wall clock and defeat the entire design. **[non-vacuous]**
-- A name change, a value change, and an `updated_at`-only change each leave the clock alone.
-- A null clock is rejected, so a record cannot be made permanently undecidable.
-- A record created after a job was submitted still reads as newer than it.
+## 4. Logical Clock Trigger Mechanics
 
-## Filters: the bug this suite was written to catch
+* *Automatic updates:* A PostgreSQL trigger automatically updates stage_decided_at to the current time whenever a user changes a stage.
+* *Trigger bypass for bulk jobs:* The trigger only fires if the writer leaves stage_decided_at alone. The bulk worker explicitly sets it to the job's snapshot_at, allowing the job to preserve its logical timestamp.
+* *Non-stage updates:* Renaming an opportunity or updating other fields leaves the logical clock untouched, preventing accidental drops from running jobs.
 
-A filter naming an outcome that resolves to **no** stage is the dangerous case. It
-reads as a filter, stores as an empty object, and a job with no stage filter
-matches **the entire workspace**. Measured live before the fix: `outcome=lost`
-against a workspace with no lost stage moved all 10 seeded records.
+## 5. Filter Edge Cases and Safety
 
-- **A filter naming an outcome with no stage matches NOTHING.** **[non-vacuous]**
-- **An explicitly empty stage list is refused, not read as no filter**, the same hazard through a second door. **[non-vacuous]**
-- **A filter naming no stages at all still matches the whole workspace**, the control for the two above, without which "always add the clause" would also pass.
-- The stored filter is the one that will be executed, not a re-derived one.
-- An explicit `null` is rejected rather than treated as no bound; an empty string is treated as absent.
-- `minValue` above `maxValue`, and `createdFrom` after `createdTo`, are rejected rather than silently matching nothing.
-- A record that **leaves the filtered stage** is skipped, and reported separately from one left alone for the clock, two different events that both read as "skipped".
-- A record left alone for scope is tested with the clock aged forward, so the scope check is what is actually under test and not shadowed by the clock.
-- `limit` is capped rather than trusted.
+* *Empty match safety:* If a filter targets an outcome that maps to no stages (such as lost in a pipeline without a lost stage), the query must match zero records. It must never accidentally match the whole workspace.
+* *Explicit validation:* Empty stage arrays, invalid date ranges, or minimum values higher than maximum values are rejected immediately.
+* *Records leaving scope:* If an opportunity moves out of the filtered stage before its batch is processed, the worker skips it and records it separately from clock-based skips.
 
-## Tenant isolation, checked where a mistake is silent
+## 6. Tenant Isolation
 
-Not "does it return 403", whether a row can be *reached* by another tenant's id.
+We verify tenant isolation at the database layer rather than relying on application code discipline alone.
 
-- **No endpoint enumerates every workspace.** **[non-vacuous]** A caller must not be able to discover other tenants by asking; the CLI reads the database directly instead, for exactly this reason.
-- The same stage name is allowed in two workspaces, the guard cannot be "name is unique".
-- An opportunity owned by another workspace's user is refused, as is one pointing at another workspace's stage.
-- A transition rule spanning two workspaces is refused.
-- A batch whose job belongs to another workspace is refused.
-- Another workspace cannot read a job or its transitions.
-- Deleting a job **keeps** its transition and clears `job_id`, an audit trail that vanishes on delete is not an audit trail.
+* *Composite foreign keys:* Every table includes workspace_id, and all cross-table references use composite keys like (id, workspace_id). Records cannot reference data from another workspace.
+* *No global enumeration:* There is no endpoint that lists all workspaces.
+* *Cross-workspace protection:* API requests cannot read, move, or transition opportunities belonging to another workspace.
 
-## The correlation id is caller-influenced, so it is untrusted input
+## 7. Full-Scale Verification
 
-- A newline in a caller-supplied id is rejected, because the id lands in log lines and a newline would let a client forge one.
-- It is validated at the edge **and again at the service**, because the edge is not the only way in.
-- A handler and a `ServiceClient` call it makes share one id, so a trace does not fork at the first hop.
-- The id is stored on the job row, so the build traces back to the request that caused it.
-
-## Full scale, where the shape breaks rather than the logic
-
-- **Every record is in exactly one batch, with no overlap.** **[non-vacuous]** The old design stored one row per record; a record in two batches would be moved and counted twice, and cardinality would be summed once per id.
-- Every matching record is snapshotted, not just the first page.
-- 50 batches of 1,000, none retried, 50,000 records at the target, 0 failed.
-- One attributable transition per record, and **50 distinct timestamps for 50,000 records**, because a batch applies in one transaction. Any per-record percentile is the batch distribution restated.
-- A job that matches nothing **completes** rather than hanging at pending.
-- A batch that exhausted its attempts is surfaced with its reason; a partly-applied batch is **not** reported as dead-lettered.
-- A healthy job reports no dead-lettered batches.
+* *Exact partitioning:* Across 50,000 opportunities, the system creates 50 batches of 1,000 records each with zero overlap and zero omitted records.
+* *One transition per record:* All 50,000 records reach the target stage with exactly one transition row each.
+* *Attributable batches:* Batches commit in 50 distinct transactions, producing 50 distinct audit timestamps for 50,000 records.
