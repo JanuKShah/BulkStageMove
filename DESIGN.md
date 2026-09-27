@@ -20,27 +20,31 @@ After step 1 the job row is the only thing that exists; nothing is held in memor
 
 ## 1. Chunking, and surviving a restart
 
-- **The match set is never materialised**, submit writes one row, the walk pages
-  1,000 ids at a time afterwards.
-- **The index** `opportunity_workspace_created_id_idx` on
-  `(workspace_id, created_at, id)`: equality, range and cursor, so a page is a
-  contiguous index range starting where the last stopped.
-- **No `OFFSET` in the job path**, it re-scans and discards every skipped row,
-  making the sweep quadratic. The worker does not page at all.
-- **The cursor** is `snapshot_cursor` + `snapshot_cursor_id`, committed **in the
-  same transaction as the batch it follows**, so it cannot claim progress the data
-  lacks, ahead skips records on resume, behind duplicates them.
-- **A half-built job is finished, not restarted.** Still `preparing`, so the next
-  sweep on whichever replica is alive reads the cursor and walks only what is
-  after it. Two details make that safe: `batch_no` resumes at `max(batch_no) + 1`
-  from the rows already written, not a counter in memory; and the per-job lock is
-  *session*-scoped, so a killed builder's connection dies and Postgres drops the
-  key immediately.
-- **Already-written batches keep draining** while the rest is written.
-- **The cursor is resolved by subquery, never a bound `Date`**, `timestamptz` has
-  microseconds, a JS `Date` has milliseconds, so binding truncates and the same
-  page returns for ever. The same trap made the worker compare column-to-column
-  in SQL.
+**Submit writes one row.** A single `bulk_job` row, stamped `now()`, left in
+`preparing`. Nothing is counted or listed at this point.
+
+**The index makes paging cheap.** `opportunity_workspace_created_id_idx` on
+`(workspace_id, created_at, id)`. A page is a contiguous range of that index, so
+each page is a seek rather than a scan.
+
+**The sweep does the walking.** Every 125 ms it picks up jobs sitting in
+`preparing`, and for each one reads the last cursor, then writes the next 1,000
+matching ids as a single batch. It repeats until nothing matches, then the job
+moves to `pending`. Submitting also calls the sweep directly, so a fresh job does
+not wait for the timer.
+
+**The cursor is stored after every batch, in the same transaction as the batch
+itself.** That one rule is the whole restart story. A cursor ahead of its batch
+would skip records on resume. A cursor behind it would duplicate them. One
+transaction cannot do either.
+
+**A half-built job is finished, not restarted.** If the walk dies at batch 10 of
+50, the job is still `preparing`, so the next sweep reads the cursor and carries
+on from batch 11. The batches already written keep draining in the meantime.
+
+**No `OFFSET` anywhere in this path.** It re-reads and discards every row it
+skips, so the sweep would slow down the further it got. The worker does not page
+at all; it reads the ids off its own batch row.
 
 ## 2. Idempotency
 
