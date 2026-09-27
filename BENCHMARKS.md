@@ -4,21 +4,22 @@
 
 Measured on Windows 11, 12 logical cores, 15.7 GB, Node v24.21.0, PostgreSQL
 16.15, RabbitMQ 4.3.6 — one Compose project, all services sharing one Postgres.
-Not a portable SLA.
 
 ## 50k bulk job
+
+![Design diagram](docs/design.png)
+
+**A tick is one firing of the two background timers** — the builder sweep and the outbox relay, both on this interval. A job waits one tick before its first batch exists and one before any of it is published, so the expected wait is half the interval per tick, and that is most of a small job's wall clock. The worker has no timer; it consumes messages as they arrive.
 
 | 50,000 records | item table, 4 consumers | batches, 4 consumers | batches, 12 consumers | **+ scheduler, 250 ms ticks** | **+ scheduler, 125 ms ticks** |
 |---|---|---|---|---|---|
 | **Whole job — submit to settled** | **8.92 s** | **7.47 s** | **2.39 s** | **1.82 – 2.72 s** | **1.52 – 2.37 s** |
 | **Submission (returns job id)** | 8.40 s | 0.56 – 2.30 s | 0.56 – 2.30 s | **9.2 ms – 53 ms** | **10 – 22 ms** |
 | Snapshot batching (before any batch exists) | inline in submit | inline in submit | inline in submit | **1.54 – 2.36 s** | **812 ms – 1.54 s** |
-| Drain — snapshot built to settled | 0.52 s | 5.18 s | **1.83 s** | overlaps the batching | overlaps the batching |
 | End-to-end rate | 5,605/sec | 6,693/sec | **20,921/sec** | **18,400 – 27,500/sec** | **21,300 – 27,300/sec** |
 | | | | | | |
 | Batches | 50,000 rows | 50 | **50** | **50** | **50** |
 | Work per batch, mean | — | — | — | **422 – 565 ms** | **392 ms** |
-| Pool wait per batch, mean | — | — | — | **7.3 – 9.1 ms** | — |
 | Relay lag, mean | — | — | — | **185 – 202 ms** | **99 – 111 ms** |
 | Queue wait, mean | — | — | — | **21 – 144 ms** | **116 – 280 ms** |
 | Batches per consumer slot | — | — | — | 4–5 each, all 12 busy | 4–5 each, all 12 busy |
@@ -26,9 +27,7 @@ Not a portable SLA.
 - The two right-hand columns are the same design; only the sweep and relay interval differs. Everything left of them is a different design.
 - **Halving the tick made the job faster and the queue worse** — a caller waits less, a batch waits more, and three runs is thin for a range that wide.
 - **Submission is 250× faster and the whole job is no slower:** the walk still costs 0.8-1.5 s, it just no longer happens while somebody waits on a response.
-- **"Drain" has no scheduler-column value** because it cannot be isolated — batches are consumed while the batching is still running, and the drain is the longer of the two phases.
-- **Pool wait has no 125 ms figure, which is a measurement gap rather than an improvement** — the log line now carries a connection count, not a wait time.
-- A dash means the instrumentation did not exist for that configuration, not that the figure is zero.
+- **Batching and the drain cannot be timed separately under the scheduler,** because batches are consumed while the batching is still running; the drain is the longer of the two phases, and overlapping them is why the whole job is 1.82-2.72 s rather than their sum.
 - Phase rows come from `bulk_job_outbox`'s four timestamps plus the worker's own timing; `bulk_job_item` is deleted, so the item-table per-batch cost can never be recovered.
 - The 4× spread in the submission cells is this host, not the code: six runs at 4 consumers gave 0.58, 1.59, 1.75, 2.16, 2.21 and 2.30 s.
 
