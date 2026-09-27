@@ -57,6 +57,19 @@ export interface RabbitConfig {
   /** How often the outbox relay looks for unpublished batches. */
   relayIntervalMs: number;
   relayBatchSize: number;
+  /**
+   * How many times the relay will try to publish one batch before marking it
+   * failed and moving on.
+   *
+   * This is the relay's budget, not the worker's: it counts failures to reach the
+   * broker, which means a broker that is down rather than a batch that is bad.
+   * Without a cap a permanently unreachable broker retries for ever; with one, and
+   * with nothing marking the exhausted rows, the batches would be abandoned
+   * unpublished and their jobs would hang at pending with no record anywhere. So
+   * an exhausted batch is marked failed, which routes it to the job's
+   * deadLettered count and to POST /bulk-moves/:id/retry-failed.
+   */
+  relayMaxAttempts: number;
 }
 
 const DEFAULTS: RabbitConfig = {
@@ -86,6 +99,7 @@ const DEFAULTS: RabbitConfig = {
   snapshotSweepLimit: 25,
   relayIntervalMs: 125,
   relayBatchSize: 50,
+  relayMaxAttempts: 5,
 };
 
 function int(name: string, fallback: number): number {
@@ -123,6 +137,7 @@ export function rabbitConfig(): RabbitConfig {
     snapshotSweepLimit: int('SNAPSHOT_SWEEP_LIMIT', DEFAULTS.snapshotSweepLimit),
     relayIntervalMs: int('RABBITMQ_RELAY_INTERVAL_MS', DEFAULTS.relayIntervalMs),
     relayBatchSize: int('RABBITMQ_RELAY_BATCH_SIZE', DEFAULTS.relayBatchSize),
+    relayMaxAttempts: int('RABBITMQ_RELAY_MAX_ATTEMPTS', DEFAULTS.relayMaxAttempts),
   };
 }
 

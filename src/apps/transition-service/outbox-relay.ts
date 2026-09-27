@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { OutboxRepository } from './outbox.repository';
 import { RabbitBatchPublisher } from './rabbit-batch.publisher';
+import { DatabaseService } from '../../shared/database/database.service';
 import { RABBIT_CONFIG, type RabbitConfig } from '../../shared/rabbit/rabbit.config';
 
 export interface RelayStats {
@@ -25,7 +26,12 @@ export interface RelayStats {
  *
  * The loop stops on a broker error rather than spinning, and resumes on the next
  * tick. A broker that is down should not turn into a hot retry loop against the
- * database either.
+ * database either. A batch that fails to publish keeps its place at the back of
+ * the queue, so it is retried last instead of ahead of work never tried.
+ *
+ * Safe to run in more than one replica. A pass claims its rows with FOR UPDATE
+ * SKIP LOCKED and holds the lock until it has published or given up, so two relays
+ * get disjoint batches instead of both publishing the same ones.
  */
 @Injectable()
 export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
@@ -42,6 +48,7 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly outbox: OutboxRepository,
     private readonly publisher: RabbitBatchPublisher,
+    private readonly db: DatabaseService,
     @Inject(RABBIT_CONFIG) private readonly config: RabbitConfig,
   ) {}
 
@@ -80,38 +87,60 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
     }
     this.running = true;
     try {
-      const rows = await this.outbox.unpublished(this.config.relayBatchSize);
-      for (const row of rows) {
-        if (this.stopped) return;
-        try {
-          await this.publisher.publish({
-            workspaceId: row.workspace_id,
-            jobId: row.job_id,
-            batchNo: row.batch_no,
-            itemCount: row.item_ids.length,
-          });
-          await this.outbox.markPublished(row.id);
-          this.stats.published += 1;
-        } catch (error) {
-          // Leave the row unpublished and stop the pass. Trying the next row
-          // would just fail the same way and turn a broker outage into a burst
-          // of doomed writes.
-          //
-          // Logged because this is the failure the outbox exists to survive, and
-          // it is otherwise invisible: the row stays unpublished, so every
-          // column still reads exactly as it did before the outage, and once the
-          // broker comes back the pass succeeds and nothing anywhere records that
-          // there was a gap. The batch is not lost - the job just sits in
-          // preparing for as long as the broker is down.
-          await this.outbox.markFailed(row.id);
-          this.stats.failed += 1;
-          this.logger.warn(
-            `publish failed for job=${row.job_id.slice(0, 8)} batch=${row.batch_no}, ` +
-              `stopping this pass: ${(error as Error).message}`,
+      // One transaction for the whole pass. The claim takes a row lock that has to
+      // survive until published_at is stamped, and that is also what stops a
+      // second replica claiming the same batches - see OutboxRepository.claim.
+      //
+      // The cost is a pooled connection held for the length of the pass, and for
+      // publishes that means the broker round trips too. That is the trade for not
+      // publishing everything twice, and it is bounded by relayBatchSize.
+      await this.db.transaction(async (client) => {
+        const abandoned = await this.outbox.abandonExhausted(client, this.config.relayMaxAttempts);
+        if (abandoned > 0) {
+          this.logger.error(
+            `gave up on ${abandoned} batch(es) after ${this.config.relayMaxAttempts} publish ` +
+              `attempts; their records are not moved and retry-failed can re-queue them`,
           );
-          return;
         }
-      }
+
+        const rows = await this.outbox.claim(client, this.config.relayBatchSize);
+        for (const row of rows) {
+          if (this.stopped) return;
+          try {
+            await this.publisher.publish({
+              workspaceId: row.workspace_id,
+              jobId: row.job_id,
+              batchNo: row.batch_no,
+              // From cardinality in the claim query, not item_ids.length: the ids
+              // are not selected any more, and were a thousand uuids per batch to
+              // count what the database already knew.
+              itemCount: row.item_count,
+            });
+            await this.outbox.markPublished(client, row.id);
+            this.stats.published += 1;
+          } catch (error) {
+            // Leave the row unpublished and stop the pass. Trying the next row
+            // would just fail the same way and turn a broker outage into a burst
+            // of doomed writes.
+            //
+            // It is not stranded, though: the attempt count moves, and the claim
+            // orders by attempts, so the next pass puts fresh work ahead of this
+            // and retries it last rather than at the head of its own queue.
+            //
+            // Logged because this is the failure the outbox exists to survive, and
+            // it is otherwise invisible: the row stays unpublished, so every column
+            // still reads exactly as it did before the outage, and once the broker
+            // comes back the pass succeeds and nothing anywhere records the gap.
+            await this.outbox.markFailed(client, row.id);
+            this.stats.failed += 1;
+            this.logger.warn(
+              `publish failed for job=${row.job_id.slice(0, 8)} batch=${row.batch_no} ` +
+                `(attempt ${row.attempts + 1}), stopping this pass: ${(error as Error).message}`,
+            );
+            return;
+          }
+        }
+      });
     } catch (error) {
       // Database unreachable; the next tick retries. Logged rather than
       // swallowed, because an unreadable outbox is indistinguishable from an
