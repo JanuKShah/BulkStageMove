@@ -33,6 +33,10 @@ crosses.
 - Every stage change is recorded as a **transition**.
 - `opportunity.stage_decided_at` is a **logical clock**, see `DESIGN.md` section 9.
 
+## Demo
+
+https://github.com/user-attachments/assets/e0f60d7f-9ea3-43ff-a536-e6a75f86b6f6
+
 ## Technology
 
 | | |
