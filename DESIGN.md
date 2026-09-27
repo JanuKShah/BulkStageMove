@@ -58,30 +58,11 @@ Six checks, fixed order. The order is load-bearing.
 
 ## 4. Snapshot vs live
 
-**Snapshot. The decision is taken once at submission, and the job is scheduled
-against that frozen copy, the request is never consulted again.**
-
-- `submit()` resolves `outcome` → stage ids, canonicalises, and writes the result
-  plus a watermark onto `bulk_job`. The walk reads `job.filter` and
-  `job.snapshot_at` off that row.
-- **The stored filter is already resolved,** so renaming a stage or changing its
-  outcome cannot alter an in-flight job, and the row is a complete audit without
-  the original request.
-- **The decision is snapshotted, not the ids**, the match set materialises
-  lazily, 1,000 a page, which keeps submit O(1): 50 batch rows, not 50,000 item
-  rows, which were **81% of the time to the `201`**. Snapshotting the ids at
-  submit is the design that took 32.06 s at 500,000.
-- **Scheduled immediately, not by a timer**, the row defaults to `preparing` and
-  `submit()` then calls `void this.builder.sweep()` before returning, so the walk
-  starts in **10 ms**. The sweep timer is the fallback, not the mechanism.
-- **The count is not knowable at submit**, `totalMatched` stays 0 while
-  `preparing`. Ids are not known at t=0, only the filter is.
-- **A record can still leave scope**, the filter is frozen but *stage membership*
-  is not, so a record matched at t=0 may have left a named stage by the time its
-  batch is written. Check 4 skips it as left-scope.
-- **A record created after submit can never be swept up**,
-  `created_at <= snapshot_at`, bound once at insert, not `now()` per query, which
-  would advance mid-walk and re-open the set.
+- **The snapshot is one timestamp,** `snapshot_at`, written when the job row is created. The filter is resolved and stored on the same row, so the request is never read again.
+- **Batches are built immediately,** not on a timer. `submit()` calls the sweep before returning, and the 125 ms sweep is the fallback.
+- **A record can fall out of the filter before its batch is built.** The filter is frozen but stage membership is not, so a record that matched at submit may have left by the time the walk reaches it. Check 4 skips it.
+- **Once a batch exists its membership is fixed.** It can be processed much later and still run, as long as the record's own timestamp allows it: `stage_decided_at <= snapshot_at`. Newer than that means someone decided after we submitted, so we leave it alone.
+- **No backpressure at this volume.** One tenant and a small table means nothing limits how much work is in flight. With multiple tenants, and throttling needed per job and per workspace, this is where it will bite.
 
 ## 5. Isolation, and the hole
 
