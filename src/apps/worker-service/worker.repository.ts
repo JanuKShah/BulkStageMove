@@ -2,10 +2,35 @@ import { Inject, Injectable } from '@nestjs/common';
 import type { PoolClient } from 'pg';
 import { DatabaseService } from '../../shared/database/database.service';
 import { RABBIT_CONFIG, type RabbitConfig } from '../../shared/rabbit/rabbit.config';
+import { elapsedMs, startTimer } from '../../shared/observability/timing';
 import { type OpportunityRef } from '../../shared/filter/snapshot-query';
 
 /** What the worker tells the broker about a batch. */
 export type BatchDisposition = 'applied' | 'skipped' | 'dead' | 'retry';
+
+/**
+ * Where the wall clock went on a batch.
+ *
+ * These are measured rather than derived, because the split is invisible in the
+ * data. started_at is stamped after the claim lands, so the time between the
+ * broker handing a message to a consumer and that stamp - which is exactly where
+ * a saturated connection pool shows up - leaves no trace in any column. The two
+ * halves also fail for unrelated reasons: pool wait is a capacity problem,
+ * workMs is a contention or query problem, and the fix for each is different.
+ *
+ * poolSize and poolWaiting are sampled at the moment the connection is taken,
+ * not accumulated, so they describe the pressure this batch actually met.
+ */
+export interface BatchTiming {
+  /** Waiting for a free connection. Zero when one was already available. */
+  poolWaitMs: number;
+  /** Claim and apply, measured on the connection once it was held. */
+  workMs: number;
+  /** Consumers queued for a connection when this one was taken. */
+  poolWaiting: number;
+  /** Connections the pool is holding, against PG_POOL_MAX. */
+  poolSize: number;
+}
 
 export interface BatchResult {
   disposition: BatchDisposition;
@@ -23,6 +48,8 @@ export interface BatchResult {
   skipped: number;
   attempts: number;
   reason?: string;
+  /** Absent only on paths that never reached a claim. */
+  timing?: BatchTiming;
 }
 
 interface JobSpec {
@@ -82,8 +109,41 @@ export class WorkerRepository {
     jobId: string,
     batchNo: number,
   ): Promise<BatchResult> {
-    const key = `${jobId}:${batchNo}`;
+    // Timed here rather than inside the work, because the wait for a connection
+    // is the one part of a batch that no column records. The claim stamps
+    // started_at after it lands, so by the time any row knows this batch was
+    // touched, whatever it spent queuing for a connection is already gone.
+    //
+    // connect() is exactly the pool wait and nothing else - pg resolves it only
+    // once a client is free - so this is a measurement, not an estimate.
+    const waited = startTimer();
     const client = await this.db.connect();
+    const poolWaitMs = elapsedMs(waited);
+    const poolWaiting = this.db.pool.waitingCount;
+    const poolSize = this.db.pool.totalCount;
+
+    const worked = startTimer();
+    const result = await this.claimAndRun(client, workspaceId, jobId, batchNo);
+    return {
+      ...result,
+      timing: { poolWaitMs, workMs: elapsedMs(worked), poolWaiting, poolSize },
+    };
+  }
+
+  /**
+   * Takes the batch's advisory lock and applies it.
+   *
+   * Split out of processBatch purely so the timing wrapper above has something
+   * to measure; the behaviour and the connection handling are unchanged, and the
+   * long comment on the lock belongs to this half.
+   */
+  private async claimAndRun(
+    client: PoolClient,
+    workspaceId: string,
+    jobId: string,
+    batchNo: number,
+  ): Promise<BatchResult> {
+    const key = `${jobId}:${batchNo}`;
     // If the unlock below fails, this connection still holds a session-scoped
     // advisory lock. Releasing it back to the pool would leak that key for the
     // life of the process and no worker could ever lock that batch again, so the
@@ -547,7 +607,7 @@ export class WorkerRepository {
               END,
               updated_at = now()
         WHERE j.id = $1 AND j.workspace_id = $2
-          AND j.status NOT IN ('completed','failed')`,
+          AND j.status NOT IN ('completed','failed','preparing')`,
       [jobId, workspaceId],
     );
   }

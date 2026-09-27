@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { DatabaseService } from '../../shared/database/database.service';
 import { RABBIT_CONFIG, type RabbitConfig } from '../../shared/rabbit/rabbit.config';
+import { elapsedMs, ms1, startTimer } from '../../shared/observability/timing';
 import { pageMatching, parseStoredFilter, BATCH_SIZE } from '../../shared/filter/snapshot-query';
 
 /**
@@ -89,6 +90,7 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
    * exact multiple of the page size does not cost a final empty round trip.
    */
   async build(jobId: string, workspaceId: string): Promise<void> {
+    const started = startTimer();
     const spec = await this.db.query<{
       filter: unknown;
       snapshot_at: Date;
@@ -185,8 +187,15 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
       );
     });
 
+    // The duration is on the line because the log is the only place it exists.
+    // Nothing stored on the job row says when the build finished: the cursor is
+    // nulled, and updated_at is overwritten by the worker's counter deltas
+    // within milliseconds of the first batch landing. The last batch's
+    // created_at is a close proxy, but it is a proxy, and a build that walked
+    // nothing records no batch at all.
     this.logger.log(
-      `job ${jobId} snapshot built: ${matched} records in ${batchNo} batches`,
+      `job ${jobId} snapshot built: ${matched} records in ${batchNo} batches ` +
+        `in ${ms1(elapsedMs(started))}`,
     );
   }
 }
