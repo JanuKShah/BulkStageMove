@@ -77,56 +77,30 @@ Six checks, fixed order. The order is load-bearing.
   no error. No row-level security, and no test can prove the absence of a future
   mistake.
 
-## 6. What breaks at 10×
+## 6. What breaks at 10x
 
 - **500,000 in one job still completes**, 500,000 moved, 0 failed, 58.71 s.
-- **Already broke, now fixed:** submission was super-linear, 0.56 s at 50,000
-  became **32.06 s at 500,000**, holding every id in memory (50–100 MB). It now
-  streams. The job total barely moved, 57.34 s before, 58.71 s now: the fix took
-  32 s off the *response*, not the job.
-- **The constraint moves from the drain to batching**, 0.70x work-per-slot at
-  50,000, **2.11x** at 500,000 (55.91 s of batching against 26.49 s per slot,
-  per-page 18 ms → 112 ms). Batching scales in rows; the drain does not.
-- **The cause is the working set, not the index**, `shared_buffers` is 128MB, the
-  index 44MB at 50,000 rows and ~17GB at 20M, but a job reads one tenant's slice.
-- **Noisy neighbour is structural.** The sweep claims `ORDER BY created_at LIMIT
-  10` across all workspaces, so one tenant filling that window delays everyone,
-  and one 500,000-record job is 2.11x the whole drain. No fairness, no
-  `limit_req`.
-- **Adding servers breaks on connections, not cores.** `PG_POOL_MAX` is 10, and
-  12 for the worker, which must be ≥ its consumer count because `processBatch`
-  holds a connection for the whole batch. `max_connections` is **100**, the
-  Postgres default, and six services already hold ~62. The session-scoped lock
-  is what makes it linear: it cannot be taken through the pool, so a connection
-  is pinned per consumer. A pooled design would add capacity per replica; this
-  adds connections.
-- **Fix, in order:**
-  1. **Fair queueing, ahead of any rate limit**, round-robin per workspace, or
-     cap in-flight jobs. No migration, and the only measure that touches a few
-     *large* jobs from one tenant; a request-rate limit cannot, since one request
-     can be 500,000 records.
-  2. **Rate limit on submit**, a Postgres counter. Meter on row creation, not
-     the replay path, so a retry is not charged twice. Not a volume limit: section 4
-     leaves `totalMatched` at 0 until the walk ends, so records-per-minute must be
-     metered in the builder.
-  3. **Partition `opportunity` by `workspace_id`**, sub-partitioned by
-     `created_at`, every job-path query already constrains `workspace_id` on the
-     leading index column, so pruning is exact with no query change. The PK widens
-     to `(workspace_id, id)`, but `opportunity_id_workspace_uniq` already has
-     that shape, so the transition FK survives.
-  4. **Row-level security in the same change as 3**, partitioning turns section 5's
-     missing predicate into a full-partition scan.
-  5. **Replicas**, more builders is the only way to speed one huge job, because
-     page N+1's cursor is page N's last row; more workers drain concurrent jobs,
-     no code change. Both already safe at N. The relay is safe at N too: it claims
-     with `FOR UPDATE SKIP LOCKED` ordered by `attempts` then `created_at`, so two
-     relays take disjoint rows rather than both publishing one batch.
-  6. **Past the ceiling**, PgBouncer cannot help, because transaction pooling
-     hands two workers the same key on two backends. Raise `max_connections`, or
-     a lease table with expiry.
-  7. **Revisit the 1,000 batch size**, a guess, not a measurement.
-- **What does not break:** the drain, 392 ms per batch across 12 slots,
-  independent of workspace size. The outbox is 20,000 rows at 20M opportunities.
+
+**Already broke, now fixed:**
+
+1. We used to store every job item individually. At 500,000 records that was 500,000 rows and 500,000 database round trips. We fixed it: we now only create batch rows holding the ids to be processed, so 50 rows instead of 500,000.
+2. We also used to change opportunities one at a time, which was another 500,000 database calls at the worker. A batch of 1,000 records is now one commit, so 500 calls instead of 500,000.
+
+**Open issues:**
+
+1. **Batching does not scale.** The scheduler is linear and creates batches one after another, so with more data it takes a long time. Workers sit ready with nothing to pick up, because the batches do not exist yet.
+2. **The cause is the working set, not the index.** The index is about 17GB at 20M rows, but a single job only reads one tenant's slice of it.
+3. **Noisy neighbour is structural.** The sweep claims `ORDER BY created_at LIMIT 25` across all workspaces, so one tenant filling that window delays everyone, and one 500,000-record job is 2.11x the whole drain. No fairness, no limit.
+4. **Adding servers breaks on connections, not cores.** `PG_POOL_MAX` is 10, and 12 for the worker, which must be at least its consumer count because `processBatch` holds a connection for the whole batch. `max_connections` is 100, the Postgres default, and six services already hold about 62. The session-scoped lock is what makes it linear: it cannot be taken through the pool, so a connection is pinned per consumer. A pooled design would add capacity per replica, this one adds connections.
+
+**What to fix:**
+
+1. **Fair queueing first.** Round-robin per workspace, or cap in-flight jobs per tenant. No migration needed, and it is the only thing that touches a few very large jobs from one tenant.
+2. **Rate limit on submit,** metered in the builder on rows created, not on the request. A request is one row even when it moves 500,000 records.
+3. **More builders.** The only way to speed up one huge job, because page N+1's cursor is page N's last row. More workers drain concurrent jobs, no code change.
+4. **Partition `opportunity` by `workspace_id`,** sub-partitioned by `created_at`. Every job-path query already filters on `workspace_id`, which is the leading index column, so pruning is exact. Row-level security goes in with it, or the missing predicate becomes a full-partition scan.
+5. **Raise `max_connections`,** or use a lease table with expiry. PgBouncer does not help, because transaction pooling can hand two workers the same key on two backends.
+6. **Measure the 1,000 batch size.** It is a guess, not a measurement.
 
 ## 7. Another week, ranked
 
