@@ -7,13 +7,23 @@ Measured on Windows 11, 12 logical cores, 15.7 GB, Node v24.21.0, PostgreSQL
 
 ## 50k bulk job
 
-**A tick is one firing of the two background timers**, the builder sweep and the
-outbox relay, both on this interval. Only one of them gates a fresh job: submit
-kicks the sweep itself, fire-and-forget, so batching starts in **10 ms** rather than
-waiting out a tick. The sweep timer is the fallback that finishes a job whose walk
-did not complete. The relay is never kicked, so written batches wait up to one tick
-to be published, **208 ms mean**, and the only poll wait in a job. The worker has no
-timer; it consumes messages as they arrive.
+Two background timers run every 125 ms:
+
+- the builder sweep, which writes a job's batches
+- the outbox relay, which publishes finished batches
+
+Either firing is "a tick".
+
+Submitting calls the sweep directly and does not wait for it, so batching starts
+about 10 ms later and a new job never waits for that timer.
+
+The sweep's timer is the fallback. It finishes a job whose walk stopped partway,
+resuming from its stored cursor.
+
+The relay is never called directly. A written batch waits for its next tick to be
+published, the only point in a job where progress waits on a timer.
+
+The worker has no timer. It consumes messages as they arrive.
 
 ```
   POST /bulk-moves ──▶  one job row written as 'preparing', 201 + jobId (~13 ms)
