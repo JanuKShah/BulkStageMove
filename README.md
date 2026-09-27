@@ -100,6 +100,10 @@ Only **transition-service** sits behind nginx; the other four keep direct ports,
 
 ## The main logic
 
+The original design, hand-drawn:
+
+![Design diagram](docs/design.png)
+
 Five steps, and after step 1 the job row is the only thing that exists — every
 later step reads it or the rows it produces, and nothing is held in memory.
 
