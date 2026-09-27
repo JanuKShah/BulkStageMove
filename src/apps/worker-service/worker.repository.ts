@@ -441,6 +441,25 @@ export class WorkerRepository {
     // a *different* member of that set slip through.
     let movedCount = 0;
     if (movable.length > 0) {
+      // One statement, not two. The move and its audit row are written by a single
+      // data-modifying CTE, so the transition can only exist for a record this
+      // statement actually moved.
+      //
+      // That is a stronger guarantee than the two statements it replaces, and the
+      // difference is the RETURNING. Previously the insert was driven by the
+      // `movable` array computed in JS, and the reason a record could not be
+      // inserted twice was an argument made in this file: a record already at the
+      // target was left out of `movable` when the batch was classified. Correct,
+      // but it is a property of this code being right rather than of the database
+      // enforcing anything - and there is no unique key on
+      // (job_id, opportunity_id) to catch it if the argument were ever wrong. Now
+      // the rows to audit are the rows the UPDATE returned, so the database
+      // guarantees it and the argument is not load-bearing.
+      //
+      // Worth one round trip on its own: this runs per batch, and the batch is
+      // already the unit of work and of retry, so halving the statements on the
+      // hot path is not nothing at 12 consumers.
+      //
       // stage_decided_at is set to this job's own snapshot_at, not now(). That
       // makes the column a logical clock saying whose decision put the record
       // here, so a job that arrives later but was submitted earlier still defers -
@@ -453,12 +472,18 @@ export class WorkerRepository {
       // stands the stage_decided_at trigger down, which is how one trigger serves
       // both a person's edit and a job's.
       const moved = await client.query<{ id: string }>(
-        `UPDATE opportunity o
-            SET stage_id = $2, updated_at = now(),
-                stage_decided_at = (SELECT snapshot_at FROM bulk_job WHERE id = $5)
-           FROM unnest($3::uuid[], $4::uuid[]) AS t(id, from_stage)
-          WHERE o.workspace_id = $1 AND o.id = t.id AND o.stage_id = t.from_stage
-        RETURNING o.id`,
+        `WITH moved AS (
+           UPDATE opportunity o
+              SET stage_id = $2, updated_at = now(),
+                  stage_decided_at = (SELECT snapshot_at FROM bulk_job WHERE id = $5)
+             FROM unnest($3::uuid[], $4::uuid[]) AS t(id, from_stage)
+            WHERE o.workspace_id = $1 AND o.id = t.id AND o.stage_id = t.from_stage
+           RETURNING o.id, o.stage_id AS previous_stage
+         )
+         INSERT INTO opportunity_transition
+           (workspace_id, opportunity_id, from_stage_id, to_stage_id, job_id)
+         SELECT $1, m.id, m.previous_stage, $2, $5 FROM moved m
+         RETURNING opportunity_id AS id`,
         [workspaceId, targetId, movable.map((m) => m.id), movable.map((m) => m.stage_id), jobId],
       );
       movedCount = moved.rows.length;
@@ -470,20 +495,6 @@ export class WorkerRepository {
           `${movable.length - movedCount} record(s) changed stage during the batch`,
         );
       }
-
-      // A plain insert, with no ON CONFLICT. The batch is one transaction, so a
-      // failed attempt rolls its transitions back with its updates and a retry
-      // starts from nothing; and a record already at the target was excluded from
-      // `movable` above, so it is never inserted for twice. There is no unique
-      // constraint behind this - see the note in 0001_schema.sql for why one is
-      // not needed and what would have to change for it to be.
-      await client.query(
-        `INSERT INTO opportunity_transition
-           (workspace_id, opportunity_id, from_stage_id, to_stage_id, job_id)
-         SELECT $1, t.id, t.from_stage, $3, $2
-           FROM unnest($4::uuid[], $5::uuid[]) AS t(id, from_stage)`,
-        [workspaceId, jobId, targetId, movable.map((m) => m.id), movable.map((m) => m.stage_id)],
-      );
     }
 
     // Records already at the target count as this batch's work, whether this
