@@ -109,22 +109,6 @@ Mean of five runs, fresh volume each time, from the four timestamps on each batc
 At 500,000 the job still completes cleanly, 500,000 moved, 0 failed, 58.71 s
 end-to-end.
 
-## A single 50,000-record job
-
-`npm run bench`, fresh volume, one run. The 50k table above is a mean of five; this
-is the single run that accompanied the two measurements below, so the conditions
-match each other and not the table.
-
-| 50,000 records | |
-|---|---|
-| **Processed / failed** | **50,000 / 0** |
-| **End-to-end from submit** | **2.12 s** |
-| **Sustained throughput** | **23,878 records/sec** |
-| Submission, returns job id | 23 ms |
-| Batches | 50 |
-| Per-batch completion p50 / p95 / p99 | 906 ms / 1.61 s / 1.71 s |
-| Per-batch min / max | 244 ms / 1.71 s |
-
 ## Interactive reads while a bulk job runs
 
 `npm run bench:interactive`, `GET /opportunities?limit=20`, sampled every 200 ms
