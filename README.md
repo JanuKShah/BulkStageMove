@@ -151,23 +151,21 @@ Both are in the database, not process memory, so a second replica is excluded to
 
 **Dispatch is an outbox, so the batch rows and the intent to send them commit together,** which makes delivery at-least-once and lets the worker's two database guards make it effectively-once.
 
+**The scheduler is in-process, not a broker message.** `SnapshotBuilder` sweeps on a 125 ms timer and walks whatever is still `preparing`, so an abandoned job is picked up by whichever replica is alive rather than being lost with the process that accepted it.
+
 **A correlation id is minted at the edge and carried on every log line,** validated against `^[A-Za-z0-9._:-]{1,64}$` because a caller-supplied id ends up in log lines and a newline would let a client forge one.
 
 ## Left for later
 
-**Redis — considered, added, then removed.** Every piece of state is either durable in Postgres or per-process, so there is nothing a cache could hold that is safe to cache.
-
-**Six services, not one per noun in the domain.** The brief's diagram implies more — separate transition, opportunity, user and stage servers. They are here, but the split is by *write ownership*, not by entity: `transition-service` owns the job lifecycle, `opportunity-service` owns deals, and the other three are thin. Splitting further would add a network hop and a shared-database contract to every call while the only cross-service traffic today is a handful of `stage-service` lookups per request. Worth revisiting when a service needs its own database, not its own noun.
-
-**`opportunity.version` — not added, because there is no UI.** `stage_decided_at` covers job-versus-record; two people editing the same deal is the other half, and the second save silently wins. The fix is a `version integer` with `WHERE version = $expected`, rejecting the later save with a 409 — but it is only observable when two humans edit one record at once, and there is no UI here to do that. A bulk job must never bump it either, or a job moving 1,000 records would hand every user a 409 about a field they never edited.
-
-**No rate limit on submit.** Nothing bounds how many jobs one tenant can create, and async submission made that cheap to spam.
-
-**Small jobs are bound by the poll intervals, not by their data.** Two ticks sit between submitting and the first batch running, so a 5,000-record job still carries ~125 ms of pure waiting.
-
-**That floor is mitigated, not removed.** Halving both ticks to 125 ms took ~100 ms off every small job and doubled queue wait; removing the wait needs a kick from `POST /bulk-moves`, not a shorter timer.
-
-**Progress is reported in batches, not records.** The endpoint returns how many batch rows settled and how many records failed, but not how many records moved — that number is in the database and is not exposed.
+- **Redis — considered, added, then removed.** Every piece of state is either durable in Postgres or per-process, so there is nothing a cache could hold that is safe to cache.
+- **Six services, not one per noun in the domain.** The split is by *write ownership*, not by entity; splitting further adds a network hop and a shared-database contract per call, and the only cross-service traffic today is a handful of `stage-service` lookups per request.
+- **`opportunity.version` — not added, because there is no UI.** `stage_decided_at` covers job-versus-record; two people editing one deal is the other half, the second save silently wins, and it is only observable with two humans on one record.
+- **A bulk job must never bump that version,** or a job moving 1,000 records would hand every user a 409 about a field they never edited.
+- **No rate limit on submit.** Nothing bounds how many jobs one tenant can create, and async submission made that cheap to spam.
+- **Small jobs are bound by the poll intervals, not by their data.** Two ticks sit between submitting and the first batch running, so a 5,000-record job still carries ~125 ms of pure waiting.
+- **That floor is mitigated, not removed.** Halving both ticks to 125 ms took ~100 ms off every small job and doubled queue wait; removing the wait needs a kick from `POST /bulk-moves`, not a shorter timer.
+- **Progress is reported in batches, not records.** The endpoint returns how many batch rows settled and how many records failed, but not how many records moved — that number is in the database and is not exposed.
+- **Websockets for progress, not polling.** The diagram says "short polling now, websocket later"; the CLI polls every 2 s and no socket exists, which is the right trade while the poll is 2 s.
 
 ## Exploring it
 
@@ -176,16 +174,24 @@ There is no UI, so two commands cover it. Both need the stack up.
 **CLI — call the API by hand.** Use it to try a filter, move an opportunity, submit a bulk
 move, or read a transition history.
 
+Run bare, it lists the workspaces in the database so you can pick one by number, writes `db-state.txt`, and opens the menu.
+
 ```bash
-npm run cli                                       # interactive menu
+npm run cli                                                          # that, then a menu
 npm run cli -- opportunities --workspace=<uuid> --outcome=won --limit=20
-npm run cli -- bulk-move --workspace=<uuid> --to=<stageId> --outcome=won
-npm run cli -- job-status --workspace=<uuid> --id=<jobId>
-npm run cli -- job-watch  --workspace=<uuid> --id=<jobId>
+npm run cli -- stages --workspace=<uuid>                             # what can be moved where
+npm run cli -- can-move --workspace=<uuid> --from=<uuid> --to=<uuid>
+npm run cli -- bulk-move --workspace=<uuid> --to=<stageId> --stageId=<uuid> --outcome=won
+npm run cli -- job-watch --workspace=<uuid> --id=<jobId>            # poll to completion
+npm run cli -- job-status --workspace=<uuid> --id=<jobId>           # one shot
+npm run cli -- job-batches --workspace=<uuid> --id=<jobId>          # per-batch state
+npm run cli -- job-failures --workspace=<uuid> --id=<jobId>         # why records did not move
+npm run cli -- dump-db --out=before.txt                              # then --out=after.txt and diff
 ```
 
-A workspace id is required. `npm run seed` prints them; there is no endpoint that lists
-workspaces, because a caller must not be able to enumerate other tenants.
+A workspace id is required. `npm run seed` prints them, and bare `npm run cli` lists them from the database directly — there is no endpoint that does, because a caller must not be able to enumerate other tenants.
+
+**`bulk-move` prints the job id and the command to watch it,** and `--key` makes a retry safe: the same key returns the original job rather than starting a second one.
 
 **`job-watch` polls every 2 seconds until the job settles** — in place on a terminal, appended when piped, so it reads live and in a log. `--interval=ms` and `--timeout=ms` override the defaults; a timeout gives up watching **without cancelling the job**, since there is no cancel endpoint.
 
