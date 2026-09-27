@@ -80,6 +80,7 @@ Mean of five runs, fresh volume each time, from the four timestamps on each batc
 | Queue wait, in RabbitMQ | 177 ms |
 | Claim gap, claim txn to work txn | 9 ms |
 | Batching + work, if sequential | 2.15 s |
+| Earned by overlapping drain | 750 ms |
 
 ## Filter selectivity
 
@@ -113,20 +114,6 @@ until it settled in **52.68 s**.
 | different workspace, quiet | 70 | 7.1 | 10.7 | 19.0 | 19.0 |
 | **different workspace**, during | 246 | 5.5 | 10.6 | **13.4** | 16.0 |
 
-- **p95 barely moves: 1.04x in the job's own workspace, 0.98x in a different one.**
-  A half-million-record job does not make ordinary reads slower.
-- **The cost is all in the p99 tail, and only in the tenant running the job**,
-  15.6 → 30.9 ms, while another tenant's p99 went 19.0 → 13.4. That is the
-  measurable form of the isolation claim in `DESIGN.md` section 5, which otherwise only
-  argues it structurally.
-- **p50 got *faster* during the run** (7.1 → 5.7 ms), which is not the job helping:
-  the 15 s baseline pays cold-start cost. It makes the quiet row a pessimistic
-  reference, so the p99 result is if anything conservative.
-- **The quiet p99 is not a real p99.** Over 70 samples, nearest-rank p99 is
-  effectively the maximum, so that row is really "max of 70" against a 246-sample
-  p99. The p50 and p95 comparisons are the sounder ones; treat the 2x tail as
-  indicative. A longer baseline (`BASELINE_MS`) fixes it.
-
 Run at 500,000 rather than 50,000 deliberately: a 50k job settles in ~1.5 s, which at
 one sample per 200 ms is about seven samples, and a p99 over seven samples is not a
 percentile. The harness warns when it collects fewer than 30.
@@ -145,18 +132,6 @@ claim that a half-built job is finished rather than restarted.
 | kill to service answering again | 3.47 s |
 | service answering to settled | 1.56 s |
 | Processed / failed | **50,000 / 0** |
-
-**Is the result correct?** All six checks pass, and the harness exits non-zero if any
-fails, a benchmark that reports a wrong result and exits 0 is worse than none.
-
-| check | result |
-|---|---|
-| every record in the target stage | 50,000 of 50,000 |
-| exactly one transition per record | 50,000 transitions |
-| no record moved twice | 50,000 distinct opportunities |
-| **no batch re-walked after the kill** | 50 rows, 50 distinct `batch_no`, 0..49 |
-| the filter margin was left alone | 50,000 moved + 2,000 excluded |
-| no failed records | 0 |
 
 The fourth row is the one that matters. If the cursor were not committed in the same
 transaction as the batch it follows, the resumed walk would re-emit batches 0-9 and
