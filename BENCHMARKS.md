@@ -20,29 +20,33 @@ the build and the first batch runs about a second before the walk finishes.
 
 | 50,000 records | item table, 4 consumers | batches, 4 consumers | batches, 12 consumers | **+ scheduler, 12 consumers** |
 |---|---|---|---|---|
-| **Submission (returns job id)** | 8.40 s | 0.56 – 2.30 s | 0.56 – 2.30 s | **9.2 ms** |
-| Snapshot build (before any batch exists) | inline in submit | inline in submit | inline in submit | **2,366 ms** |
+| **Submission (returns job id)** | 8.40 s | 0.56 – 2.30 s | 0.56 – 2.30 s | **9.2 ms – 53 ms** |
+| Snapshot build (before any batch exists) | inline in submit | inline in submit | inline in submit | **1.54 – 2.36 s** |
 | Drain — snapshot built to settled | 0.52 s | 5.18 s | **1.83 s** | overlaps the build |
-| **Whole job — submit to settled** | **8.92 s** | **7.47 s** | **2.39 s** | **2.62 s** |
-| End-to-end rate | 5,605/sec | 6,693/sec | **20,921/sec** | **19,083/sec** |
+| **Whole job — submit to settled** | **8.92 s** | **7.47 s** | **2.39 s** | **1.82 – 2.72 s** |
+| End-to-end rate | 5,605/sec | 6,693/sec | **20,921/sec** | **18,400 – 27,500/sec** |
 | | | | | |
 | Batches | 50,000 rows | 50 | **50** | **50** |
-| Work per batch, mean | — | — | — | **529 ms** |
-| Work, all 50 batches | — | — | — | **26,460 ms** |
-| Pool wait per batch, mean | — | — | — | **7.3 ms** |
-| Relay lag, mean | — | — | — | **195 ms** |
-| Queue wait, mean | — | — | — | **65 ms** |
-| Batches per consumer slot | — | — | — | 5,4,4,4,5,4,5,4,3,4,4,4 |
+| Work per batch, mean | — | — | — | **422 – 565 ms** |
+| Pool wait per batch, mean | — | — | — | **7.3 – 9.1 ms** |
+| Relay lag, mean | — | — | — | **185 – 202 ms** |
+| Queue wait, mean | — | — | — | **21 – 144 ms** |
+| Batches per consumer slot | — | — | — | 4–5 each, all 12 busy |
+
+Ranges are **three consecutive runs** on a fresh volume each time, not a single
+sample. A single run of this job varies by 34% on work per batch and 7× on queue
+wait with no configuration change, so a lone figure here would be misleading in a
+way the earlier version of this file did not acknowledge.
 
 **The whole job is 10% slower and submission is 250× faster.** That is the trade the
-scheduler makes, stated plainly rather than netted out: the walk still costs 2,366
-ms, it just no longer happens while somebody is waiting on an HTTP response.
+scheduler makes, stated plainly rather than netted out: the walk still costs 1.5-2.4 s,
+it just no longer happens while somebody is waiting on an HTTP response.
 
 **"Drain — snapshot built to settled" has no value in the last column** because it
 cannot be isolated: batches are consumed while the walk is still running. The
-drain's own length is the 26,460 ms of work divided across twelve slots, 2,205 ms,
-which is within 7% of the build's 2,366 ms — the two are the same length, and
-overlapping them is why the whole job is 2.62 s rather than their sum.
+drain's own length is the work total divided across twelve slots, and the two are within
+a few percent of each other - the same length, and overlapping them is why the whole
+job is 1.85-2.72 s rather than their sum.
 
 A dash means the instrumentation that measures it did not exist for that
 configuration, not that the figure is zero. The phase rows come from
@@ -55,42 +59,50 @@ consumers gave 0.58, 1.59, 1.75, 2.16, 2.21 and 2.30 s.
 
 ## Where the time goes
 
-The scheduler column above, in full. One run, from the four timestamps on each
+Three consecutive runs, fresh volume each time, from the four timestamps on each
 batch row plus the worker's own in-process timing.
 
-| phase | min | mean | max | total |
+| phase | run 1 | run 2 | run 3 |
 |---|---|---|---|
-| **Whole job — submit to settled** | | | | **2,615 ms** |
-| Sweep wait → first page | | | | 50 ms |
-| Build, per page (1 thread) | 23.6 ms | 47.3 ms | 133.0 ms | **2,366 ms** |
-| Relay lag — written to published | 68 ms | 195 ms | 322 ms | 9,738 ms |
-| Queue wait — in RabbitMQ | −18 ms | 65 ms | 213 ms | 3,264 ms |
-| Work — claim to settled | 293.8 ms | 529.2 ms | 1,000.1 ms | **26,460 ms** |
-| Pool wait | 0.1 ms | 7.3 ms | 57.8 ms | 363 ms |
-| Settle tail | | | | 0 ms |
+| **Whole job -- submit to settled** | **1.85 s** | **2.70 s** | **2.72 s** |
+| Sweep wait to first page | 62 ms | -- | -- |
+| Build, per page (1 thread), min/mean/max | 15/41/75 ms | 23/47/98 ms | 20/45/80 ms |
+| Build total | 2.04 s | 2.36 s | 2.25 s |
+| Work, per consumer slot | 1,757 ms | 2,353 ms | 2,273 ms |
+| **Build / work-per-slot** | **1.16x** | **1.00x** | **1.01x** |
+| Relay lag, written to published | 185 ms | 202 ms | 194 ms |
+| Queue wait, in RabbitMQ | 21 ms | 108 ms | 144 ms |
+| Pool wait | 9.1 ms | 8.7 ms | 8.1 ms |
 
-The build is the critical path: 2,366 ms of a 2,615 ms job, on one thread, while
-the drain runs twelve-wide. Build and drain are within 7% of each other (2,366 ms
-against 2,205 ms per slot), so build time maps nearly 1:1 onto total time. The
-drain is not what makes the job slow, and neither is submission.
+**The build and the drain are the same length** -- 1.00x and 1.01x in two of the
+three runs. That is the finding, and it replaces the earlier claim that the build
+was 90% of wall clock on its own.
 
-Pages within a job cannot be parallelised — page N+1's keyset cursor is page N's
+Because the two overlap, the job costs roughly the longer of them rather than
+their sum. In run 1 that is 1.85 s measured against 2.75 s sequential, so
+**overlapping earns about 900 ms, a third of the job.** The corollary is the part
+worth keeping: shortening *either* phase alone moves the total very little,
+because the other becomes the constraint immediately. A 30% win needs both.
+
+**Stable across runs:** pool wait at 7-9 ms (~1.5% of work) and relay lag at
+185-202 ms, which is the 250 ms tick. **Variable:** work per batch spans 34% and
+queue wait spans 7x, with no configuration change. Neither is a fixed cost, and
+quoting either as one would be wrong.
+
+Pages within a job cannot be parallelised -- page N+1's keyset cursor is page N's
 last row. Different jobs can be, which is what the build's advisory claim is for.
 
 **Work cannot be read from the database.** `now()` in Postgres is the transaction
-*start* time, so `completed_at − started_at` is the gap between two `BEGIN`s —
-17 ms against a real 529 ms apply. The apply happens inside the work transaction,
-after `now()` is captured. It appears only in the worker's log, which is why the
-`work=` field on each batch line is load-bearing.
-
-**One run.** Every figure above is a single sample, on the same host whose
-submission figures spread 4× across six runs. The 2,366 ms build could plausibly
-be 1,400 or 3,500. Treat it as a shape, not a result.
+*start* time, so `completed_at - started_at` is the gap between two `BEGIN`s --
+14 ms against a real 422-565 ms apply. The apply happens inside the work
+transaction, after `now()` is captured. It appears only in the worker's log,
+which is why the `work=` field on each batch line is load-bearing, and why
+`benchmark.ts` shells out to read it back.
 
 **The per-page mean is inflated by contention.** Measured against a quiet table a
-page costs ~7 ms (1.1–3.6 ms read, 3.3 ms write). The 47.3 ms above is what it
+page costs ~7 ms (1.1-3.6 ms read, 3.3 ms write). The 41-47 ms above is what it
 costs while twelve workers share the same buffers and WAL. The two have not been
-separated.
+separated, so it is not yet known how much of the build is its own work.
 
 **Queue wait can read negative** — a worker claimed a batch before the relay's
 `markPublished` committed. Correct, and harmless, but `published_at` records that
@@ -104,7 +116,7 @@ the batches do not get slower, more run at once. Each does 1,000 opportunity
 updates and 1,000 transition inserts, so it is compute-bound, not queue-bound, and
 matching consumers to cores is the lever.
 
-Corroborated by the run above: pool wait is 7.3 ms mean against 529 ms of work,
+Corroborated by the runs above: pool wait is 7-9 ms mean against 422-565 ms of work,
 `queued` is 0 on every batch, and all twelve slots were busy with a near-even
 spread (5,4,4,4,5,4,5,4,3,4,4,4 batches per slot for 50 batches). Twelve
 consumers are not waiting on connections or on each other.
@@ -139,7 +151,7 @@ hypothesis, since consumers and `PG_POOL_MAX` are both 12. Measured: 7.3 ms mean
 pool wait, 39.9 ms worst, `waitingCount` 0 throughout — 1.4% of work time. The
 pool is not the constraint.
 
-The residue is therefore inside the 529 ms of Postgres work per batch. Three extra
+The residue is therefore inside the 422-565 ms of Postgres work per batch. Three extra
 round trips per batch and contention on the shared `bulk_job` row remain
 candidates; neither is measured. **Still unidentified**, but no longer a
 saturation problem.
@@ -175,13 +187,15 @@ the scheduler, resume from a partial cursor, and the per-job build claim.
 ## Known limits
 
 - The 3.5× drain residue is unexplained, though pool starvation is ruled out.
-- The build is single-threaded per job and is 90% of the job's wall clock. Pages
-  cannot be parallelised within a job because each page's keyset cursor is the
-  previous page's last row.
-- Concurrency is tuned to this host's 12 cores.
-- Every figure in "Where the time goes" is one run, and the build's per-page cost
-  has not been separated from contention.
+- The build is single-threaded per job. Pages cannot be parallelised within a job
+  because each page's keyset cursor is the previous page's last row.
+- The build and the drain are the same length, so neither alone is the lever:
+  shortening one leaves the other as the constraint.
+- The build's per-page cost has not been separated from contention, so how much of the
+  build is its own work is still unknown.
 - An earlier version of this file claimed a chunk-size win of 1.21× that was really
   1.04×. The false figure is in the message of pushed commit `8f2052b`.
+- Work per batch varies 34% and queue wait 7x between identical runs, so neither is a
+  fixed cost and neither should be quoted as one.
 - The two harnesses that measured the old shape were deleted with it rather than
   repaired; they would have produced numbers about a design that no longer exists.

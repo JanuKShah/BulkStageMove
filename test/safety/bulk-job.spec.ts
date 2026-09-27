@@ -81,12 +81,27 @@ describe('bulk job safety', () => {
     });
 
     it('several unfinished jobs may exist in one workspace', async () => {
-      const { rows } = await pool.query<{ n: number }>(
-        `SELECT count(*)::int AS n FROM bulk_job
-         WHERE workspace_id = $1 AND status = 'pending'`,
-        [ws.workspaceId],
-      );
-      expect(rows[0]!.n).toBeGreaterThan(1);
+      // Counted as anything not yet terminal, and waited for rather than
+      // sampled. A job is created 'preparing' and only becomes 'pending' once its
+      // batches are built, which is up to a couple of seconds after the response -
+      // so counting 'pending' alone was reading a race, and returned 1 whenever
+      // the build had not finished. The property under test is that the uniqueness
+      // key is (workspace_id, idempotency_key) rather than the workspace, so what
+      // matters is that none of these are finished.
+      const deadline = Date.now() + 20_000;
+      for (;;) {
+        const { rows } = await pool.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM bulk_job
+            WHERE workspace_id = $1
+              AND status NOT IN ('completed', 'failed')`,
+          [ws.workspaceId],
+        );
+        if (rows[0]!.n > 1) break;
+        if (Date.now() > deadline) {
+          throw new Error(`only ${rows[0]!.n} unfinished job(s) after 20s`);
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
     });
 
     it('the database refuses a duplicate key even if the service check were removed', async () => {

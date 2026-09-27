@@ -265,21 +265,69 @@ async function main(): Promise<void> {
     line(p.phase, `${triple.join(' / ')}${total}`);
   }
 
-  // Reconciliation: the phases are sequential within a batch, so their totals
-  // should add up to something close to the whole job. The gap is idle time.
-  const total = phases.find((p) => p.phase.startsWith('whole job'))?.min_ms ?? 0;
-  const accounted = phases
-    .filter((p) => p.sum_ms !== null && p.phase.startsWith('build'))
-    .reduce((a, p) => a + (p.sum_ms ?? 0), 0);
-  const workTotal =
-    phases.find((p) => p.phase.startsWith('work'))?.sum_ms ?? 0;
-  console.log(
-    `\n  build total ${ms(accounted)} and work total ${ms(workTotal)} across ` +
-      `${batches.length} batches. Twelve slots, so the work total is wall-clock ` +
-      `parallelism, not elapsed time - compare it against the whole job rather ` +
-      `than adding to it.`,
-  );
-  line('work total / whole job', `${Math.round((workTotal / Math.max(total, 1)) * 100)}%`);
+  // Real per-batch apply time, read out of the worker's log.
+  //
+  // Not available from the table above, and not derivable: now() in Postgres is
+  // the transaction start time, so completed_at - started_at is the gap between two
+  // BEGINs rather than the work. The apply happens inside the work transaction,
+  // after now() has been captured, so its cost appears in no column at all. The
+  // worker times processBatch in-process and logs it, which is the only source.
+  const perBatchWork: number[] = [];
+  try {
+    const log = execSync('docker logs bsm-worker 2>&1', { encoding: 'utf8', maxBuffer: 64 << 20 });
+    const prefix = jobId.slice(0, 8);
+    for (const l of log.split('\n')) {
+      if (!l.includes(prefix)) continue;
+      const m = /work=([\d.]+)ms/.exec(l);
+      if (m) perBatchWork.push(Number(m[1]));
+    }
+    // The container keeps its log across benchmark runs, so the prefix has to be
+    // the only filter. Asserted rather than assumed: taking the last N would also
+    // work but would hide a job id that failed to match, and the worker's line
+    // carries only the truncated id, so a wrong prefix silently yields nothing.
+    if (perBatchWork.length !== batches.length) {
+      console.log(
+        `\n  (warning: matched ${perBatchWork.length} batch lines for ${prefix}, ` +
+          `expected ${batches.length} - drain figures below are suspect)`,
+      );
+    }
+  } catch {
+    // The worker log is not reachable - reported below as absent rather than
+    // silently printed as zero, which is what a bare fallback would produce.
+  }
+
+  // Build against drain. The two are the same length, and that is the finding:
+  // they are not sequential, so the job costs roughly the longer of the two
+  // rather than their sum, and shortening only one of them moves the total very
+  // little.
+  // Number(), not the value as it comes back. The query casts these to bigint, and
+  // node-postgres returns bigint as a STRING so a value beyond Number's integer
+  // range cannot be silently rounded. Division coerces, so the ratio looked right;
+  // `+` does not, so "1660" + 1190 was the string "16601190" and this reported a
+  // sequential time of 16601 seconds. Milliseconds are nowhere near 2^53, so the
+  // safety the string buys is worth nothing here and the arithmetic is.
+  const total = Number(phases.find((p) => p.phase.startsWith('whole job'))?.min_ms ?? 0);
+  const buildTotal = Number(phases.find((p) => p.phase.startsWith('build'))?.sum_ms ?? 0);
+  const slots = Number(process.env.RABBITMQ_CONSUMER_CONCURRENCY ?? 12);
+  if (perBatchWork.length > 0) {
+    // Both figures are already milliseconds: the build's sum_ms comes from the
+    // query and the work figures are parsed straight out of the worker's log.
+    const workPerSlot = perBatchWork.reduce((a, b) => a + b, 0) / slots;
+    console.log(
+      `\n  build total ${ms(buildTotal)} against ${ms(workPerSlot)} of work per slot ` +
+        `across ${perBatchWork.length} batches on ${slots} consumers.`,
+    );
+    line('build / work-per-slot', `${(buildTotal / Math.max(workPerSlot, 1)).toFixed(2)}x`);
+    line('build + work, if sequential', ms(buildTotal + workPerSlot));
+    line('measured whole job', ms(total));
+    // The gap between the sum and the measurement is what overlapping is worth.
+    line('earned by overlapping', ms(buildTotal + workPerSlot - total));
+  } else {
+    console.log(
+      '\n  (worker log unavailable, so per-batch apply time is not reported here;\n' +
+        '   it lives only in the worker log and cannot be read from the database)',
+    );
+  }
 
   await pool.query('DELETE FROM workspace WHERE id = $1', [ws.workspaceId]);
   await pool.end();
