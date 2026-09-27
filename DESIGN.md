@@ -48,21 +48,35 @@ at all; it reads the ids off its own batch row.
 
 ## 2. Idempotency
 
-- **Key:** caller-supplied, required, on the job row, enforced by
-  `UNIQUE (workspace_id, idempotency_key)`.
-- **Not derived from the request**, a hash of `(workspace, target, filter)` can
-  only detect an *identical* request, and a deliberate re-run is identical, so it
-  would be refused as a replay. A client key keeps "retry this" distinct from
-  "do it again".
-- **Protects:** a retry gets the original `jobId`, creates nothing, reports
-  `replay: true`. **Held by the database, not the application**, the service does
-  read-then-insert, which two callers can both pass.
-- **The one gap:** a different key for the same intent. Nothing can tell a fresh
-  uuid per attempt from one that meant it.
-- **Not a hole:** a changed filter or target on the same key is rejected 409, not
-  silently reused. The key is never freed, a column on the row, and nothing
-  prunes completed jobs. There is no DELETE route, so freeing one means deleting
-  the workspace.
+**The caller supplies the key.** It goes on the job row and the database enforces
+it: `UNIQUE (workspace_id, idempotency_key)`. The same key in the same workspace
+cannot be inserted twice, whatever the application does.
+
+**On submit, we look the key up first.** If no job has it, this is a new
+submission and we insert one. If a job already has it, we do not insert anything.
+
+**Then we compare.** The stored job's target stage, and its stored filter, against
+the ones in this request:
+
+- **Both match**, so this is the same request arriving twice. We return the
+  original `jobId` and create nothing. A client that retries after a timeout gets
+  one job, not two.
+- **Either differs**, so the caller has reused a key for something else. We
+  return **409** and change nothing. Silently reusing the old job would run a
+  filter the caller did not ask for.
+
+**The filter is compared after it is resolved.** `outcome=won` is turned into the
+list of stage ids it means before it is stored or compared, so two spellings of
+the same request match, and `outcome=won` cannot be compared against a different
+spelling of itself.
+
+**The key is never freed.** It is a column on the row, nothing prunes completed
+jobs, and there is no delete route, so a key stays taken for as long as its job
+exists. That is the cost of never mistaking a retry for a new request.
+
+**What this does not catch:** the same intent sent under a different key. A client
+that generates a fresh uuid per attempt gets a new job each time, and nothing here
+can tell that apart from a deliberate re-run.
 
 ## 3. Concurrency on one opportunity
 
