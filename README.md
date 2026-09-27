@@ -26,6 +26,8 @@ crosses.
   carries at least: a name, a monetary value, a status
   (open / won / lost / abandoned), an owner, and created/updated timestamps.
 - Every stage change is recorded as a **transition**.
+- `opportunity.stage_decided_at` is a **logical clock**: a person's edit stamps the wall clock, a bulk job stamps its own submission time, and a rename or value edit changes nothing.
+  A job skips any record whose clock is newer than its submission, so a manual edit is never overwritten and the newest job wins however long the older one takes.
 
 ## Technology
 
