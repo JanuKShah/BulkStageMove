@@ -36,7 +36,7 @@ After step 1 the job row is the only thing that exists; nothing is held in memor
 - **Either differs:** the key was reused for something else. **409**, change nothing.
 - **The filter is compared resolved.** `outcome=won` becomes stage ids first, so two spellings of one request match.
 - **Keys are never freed.** A column on the row, and there is no delete route.
-- **The gap:** the same intent under a new key. A fresh uuid per attempt looks like a deliberate re-run.
+- **What this does not catch:** the same intent sent under a different key. A client that generates a fresh uuid per attempt gets a new job each time, and nothing here can tell that apart from a deliberate re-run.
 
 ## 3. Concurrency on one opportunity
 
