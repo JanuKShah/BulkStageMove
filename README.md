@@ -15,10 +15,9 @@ moves up to **50,000** matching opportunities to a different stage in one action
 The API returns immediately with a job handle. The work happens in the
 background. The user polls for progress.
 
-It sounds like a loop. It is not. At volume it is a background job that must be
-**idempotent**, **resumable**, and polite to everything running alongside it,
-and it has to stay correct while individual users are editing the same records
-by hand.
+At volume it is a background job that must be **idempotent**, **resumable**, and
+polite to everything running alongside it, and it has to stay correct while
+individual users are editing the same records by hand.
 
 ## Domain model
 
