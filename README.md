@@ -67,54 +67,36 @@ migrations, and blocks until healthy. `npm run down` tears the stack down and
 
 ## The services
 
-**Ten containers, all started together. Six of them are application services, and
-they are single-process each — the concurrency is inside them, not in how many of
-them there are.**
+**Ten containers, all started together. Six are application services, single-process each — the concurrency is inside them, not in how many there are.**
 
 | container | role | port | kept up at once |
 |---|---|---|---|
-| `workspace-service` | tenants | 3001 | 1 process, pool of 10 |
-| `user-service` | owners | 3002 | 1 process, pool of 10 |
-| `stage-service` | pipelines and permitted moves | 3003 | 1 process, pool of 10 |
-| `opportunity-service` | deals, their stages, the list and filter | 3004 | 1 process, pool of 10 |
-| `transition-service` | **bulk jobs**: submit, batching, status | 3005 | 1 process, pool of 10, **2 background loops** |
-| `worker-service` | applies batches; **no port** — it only consumes | — | 1 process, **12 consumers**, pool of 12 |
+| `workspace-service` | tenants | 3001 | 1 process, **DB pool of 10** |
+| `user-service` | owners | 3002 | 1 process, **DB pool of 10** |
+| `stage-service` | pipelines and permitted moves | 3003 | 1 process, **DB pool of 10** |
+| `opportunity-service` | deals, their stages, the list and filter | 3004 | 1 process, **DB pool of 10** |
+| `transition-service` | **bulk jobs**: submit, batching, status | 3005 | 1 process, **DB pool of 10**, **2 background loops** |
+| `worker-service` | applies batches; **no port** — it only consumes | — | 1 process, **12 consumers**, **DB pool of 12** |
 | `nginx` | the edge; fronts transition-service only | 8080 | 1 |
 | `postgres` | the datastore | 5432 | 1 |
 | `rabbitmq` | batch dispatch | 5672, UI 15672 | 1 exchange, **5 queues** |
-| `migrate` | applies migrations, then exits | — | runs once at startup, not kept up |
+| `migrate` | applies migrations, then exits | — | runs once at startup |
 
-**The three loops that do the work**, all of them on 125 ms timers inside
-`transition-service` and `worker-service`:
+**The three loops that do the work:**
 
 | loop | where | every | up to | parallelism |
 |---|---|---|---|---|
-| `SnapshotBuilder` | transition-service | 125 ms | 25 jobs claimed per tick | **one job at a time**, and always one walker per job |
-| `OutboxRelay` | transition-service | 125 ms | 50 unpublished batch rows per tick | one at a time |
+| `SnapshotBuilder` | transition-service | 125 ms | 25 jobs claimed | **one job at a time**, one walker per job |
+| `OutboxRelay` | transition-service | 125 ms | 50 unpublished rows | one at a time |
 | `BatchWorker` | worker-service | message-driven | — | **12 slots**, one channel each |
 
-Batching is the one that cannot be widened. A page's keyset cursor is the
-previous page's last row, so page 2 cannot be asked for before page 1 returns —
-one job, one walker, always. What *can* run in parallel is different jobs, which
-is what the advisory lock is for: with three replicas, three jobs batch at once
-and no two batching passes touch the same one. Twelve workers is the widest thing in the
-system and it is deliberately matched to this host's 12 cores.
+**Batching cannot be widened** — a page's keyset cursor is the previous page's last row — but different jobs can run in parallel, which is what the advisory lock is for. Twelve workers is the widest thing here, matched to this host's 12 cores.
 
-Every service has its **own** pool, per service rather than shared: five pools of
-10 plus the worker's 12 is **62 connections at most**, against Postgres' 100
-limit. That arithmetic is why the worker gets 12 and the rest get 10 — the other
-five services are request/response and never need more than a handful at a time.
+**"DB pool of N" is a ceiling on Postgres connections** for that process (`PG_POOL_MAX` becomes `pg`'s `max`), opened on demand — the idle stack held 8 while this was written. Five pools of 10 plus the worker's 12 is **62 against Postgres' 100** `max_connections`, which is why the worker gets 12 and the rest 10. The ceiling is per process, so it multiplies by replica count: three worker replicas put the stack at 86, and a fourth breaches the limit.
 
-The five queues are one work queue, one dead-letter queue, and **three retry
-queues, one per backoff step** (1 s, 5 s, 30 s). A queue carries exactly one TTL
-and dead-letters on expiry, so three delays means three queues — and the message
-waits out its backoff in the broker, not in a sleeping consumer, so a retrying
-batch holds no worker slot. That is the difference between 12 slots and 12 slots
-that are sometimes just waiting.
+**Five queues: one work, one dead-letter, three retry** — one per backoff step (1 s, 5 s, 30 s), because a queue carries one TTL. The backoff waits in the broker, not in a consumer, so a retrying batch holds no worker slot.
 
-Only **transition-service** sits behind nginx. The other four keep direct ports,
-because the brief asks for the service boundaries rather than a gateway. Tenant
-scoping is a required `X-Workspace-Id` header.
+Only **transition-service** sits behind nginx; the other four keep direct ports, since the brief asks for the boundaries rather than a gateway. Tenant scoping is a required `X-Workspace-Id` header.
 
 ## The main logic
 
@@ -140,134 +122,46 @@ later step reads it or the rows it produces, and nothing is held in memory.
 | 5 | its current stage has a permitted transition to the target | **fail** — no permitted move |
 | 6 | — | **move it**, and insert one transition |
 
-Check 2 must stay ahead of check 3, and the reason is the mirror image of the
-obvious one. A person who moves a record *to* the target has stamped it with a
-time newer than the job's, so testing the clock first would report that as a
-skip — and under-report a job that in fact achieved its intent. Check 2 also
-makes a retry idempotent: a record the previous attempt already moved is counted
-as moved, not as a failure, so a batch that dies halfway does not turn every
-record it finished into a failure on the second attempt.
+**Check 2 must stay ahead of check 3** — the mirror of the obvious order. A person who moves a record *to* the target has stamped it newer than the job, so testing the clock first would report a skip and under-count a job that achieved its intent. Check 2 also makes a retry idempotent, so a batch that dies halfway does not turn every record it finished into a failure.
 
-Two guards sit in front of all of that, and they cover different accidents:
+**Two guards sit in front of all six checks, and they cover different accidents:**
 
-- **A per-batch advisory lock**, taken first. If another consumer already holds
-  this batch, the second one is refused outright and returns without touching a
-  row. This is the only thing that catches a *concurrent* duplicate, and it has
-  to come first — two consumers holding the same message both read `pending`, so
-  both would pass a status check.
-- **A `pending → running` compare-and-set**, taken second. A batch that already
-  committed is `completed` and matches nothing, so a redelivery that arrives
-  *after* the first attempt finished claims no rows and does nothing.
+- **A per-batch advisory lock, taken first.** Two consumers holding the same message both read `pending`, so only the lock catches a *concurrent* duplicate; the second is refused without touching a row.
+- **A `pending → running` compare-and-set, taken second.** A batch that already committed is `completed` and matches nothing, so a redelivery after the fact claims no rows.
 
-Both are in the database, not in process memory, because a second replica has to
-be excluded too. Neither is a unique index: there is deliberately no constraint
-on `(job_id, opportunity_id)`, and `0001_schema.sql` records why one is not
-needed and what would have to change to bring it back.
+Both are in the database, not process memory, so a second replica is excluded too. Neither is a unique index — `0001_schema.sql` records why one is not needed on `(job_id, opportunity_id)`.
 
 ## Design decisions
 
-**Submission returns before the work starts.** `POST` writes the job row and
-returns in single-digit milliseconds. The walk that turns a filter into batches
-runs afterwards in `SnapshotBuilder`, resumed from a cursor if it dies. At
-500,000 records the old inline walk was super-linear — 0.56 s at 50,000 became
-32.06 s at 500,000 — because it accumulated every batch's ids in memory first.
-Streaming fixes the shape, not just the constant.
+**Submission returns before the work starts.** The walk that turns a filter into batches runs in `SnapshotBuilder` after the response, resumed from a cursor, because the old inline walk was super-linear — 0.56 s at 50,000 became 32.06 s at 500,000.
 
-**A job row is 'preparing' by default, not 'pending'.** A job is created before
-its batches exist, so that is the state it is actually in, and it is the state
-the sweep looks for. The opposite default produced a silent hang: a job inserted
-without an explicit status sat in 'pending' with no batches, nothing to publish,
-and nothing to notice it had stalled. Getting it wrong now means a job gets
-built that should not have been, which is recoverable.
+**A job row is 'preparing' by default, not 'pending'.** A job exists before its batches do, so that is the state it is actually in; the opposite default produced a silent hang.
 
-**Batches hold record ids, not one row per record.** The job writes 50 batch rows
-carrying 1,000 uuids each, not 50,000 item rows. The old shape was 81% of the
-time to the `201` and needed four indexes and three composite foreign keys per
-record. What it bought back — the ability to skip a record someone moved by hand
-— is kept, by re-reading live state in the worker rather than by storing a
-membership table.
+**Batches hold record ids, not one row per record.** 50 rows of 1,000 uuids instead of 50,000 item rows, which were 81% of the time to the `201`.
 
-**`stage_decided_at` is a logical clock, not a timestamp of change.** A person's
-edit stamps the wall clock. A bulk job stamps **its own submission time**. The
-worker's rule is then `skip if record.stage_decided_at > job.snapshot_at`, which
-compares *when jobs were submitted* rather than when rows were written — so the
-newest job wins no matter which one finishes first. Writing the wall clock would
-make it last-writer-wins, and an older job still draining would beat a newer one.
-Two properties fall out: a person always wins, at either side of the submission;
-and a job never skips its own work, because `J.at > J.at` is false, so a retry is
-never blocked by its first attempt.
+**`stage_decided_at` is a logical clock, not a timestamp of change.** A person stamps the wall clock, a job stamps its own submission time, so the newest job wins however long the older one takes.
 
-It needs **no synchronised clocks**, because every timestamp in the comparison
-comes from the one Postgres — the job's `snapshot_at` is `now()` at insert, the
-trigger's `now()` is the same clock, and the worker reads its stamp from its own
-row rather than from its own system time.
+**It needs no synchronised clocks,** because every timestamp in that comparison comes from the one Postgres — the job's `snapshot_at` and the trigger's `now()` are the same clock.
 
-**One batching pass per job, enforced by the database.** A job's pages are keyset-
-paginated, so page N+1's cursor is page N's last row and a job's walk cannot be
-parallelised at all. Different jobs are independent, so `SnapshotBuilder` takes a
-non-blocking advisory lock per job before walking it. Without the lock a second
-replica is *correct* and wasteful — every page read and written twice, scaling
-with replica count. The lock makes "one walker per job" something Postgres
-enforces rather than a property of there happening to be one replica.
+**One batching pass per job, enforced by the database.** A page's keyset cursor is the previous page's last row, so a job cannot be walked twice at once; the advisory lock makes that Postgres's rule rather than a property of there being one replica.
 
-**Dispatch is an outbox, so the batch rows and the intent to send them commit
-together.** A row is marked published only after the broker confirms, so a crash
-between the two re-publishes rather than loses. Delivery is at-least-once, and
-the worker's two database guards — a per-batch advisory lock, then a
-`pending → running` compare-and-set — make processing effectively-once.
-Duplicate batches are harmless; a lost one would hang the job at pending for
-ever.
+**Dispatch is an outbox, so the batch rows and the intent to send them commit together,** which makes delivery at-least-once and lets the worker's two database guards make it effectively-once.
 
-**A correlation id is minted at the edge and carried on every log line.** One
-`--> / <--` pair per request in every service, and the job's id stored on the job
-row so the batching can be traced back to the request that caused it. Validated
-against `^[A-Za-z0-9._:-]{1,64}$` at both the edge and the service, because a
-caller-supplied id ends up in log lines and a newline would let a client forge
-one.
+**A correlation id is minted at the edge and carried on every log line,** validated against `^[A-Za-z0-9._:-]{1,64}$` because a caller-supplied id ends up in log lines and a newline would let a client forge one.
 
 ## Left for later
 
-**Redis — considered, added, then removed.** The state is either durable or
-per-process, with nothing in between. Job status and cursors must survive a
-restart, so they belong in Postgres; the correlation id is request-scoped and
-belongs in `AsyncLocalStorage`, which needs no infrastructure. Caching the
-snapshot batching would make it *less* correct, not faster: the cursor and the batch
-data commit in one transaction, and splitting them across two stores turns an
-atomic operation into a distributed one. It would earn its place for leader
-election at high replica counts, or for a read path `EXPLAIN` shows hammering
-Postgres. Neither is true yet.
+**Redis — considered, added, then removed.** Every piece of state is either durable in Postgres or per-process, so there is nothing a cache could hold that is safe to cache.
 
-**`opportunity.version` — the one concurrency gap left open.** `stage_decided_at`
-covers job-versus-record. Two people editing the same deal is the other half, and
-it is not covered: the second save silently wins. The fix is a
-`version integer` with `WHERE version = $expected` on the single-record move,
-rejecting the **later** save with a 409. The bulk job must never bump it — a job
-moving 1,000 records would bump 1,000 versions and hand every user with one of
-them open a 409 about a field they never edited — so the two mechanisms have to
-stay independent. Not built: there is no UI, so it is only observable when two
-humans edit one record at once.
+**`opportunity.version` — the one concurrency gap left open.** `stage_decided_at` covers job-versus-record; two people editing the same deal is the other half, and the second save silently wins.
 
-**No rate limit on submit.** Nothing bounds how many jobs one tenant can create,
-and with async submission that is now cheap to spam. Would be a Postgres
-counter before a new dependency.
+**No rate limit on submit.** Nothing bounds how many jobs one tenant can create, and async submission made that cheap to spam.
 
-**Small jobs are bound by the poll intervals, not by their data.** A job waits a
-tick before the first batch exists, then a tick before any of it is published. At
-the original 250 ms, a filter matching 5,050 records settled in 390–470 ms and one
-matching 5,065 in 386–407 ms — indistinguishable, and both carrying roughly half a
-second of pure waiting. Halving both ticks to 125 ms took those to **335–341 ms**
-and **275–336 ms**, a consistent ~100 ms across three runs, and the 50,000-record
-job from 1.82–2.72 s to 1.52–2.37 s.
+**Small jobs are bound by the poll intervals, not by their data.** Two ticks sit between submitting and the first batch running, so a 5,000-record job still carries ~125 ms of pure waiting.
 
-That is a mitigation, not a fix. The wait is now ~125 ms of expectation rather
-than ~250 ms, and it is still there: a tick is a tick, and halving the interval
-halves the wait rather than removing it. Removing it means kicking the builder
-from `POST /bulk-moves` and kicking the relay after each page commits, leaving the
-timers as the recovery path for a crashed replica. Not built.
+**That floor is mitigated, not removed.** Halving both ticks to 125 ms took ~100 ms off every small job and doubled queue wait; removing the wait needs a kick from `POST /bulk-moves`, not a shorter timer.
 
-It was not free. Queue wait roughly doubled — mean 116–280 ms against 21–144 ms —
-because publishing twice as often delivers a heavier stream to twelve consumers.
-The job a caller waits for got faster while internal queueing got worse.
+**Progress is reported in batches, not records.** The endpoint returns how many batch rows settled and how many records failed, but not how many records moved — that number is in the database and is not exposed.
 
 ## Exploring it
 
@@ -281,13 +175,24 @@ npm run cli                                       # interactive menu
 npm run cli -- opportunities --workspace=<uuid> --outcome=won --limit=20
 npm run cli -- bulk-move --workspace=<uuid> --to=<stageId> --outcome=won
 npm run cli -- job-status --workspace=<uuid> --id=<jobId>
+npm run cli -- job-watch  --workspace=<uuid> --id=<jobId>
 ```
 
 A workspace id is required. `npm run seed` prints them; there is no endpoint that lists
 workspaces, because a caller must not be able to enumerate other tenants.
 
-**Dump — write the database to a file.** Use it to check by eye that a bulk move or a
-filter touched exactly the rows you expected.
+**`job-watch` polls every 2 seconds until the job settles** — in place on a terminal, appended when piped, so it reads live and in a log. `--interval=ms` and `--timeout=ms` override the defaults; a timeout gives up watching **without cancelling the job**, since there is no cancel endpoint.
+
+```bash
+     0.1s  running     21/50 batches  11 running  18 pending    -
+     2.1s  completed   50/50 batches  0 running  0 pending  23.9 batches/s
+
+  completed in 2.1s  50 batch(es), 50000 matched, 0 failed
+```
+
+Progress is in batches, not records, because the API exposes no records-moved count — see *Left for later*.
+
+**Dump — write the database to a file,** to check by eye that a bulk move or a filter touched exactly the rows you expected. It reads Postgres directly, so it reflects what is actually stored.
 
 ```bash
 npm run dump                                      # every row -> db-state.txt
@@ -295,17 +200,12 @@ npm run cli -- dump-db --sample=100               # capped, for the 500k dataset
 npm run cli -- dump-db --out=before.txt           # then --out=after.txt and diff
 ```
 
-It reads Postgres directly, not the API, so it reflects what is actually stored.
-
-**Watch a job run.**
+**Watch a job run.** Service names, not the `bsm-` container names.
 
 ```bash
 docker compose logs -f worker-service     # one line per batch: wait, work, pool pressure
 docker compose logs -f transition-service # batching, per page, and the relay
 ```
-
-Service names, not the `bsm-` container names — `docker compose logs` takes the
-former and fails on the latter.
 
 ## Tests
 

@@ -69,41 +69,20 @@ consumers gave 0.58, 1.59, 1.75, 2.16, 2.21 and 2.30 s.
 Three consecutive runs at the 125 ms tick, fresh volume each time, from the four
 timestamps on each batch row plus the worker's own in-process timing.
 
-- **The drain is the constraint now, not batching** — 0.55x-0.89x, reversing the
-  1.00x this section used to report. At 812 ms of batching against 1.49 s of work
-  per slot there is 678 ms of headroom the job was never waiting on. Batching
-  nonetheless got about 2x faster (per-page mean 41-47 ms to 16-31 ms) from a timer
-  that is not on the page-write path. That is unexplained, and it is why the
-  per-page figure is not yet trusted: a quiet table pages in ~7 ms, so most of the
-  16-31 ms is contention with the twelve workers rather than the walk's own work.
-- **The tighter tick was not free.** Queue wait mean 116-280 ms against 21-144 ms,
-  summing to 14.00 s across the 50 batches against 5.78 s — publishing twice as
-  often delivers a heavier stream to twelve consumers, so batches sit in the broker
-  longer. The job a caller waits for got faster, 1.52-2.37 s against 1.82-2.72 s,
-  while batches queued roughly twice as long. Three runs is thin for a range that
-  wide, so the size of the regression is unsettled. Against it: relay lag halved
-  (mean 99-111 ms, floor 43-55 ms, against a previously flat 185 ms that was almost
-  entirely tick) and sweep wait fell to 7-32 ms from 62 ms.
-- **Work cannot be read from the database.** `now()` is the transaction *start*
-  time, so `completed_at - started_at` is the gap between two `BEGIN`s — a few ms
-  against a real 174-598 ms apply. It exists only in the worker's log, which is why
-  the `work=` field on each batch line is load-bearing and why `benchmark.ts` shells
-  out to read it back.
-- **Two things that look like bugs and are not.** Pages cannot be parallelised
-  within a job, because page N+1's keyset cursor is page N's last row; different
-  jobs can be, which is what the advisory claim is for. And queue wait can read
-  negative, because a worker claimed a batch before the relay's `markPublished`
-  committed — `published_at` records that publication happened, not an ordering
-  guarantee.
+- **The drain is the constraint now, not batching** — 0.55x-0.89x, reversing the 1.00x this section used to report, so there is 678 ms of batching headroom the job was never waiting on.
+- **Batching nonetheless got about 2x faster** — per-page mean 41-47 ms to 16-31 ms — from a timer that is not on the page-write path, which is unexplained.
+- **That is also why the per-page figure is not trusted:** a quiet table pages in ~7 ms, so most of the 16-31 ms is contention with the twelve workers, not the walk's own work.
+- **The tighter tick was not free.** Queue wait mean 116-280 ms against 21-144 ms, summing to 14.00 s across the 50 batches against 5.78 s.
+- **The caller's job still got faster** — 1.52-2.37 s against 1.82-2.72 s — while batches queued roughly twice as long; three runs is thin for a range that wide, so the size of the regression is unsettled.
+- **Against that: relay lag halved** (mean 99-111 ms, floor 43-55 ms, against a previously flat 185 ms that was almost entirely tick) and sweep wait fell to 7-32 ms from 62 ms.
+- **Work cannot be read from the database.** `now()` is the transaction *start* time, so `completed_at - started_at` is the gap between two `BEGIN`s — a few ms against a real 174-598 ms apply.
+- **It exists only in the worker's log,** which is why the `work=` field on each batch line is load-bearing and why `benchmark.ts` shells out to read it back.
+- **Pages cannot be parallelised within a job,** because page N+1's keyset cursor is page N's last row; different jobs can be, which is what the advisory claim is for.
+- **Queue wait can read negative,** because a worker claimed a batch before the relay's `markPublished` committed — `published_at` records that publication happened, not an ordering guarantee.
 
 ## Filter selectivity
 
-`npx tsx test/happyflow/filter-bench.ts` - one freshly seeded 50,000 record
-workspace per case, one **full job** per filter, each case run twice with only the
-second (warm) pass reported, whole script run three times per tick. **Per
-transition** is total wall clock divided by records moved, which is the only column
-here that is directly comparable across filters of different sizes: the raw totals
-are not, because a 5,000-record job pays the same fixed cost as a 50,000-record one.
+`npx tsx test/happyflow/filter-bench.ts` - one freshly seeded 50,000 record workspace per case, one **full job** per filter, each case run twice with only the warm pass reported, whole script run three times per tick. **Per transition** is total wall clock over records moved — the only column comparable across filter sizes, since raw totals are not.
 
 | filter | matched | pages | per transition, 250 ms | per transition, 125 ms | moved | verdict |
 |---|---|---|---|---|---|---|
@@ -112,50 +91,13 @@ are not, because a 5,000-record job pays the same fixed cost as a 50,000-record 
 | value range | 5,050 | 6 | 77.2-93.1 µs | 66.3-67.5 µs | 5,050 | **-21%** |
 | date range | 5,065 | 6 | 76.2-80.4 µs | 54.3-66.3 µs | 5,065 | **-23%** |
 
-**No regression anywhere.** Every selective filter got about 21-23% cheaper per
-transition, and the unfiltered job is unchanged within run-to-run noise — its two
-ranges overlap, and `benchmark.ts` puts the same 50,000-record job the other way
-(1.82-2.72 s at 250 ms against 1.52-2.37 s at 125 ms), which is what noise at this
-scale looks like. The tick change was never going to help a job that spends its
-time on per-record work rather than waiting.
-
-**The finding is the 3.5x spread down the per-transition column, not the tick
-change.** 23.7 µs at 50,000 records against 85.1 µs at 5,050: the smaller the job,
-the worse it pays per record, because the fixed costs — one sweep tick, one relay
-tick, one builder pass — do not amortise over fewer records. That is the honest
-version of "small jobs are slow", and total/s alone hides it by reporting a rate.
-
-**Per page does not show the cost of selectivity**, which is the column this was
-originally written to find. Across four filters and three runs it lands in a
-6-18 ms band with no ordering — the value-range rows are the *slowest* per page and
-they match the fewest records. The walk's per-page work is dominated by the batch
-write, a 1,000-element uuid array and a commit, not by how many rows the stage
-filter discarded on the way. So whether `stage_id` belongs in the walk's index is
-**not answered here** and should not be argued from these numbers. An earlier
-reading of 25 ms against 13 ms looked like an effect and was a warm-up curve: the
-cases ran in order and the first was always the coldest thing in shared buffers
-after 50,000 rows had just been inserted.
-
-**Halving the ticks mitigated the floor rather than removing it.** A job waits one
-sweep tick before its first batch exists and one relay tick before any of it is
-published, so the expected wait is half the interval per tick: ~125 ms instead of
-~250 ms, which is where the ~21-23% above comes from on a 5,000-record job. It is
-still a floor. Removing it needs a kick rather than a shorter tick — `POST
-/bulk-moves` waking the builder, and the builder waking the relay after each page
-commits, with the timers left as the recovery path for a crashed replica. **Not
-built.**
-
-The tighter tick is affordable because both polls are index scans that usually
-return nothing — the sweep reads `bulk_job_preparing_idx`, the relay reads
-`bulk_job_outbox_unpublished_idx`, itself partial over `WHERE published_at IS
-NULL` — so an idle tick touches one index entry. Below this it stops being free,
-which is where the event-driven version becomes the right answer rather than merely
-the better one.
-
-**The record count at which waiting stops dominating has moved and is not
-re-measured.** The smallest filter here is 5,050 records, which is not small enough
-to locate it. **No threshold should be quoted until this bench runs cases below
-1,000.**
+- **No regression anywhere** — every selective filter got 21-23% cheaper per transition, and the unfiltered job is unchanged within noise; its ranges overlap and `benchmark.ts` puts the same job the other way, which is what noise at this scale looks like.
+- **The finding is the 3.5x spread down the column, not the tick change** — 23.7 µs at 50,000 records against 85.1 µs at 5,050, because the fixed costs do not amortise over fewer records. A rate would have hidden this.
+- **Per page shows no cost of selectivity** — a 6-18 ms band with no ordering, the value-range rows being the slowest and matching the fewest. The walk is dominated by the batch write, not by rows the stage filter discarded, so whether `stage_id` belongs in its index is **not answered here**.
+- **An earlier 25 ms against 13 ms reading was a warm-up curve,** not an effect: cases ran in order and the first was always coldest after 50,000 rows were inserted.
+- **Halving the ticks mitigated the floor, it did not remove it** — ~125 ms of expected wait is where the 21-23% comes from at 5,000 records. Removing it needs a kick from `POST /bulk-moves`, not a shorter timer. **Not built.**
+- **The tighter tick is affordable** because both polls are index scans that usually return nothing — `bulk_job_preparing_idx` and a partial `bulk_job_outbox_unpublished_idx`. Below this it stops being free.
+- **The record count at which waiting stops dominating is not re-measured.** The smallest case here is 5,050 records. **No threshold should be quoted until this bench runs cases below 1,000.**
 
 ## Beyond the brief
 
@@ -190,19 +132,9 @@ entire workspace.
 
 ## Known limits
 
-- Batching is single-threaded per job. Pages cannot be parallelised within a job
-  because each page's keyset cursor is the previous page's last row.
-- Batching's per-page cost has not been separated from contention, so how much of
-  the batching is its own work is still unknown.
-- **A small job is bound by its polling intervals, not by its data.** A sweep tick
-  before the first batch exists, then a relay tick before any of it is published.
-  Halved from 250 ms to 125 ms, which took ~100 ms off every small job: 5,050
-  records settled in 335–341 ms against 390–470 ms, and 5,065 in 275–336 ms against
-  386–407 ms. The floor is now ~125 ms of expectation rather than ~250 ms, and is
-  still a floor — removing it needs a kick rather than a shorter tick. The record
-  count at which waiting stops dominating has moved with it and is not re-measured;
-  see "Filter selectivity" above.
-- Queue wait roughly doubled when the tick was halved, which is the cost of it.
-  Unsettled at three runs. See "Where the time goes".
-- Batching got about 2x faster when only a timer changed, and nothing in the tick
-  is on the path of a page write. Unexplained. See "Where the time goes".
+- Batching is single-threaded per job, because each page's keyset cursor is the previous page's last row.
+- Batching's per-page cost has not been separated from contention, so how much is its own work is unknown.
+- **A small job is bound by its polling intervals, not by its data** — ~125 ms of waiting, halved from 250 ms and still a floor. The record count at which waiting stops dominating has moved with it and is not re-measured. See "Filter selectivity".
+- Queue wait roughly doubled when the tick was halved, which is the cost of it. Unsettled at three runs. See "Where the time goes".
+- Batching got about 2x faster when only a timer changed. Unexplained. See "Where the time goes".
+
