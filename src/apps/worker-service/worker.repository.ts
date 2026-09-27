@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import type { PoolClient } from 'pg';
 import { DatabaseService } from '../../shared/database/database.service';
 import { RABBIT_CONFIG, type RabbitConfig } from '../../shared/rabbit/rabbit.config';
@@ -81,6 +81,8 @@ interface JobSpec {
  */
 @Injectable()
 export class WorkerRepository {
+  private readonly logger = new Logger(WorkerRepository.name);
+
   constructor(
     private readonly db: DatabaseService,
     @Inject(RABBIT_CONFIG) private readonly config: RabbitConfig,
@@ -342,12 +344,28 @@ export class WorkerRepository {
     // The live stage for every record in the batch. This is the baseline the
     // decision is made against - the stored membership says which records to
     // consider, and this says where they actually are now.
-    const live = await client.query<OpportunityRef>(
-      `SELECT id, stage_id FROM opportunity
-        WHERE workspace_id = $1 AND id = ANY($2::uuid[])`,
-      [workspaceId, ids],
+    //
+    // decided_since is the logical clock, and it is computed here in SQL rather
+    // than in the loop below for two reasons. The comparison is
+    // stage_decided_at > snapshot_at, column against column, so no timestamp
+    // crosses the wire: timestamptz carries microseconds and a JS Date carries
+    // milliseconds, and with no type parser override both sides would truncate.
+    // And it is free - this query already fetches per-record state, and a boolean
+    // comes back where a Date would have.
+    const live = await client.query<OpportunityRef & { decided_since: boolean }>(
+      `SELECT o.id, o.stage_id, o.stage_decided_at > j.snapshot_at AS decided_since
+         FROM opportunity o, bulk_job j
+        WHERE o.workspace_id = $1 AND o.id = ANY($2::uuid[])
+          AND j.id = $3 AND j.workspace_id = $1`,
+      [workspaceId, ids, jobId],
     );
     const present = new Map(live.rows.map((r) => [r.id, r.stage_id]));
+    // Read separately rather than folded into `present`, which is keyed by stage
+    // and is asked "where is it". This one answers "has it changed since we were
+    // submitted", which is a different question and the reason this column
+    // exists - a record can sit in a stage the filter names and still have been
+    // moved there deliberately since submission.
+    const changedSince = new Set(live.rows.filter((r) => r.decided_since).map((r) => r.id));
 
     // One query for the rules of every stage this batch starts from, not 1000.
     const rules = await client.query<{ from_stage_id: string; to_stage_id: string }>(
@@ -370,8 +388,11 @@ export class WorkerRepository {
     // been deleted is in neither set, and dropping it silently would hide a real
     // loss; a record that has left the filtered set is in one and must be
     // recognised as out of scope rather than moved.
+    //
+    // The order of these checks is the design, not an accident.
     let alreadyThere = 0;
     let leftScope = 0;
+    let changedAfterSubmit = 0;
     for (const id of ids) {
       const stageId = present.get(id);
       if (stageId === undefined) {
@@ -383,7 +404,24 @@ export class WorkerRepository {
         // because on a retry that is exactly what it is - the previous attempt
         // did this record before dying. Treating it as a failure would turn every
         // successful record into a failure on the second attempt.
+        //
+        // Ahead of the clock check below, and it has to stay there. A person who
+        // moves a record *to* the target has done what the job wanted, and their
+        // stamp is newer than the job's, so checking the clock first would report
+        // that as a skip and under-report a job that in fact achieved its intent.
         alreadyThere += 1;
+        continue;
+      }
+      if (changedSince.has(id)) {
+        // Somebody decided this record's stage after this job was submitted, and
+        // that decision is newer. Left alone for the same reason as the check
+        // below: undoing a deliberate change is worse than not finishing the job.
+        //
+        // This is the case the stored membership cannot see. The record may well
+        // still be in a stage the filter names - the check below would pass it
+        // through - and it is this one that stops a bulk job overwriting a
+        // deliberate edit made while the job was still being built.
+        changedAfterSubmit += 1;
         continue;
       }
       if (filterStages.size > 0 && !filterStages.has(stageId)) {
@@ -403,13 +441,25 @@ export class WorkerRepository {
     // a *different* member of that set slip through.
     let movedCount = 0;
     if (movable.length > 0) {
+      // stage_decided_at is set to this job's own snapshot_at, not now(). That
+      // makes the column a logical clock saying whose decision put the record
+      // here, so a job that arrives later but was submitted earlier still defers -
+      // writing the wall clock instead would make this last-writer-wins and let an
+      // older job still draining beat a newer one.
+      //
+      // Read from the row rather than bound as a parameter, for the same reason
+      // the read above avoids binding one: a JS Date would truncate microseconds
+      // on a value other jobs compare at full precision. Naming the column also
+      // stands the stage_decided_at trigger down, which is how one trigger serves
+      // both a person's edit and a job's.
       const moved = await client.query<{ id: string }>(
         `UPDATE opportunity o
-            SET stage_id = $2, updated_at = now()
+            SET stage_id = $2, updated_at = now(),
+                stage_decided_at = (SELECT snapshot_at FROM bulk_job WHERE id = $5)
            FROM unnest($3::uuid[], $4::uuid[]) AS t(id, from_stage)
           WHERE o.workspace_id = $1 AND o.id = t.id AND o.stage_id = t.from_stage
         RETURNING o.id`,
-        [workspaceId, targetId, movable.map((m) => m.id), movable.map((m) => m.stage_id)],
+        [workspaceId, targetId, movable.map((m) => m.id), movable.map((m) => m.stage_id), jobId],
       );
       movedCount = moved.rows.length;
       if (movedCount !== movable.length) {
@@ -505,7 +555,20 @@ export class WorkerRepository {
     );
 
     await this.settleJob(client, workspaceId, jobId);
-    return { moved: settled, failed: failedCount, skipped: leftScope };
+    // Both skip causes are reported as one count, because from the job's point of
+    // view they are the same event: a record the job declined to touch. They are
+    // counted apart above only so this line can say which was more common, and
+    // because a record skipped for the clock is a materially different thing from
+    // one skipped for scope - the first was a deliberate edit to a record that was
+    // still in scope, and a user watching processed_count come in under
+    // total_matched deserves to know that is why.
+    if (changedAfterSubmit > 0) {
+      this.logger.log(
+        `job ${jobId} batch ${batchNo}: ${changedAfterSubmit} record(s) left alone, ` +
+          `stage decided after this job was submitted`,
+      );
+    }
+    return { moved: settled, failed: failedCount, skipped: leftScope + changedAfterSubmit };
   }
 
   /** Records what became of the batch, on the batch row. */
