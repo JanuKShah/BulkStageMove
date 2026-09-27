@@ -119,10 +119,6 @@ observable without a UI. A gateway, websockets, or one service per noun. An
 event-driven *relay* kick, submit kicks the sweep inline, but a committed batch
 still waits out the relay's next tick.
 
-**Known gaps, in `DESIGN.md` section 8.** A given-up batch's records sit in no counter
-until someone calls `retry-failed`. Idempotency keys are never cleared. Queue wait
-is the largest cost and is not yet attributed to anything.
-
 ## Exploring it
 
 There is no UI, so two commands cover it. Both need the stack up.
