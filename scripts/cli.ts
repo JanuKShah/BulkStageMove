@@ -54,7 +54,35 @@ async function request<T = unknown>(
 
 const ok = (r: Reply): boolean => r.status < 400;
 
+/**
+ * Set by `--json`, read by every renderer.
+ *
+ * Module-level rather than threaded through, because the renderers are reached
+ * from two places (a direct command and a menu entry) and threading a flag
+ * through both would put a parameter on five functions to carry one boolean.
+ */
+let jsonMode = false;
+
+/**
+ * Prints the response body as JSON when `--json` is set.
+ *
+ * Returns true when it has printed, so the caller returns early and the human
+ * rendering is skipped. Every renderer starts with this, which is what makes the
+ * flag work uniformly instead of per command - the alternative was four renderers
+ * each remembering to check, and one of them would eventually not.
+ *
+ * The body is the API's own response, unmodified. This is a CLI convenience, not
+ * a second shape to keep in step with the API: anything added to an endpoint shows
+ * up here with no work on this side.
+ */
+function emitJson(reply: Reply): boolean {
+  if (!jsonMode) return false;
+  console.log(JSON.stringify(reply.body ?? null, null, 2));
+  return true;
+}
+
 function print(reply: Reply, label = ''): void {
+  if (emitJson(reply)) return;
   if (label) console.log(`\n--- ${label} ---`);
   if (reply.status >= 400) {
     const body = reply.body as { message?: string } | null;
@@ -72,6 +100,73 @@ const indent = (text: string): string =>
     .split('\n')
     .map((l) => `  ${l}`)
     .join('\n');
+
+// ------------------------------------------------------------------ formatting
+
+/** A uuid shortened to its first segment, which is enough to recognise and enough to paste. */
+const shortId = (id: string): string => (id.length > 8 ? id.slice(0, 8) : id);
+
+/** Groups digits: 50000 -> 50,000. */
+const group = (n: number): string => n.toLocaleString('en-US');
+
+/** Human duration from milliseconds: 940 -> 940ms, 2100 -> 2.1s, 125000 -> 2m 5s. */
+function duration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '-';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s = Math.round((ms % 60_000) / 1000);
+  return `${m}m ${s}s`;
+}
+
+/**
+ * A fixed-width progress bar.
+ *
+ * Width is constant so successive polls of a running job line up in a terminal
+ * and the bar visibly grows rather than the line jittering. Empty rather than a
+ * spinner, because a caller watching a job wants to know how far along it is, and
+ * "how far along" is a number.
+ */
+function bar(done: number, total: number, width = 24): string {
+  if (total <= 0) return '[' + '-'.repeat(width) + ']';
+  const filled = Math.max(0, Math.min(width, Math.round((done / total) * width)));
+  return '[' + '='.repeat(filled) + '-'.repeat(width - filled) + ']';
+}
+
+/** Percentage, one decimal under 10% so an early job does not read as "0.0%". */
+const percent = (done: number, total: number): string =>
+  total <= 0 ? '-' : `${((done / total) * 100).toFixed(1)}%`;
+
+/** Left-pads a label so a block of key/value lines reads as a column. */
+function field(label: string, value: string, width = 11): string {
+  return `  ${label.padEnd(width)}${value}`;
+}
+
+/**
+ * A one-line description of a job's filter.
+ *
+ * The filter is jsonb and can hold any of stage ids, owner ids, an outcome, a value
+ * range and a date range. Rendering it as json tells the reader nothing about what
+ * the job is about to do, which is the one thing a status screen exists to say.
+ */
+function describeFilter(filter: unknown): string {
+  if (filter === null || typeof filter !== 'object') return '(none)';
+  const f = filter as Record<string, unknown>;
+  const parts: string[] = [];
+  const list = (v: unknown): string =>
+    Array.isArray(v) && v.length > 0 ? v.map((x) => shortId(String(x))).join(',') : '';
+  if (list(f['stageId'])) parts.push(`stage ${list(f['stageId'])}`);
+  if (list(f['ownerId'])) parts.push(`owner ${list(f['ownerId'])}`);
+  if (typeof f['outcome'] === 'string') parts.push(`outcome ${f['outcome']}`);
+  if (f['minValue'] !== undefined || f['maxValue'] !== undefined) {
+    const lo = f['minValue'] === undefined ? '*' : String(f['minValue']);
+    const hi = f['maxValue'] === undefined ? '*' : String(f['maxValue']);
+    parts.push(`value ${lo}..${hi}`);
+  }
+  if (typeof f['createdFrom'] === 'string') parts.push(`from ${f['createdFrom']}`);
+  if (typeof f['createdTo'] === 'string') parts.push(`to ${f['createdTo']}`);
+  return parts.length > 0 ? parts.join(', ') : '(whole workspace)';
+}
 
 // ---------------------------------------------------------------- prompting
 
@@ -347,6 +442,7 @@ function filterFromArgs(args: Record<string, string | undefined>): Record<string
 
 /** Renders a job's transitions. Shared so the two modes cannot drift. */
 function renderJobTransitions(reply: Reply): void {
+  if (emitJson(reply)) return;
   if (reply.status >= 400) {
     print(reply, 'job transitions');
     return;
@@ -381,6 +477,9 @@ function renderJobTransitions(reply: Reply): void {
 interface JobStatus {
   id: string;
   status: string;
+  targetStageId?: string;
+  filter?: unknown;
+  snapshotAt?: string;
   totalMatched: number;
   failedCount: number;
   error: string | null;
@@ -392,33 +491,113 @@ interface JobStatus {
   completedAt: string | null;
 }
 
-/** Renders a job's counts. Shared so the two modes cannot drift. */
+const ms = (iso: string | null | undefined): number | null => {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? t : null;
+};
+
+/**
+ * Renders a job.
+ *
+ * Not `print(reply)`, which dumps the whole response body as json. A status screen
+ * exists to answer "what is this job doing and is it in trouble", and a json dump
+ * answers neither without the reader already knowing every field name. The raw
+ * body is still one command away, for when someone does want it.
+ *
+ * What earns its place here: what the job is (target and filter, so the screen
+ * says what is being moved rather than only how far), how far along it is, how
+ * fast, and what to do about it if it has stalled or given up.
+ */
 function renderJobStatus(reply: Reply): void {
-  print(reply, 'bulk job');
-  if (reply.status >= 400) return;
+  if (emitJson(reply)) return;
+  if (reply.status >= 400) {
+    print(reply, 'bulk job');
+    return;
+  }
   const b = reply.body as JobStatus;
+
   const settled = b.batches.completed + b.batches.failed;
   const total = b.batches.pending + b.batches.running + settled;
-  console.log(
-    `  batches:   ${settled}/${total} settled` +
-      (b.batches.running ? `  ${b.batches.running} running` : '') +
-      (b.batches.pending ? `  ${b.batches.pending} pending` : ''),
-  );
-  console.log(`  records:   ${b.totalMatched} matched, ${b.failedCount} failed`);
-  console.log(`  status:    ${b.status}`);
-  if (b.error) console.log(`  error:     ${b.error}`);
+  const done = settled;
+
+  console.log(`\n  bulk job ${shortId(b.id)}  ${b.status.toUpperCase()}`);
+  console.log(`  ${bar(done, total)}  ${percent(done, total)}  ${done}/${total} batches settled`);
+
+  // What the job is. A caller holding only an id has no other way to find out.
+  if (b.targetStageId) {
+    console.log(field('moving to', `${shortId(b.targetStageId)}  (${describeFilter(b.filter)})`));
+  } else {
+    console.log(field('filter', describeFilter(b.filter)));
+  }
+
+  console.log(field('records', `${group(b.totalMatched)} matched, ${group(b.failedCount)} failed`));
+
+  // Batch breakdown, only when there is something to break down. A healthy job is
+  // one line, not four.
+  const parts: string[] = [];
+  if (b.batches.running) parts.push(`${b.batches.running} running`);
+  if (b.batches.pending) parts.push(`${b.batches.pending} pending`);
+  if (b.batches.completed) parts.push(`${b.batches.completed} completed`);
+  if (b.batches.failed) parts.push(`${b.batches.failed} failed`);
+  if (parts.length > 0) console.log(field('batches', parts.join(', ')));
+
+  // Timing. Elapsed is measured to the moment of the poll, so a running job's
+  // figure grows between calls, which is the point of watching one.
+  const created = ms(b.createdAt);
+  const started = ms(b.startedAt);
+  const completed = ms(b.completedAt);
+  const now = Date.now();
+  if (created) console.log(field('submitted', new Date(created).toLocaleTimeString('en-US')));
+  if (b.snapshotInProgress) {
+    console.log(field('snapshot', `building, matched so far ${group(b.totalMatched)}`));
+  }
+  if (started) {
+    // Elapsed is completed_at - started_at when that is positive, and
+    // completed_at - created_at otherwise.
+    //
+    // The fallback is not defensive padding. Observed on a real job, the two
+    // columns came back the wrong way round - completed_at 47ms *before*
+    // started_at - so the difference was negative and a duration built from it
+    // printed as "-". The end-to-end figure is measured from created_at anyway,
+    // which is what BENCHMARKS.md reports, so falling back to it prints a number
+    // that means something. The ordering itself is a separate defect and is not
+    // fixed here.
+    const end = completed ?? now;
+    const fromStart = end - started;
+    const elapsed = fromStart > 0 ? fromStart : created ? end - created : 0;
+    const rate = elapsed > 0 ? b.totalMatched / (elapsed / 1000) : 0;
+    console.log(
+      field(
+        'elapsed',
+        `${duration(elapsed)}${rate > 0 ? `, ${group(Math.round(rate))} records/sec` : ''}`,
+      ),
+    );
+  }
+
+  if (b.error) console.log(field('error', b.error));
+
   if (b.deadLettered.batches > 0) {
     console.log(
-      `  given up: ${b.deadLettered.batches} batch(es), ` +
-        `${b.deadLettered.records} record(s) never moved`,
+      field(
+        'given up',
+        `${b.deadLettered.batches} batch(es), ${group(b.deadLettered.records)} record(s) never moved`,
+      ),
     );
+    for (const r of b.deadLettered.reasons) console.log(field('', r));
     // Worth printing rather than leaving to the docs: these records are in no
     // counter anywhere, and nothing retries them unless a caller asks.
-    console.log('  They are not retried automatically. To try them again: job-retry --id=<uuid>');
+    console.log(`\n  Not retried automatically. To try them again:`);
+    console.log(`    npm run cli -- job-retry --id=${b.id}`);
   }
   if (b.failedCount > 0) {
-    console.log(`\n  ${b.failedCount} record(s) did not move and are listed individually.`);
-    console.log('  The rest of each batch still applied. See them with: job-failures');
+    console.log(
+      `\n  ${group(b.failedCount)} record(s) did not move. The rest of each batch still applied.`,
+    );
+    console.log(`    npm run cli -- job-failures --id=${b.id}`);
+  }
+  if (b.snapshotInProgress) {
+    console.log(`\n  Still building its batches. Nothing to do; check again shortly.`);
   }
 }
 
@@ -462,6 +641,30 @@ async function watchJob(jobId: string, intervalMs: number, timeoutMs: number): P
     }
 
     const b = reply.body as JobStatus;
+
+    // In --json mode, one object per line rather than one pretty-printed block per
+    // poll. A watcher emits many samples and the point of asking for JSON is to
+    // pipe them somewhere, so newline-delimited is the shape that survives a pipe;
+    // concatenated pretty-printed blocks would not parse as one document and a
+    // consumer would have to know to expect that.
+    if (jsonMode) {
+      console.log(
+        JSON.stringify({
+          ...(b as unknown as Record<string, unknown>),
+          polledAt: new Date().toISOString(),
+        }),
+      );
+      if (isSettled(b)) return;
+      const remaining = timeoutMs - (Date.now() - started);
+      if (remaining <= 0) {
+        console.error(`timed out after ${timeoutMs}ms; the job is still running`);
+        process.exitCode = 1;
+        return;
+      }
+      await sleep(Math.min(intervalMs, remaining));
+      continue;
+    }
+
     const elapsed = (Date.now() - started) / 1000;
     // Rate is per batch, not per record: the endpoint does not return how many
     // records have moved, only how many batches have settled, so a record rate
@@ -537,6 +740,7 @@ async function watchJob(jobId: string, intervalMs: number, timeoutMs: number): P
 
 /** Renders which records failed and why - the only actionable failure output. */
 function renderJobFailures(reply: Reply): void {
+  if (emitJson(reply)) return;
   if (reply.status >= 400) {
     print(reply, 'job failures');
     return;
@@ -554,6 +758,7 @@ function renderJobFailures(reply: Reply): void {
 
 /** Renders per-batch progress, which is the unit work is actually done in. */
 function renderJobBatches(reply: Reply): void {
+  if (emitJson(reply)) return;
   if (reply.status >= 400) {
     print(reply, 'job batches');
     return;
@@ -594,7 +799,7 @@ async function cmdListOpportunities(args: Record<string, string | undefined>): P
     'opportunity',
     `/opportunities${query ? `?${query}` : ''}`,
   );
-  if (ok(reply)) {
+  if (ok(reply) && !jsonMode) {
     table(
       reply.body.items.map((i) => ({
         id: i.id,
@@ -612,7 +817,7 @@ async function cmdListOpportunities(args: Record<string, string | undefined>): P
 
 async function cmdStages(): Promise<Reply> {
   const reply = await request<Row[]>('stage', '/stages');
-  if (ok(reply)) {
+  if (ok(reply) && !jsonMode) {
     table(
       reply.body.map((s) => ({
         id: s.id,
@@ -627,7 +832,7 @@ async function cmdStages(): Promise<Reply> {
 
 async function cmdUsers(): Promise<Reply> {
   const reply = await request<Row[]>('user', '/users');
-  if (ok(reply)) {
+  if (ok(reply) && !jsonMode) {
     table(
       reply.body.map((u) => ({ id: u.id, name: u.name, email: u.email ?? '-' })),
       ['id', 'name', 'email'],
@@ -664,7 +869,7 @@ async function cmdMove(id: string, toStageId: string): Promise<Reply> {
 
 async function cmdTransitions(id: string): Promise<Reply> {
   const reply = await request<Row[]>('opportunity', `/opportunities/${id}/transitions`);
-  if (ok(reply)) {
+  if (ok(reply) && !jsonMode) {
     table(
       reply.body.map((t) => ({
         at: String(t.created_at).slice(0, 19),
@@ -690,7 +895,20 @@ export const COMMANDS: Record<
   (args: Record<string, string | undefined>) => Promise<CommandResult>
 > = {
   health: async () => {
-    for (const r of await cmdHealth()) console.log(`  ${String(r.body)}`);
+    const results = await cmdHealth();
+    if (jsonMode) {
+      // One object per service, with the reachability the loop already worked out,
+      // rather than the pre-formatted sentence the human path prints.
+      console.log(
+        JSON.stringify(
+          results.map((r) => ({ status: r.status, detail: String(r.body) })),
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+    for (const r of results) console.log(`  ${String(r.body)}`);
   },
   'workspace-info': async () => {
     const id = currentWorkspace;
@@ -795,6 +1013,16 @@ export const COMMANDS: Record<
   },
 };
 
+/**
+ * Commands that format their own output rather than returning a body to print.
+ *
+ * Listed rather than inferred, because a command that renders and also returns
+ * its reply is otherwise indistinguishable from one that only returns it, and the
+ * symptom - the same rows printed twice - looks like a formatting bug rather than
+ * a dispatch one.
+ */
+const SELF_RENDERED = new Set(['stages', 'users', 'opportunities', 'transitions']);
+
 const OPTION_SPEC = {
   workspace: { type: 'string' },
   from: { type: 'string' },
@@ -818,6 +1046,10 @@ const OPTION_SPEC = {
   key: { type: 'string' },
   interval: { type: 'string' },
   timeout: { type: 'string' },
+  // Every command accepts it. Output shape is a property of the invocation rather
+  // than of each command, so it is one flag here rather than an argument each
+  // handler has to remember to honour.
+  json: { type: 'boolean' },
 } as const;
 
 async function runDirect(argv: string[]): Promise<void> {
@@ -837,9 +1069,27 @@ async function runDirect(argv: string[]): Promise<void> {
   }
   const handler = COMMANDS[name];
   if (!handler) {
+    if (values.json) {
+      // Machine-readable failure too: a script asking for JSON should not have to
+      // parse an English sentence to find out its arguments were wrong.
+      console.log(
+        JSON.stringify(
+          { error: `unknown command "${name}"`, commands: Object.keys(COMMANDS) },
+          null,
+          2,
+        ),
+      );
+      process.exitCode = 1;
+      return;
+    }
     console.log(`unknown command "${name}". try one of: ${Object.keys(COMMANDS).join(', ')}`);
     return;
   }
+  jsonMode = values.json === true;
+  // `json` shapes the output and is consumed above the handlers, so it is not
+  // passed down. That also keeps every handler's argument type a plain string,
+  // which is what they all actually read.
+  const { json: _json, ...cmdArgs } = values;
   // These operate across all workspaces, so they need no workspace id.
   const NO_WORKSPACE = new Set(['health', 'dump-db']);
   if (name !== 'health' && values.workspace) {
@@ -849,9 +1099,13 @@ async function runDirect(argv: string[]): Promise<void> {
     return;
   }
   void rest;
-  const result = await handler(values);
+  const result = await handler(cmdArgs);
   if (result && typeof result === 'object' && 'status' in result) {
-    print(result, name);
+    // These four draw their own table and then hand the reply back. Printing it as
+    // well showed every row twice - once aligned, once as raw json under a
+    // "--- stages ---" header - which is the opposite of readable. The reply is
+    // still printed under --json, where the table is suppressed instead.
+    if (jsonMode || !SELF_RENDERED.has(name)) print(result, name);
   }
 }
 
