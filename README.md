@@ -253,19 +253,23 @@ humans edit one record at once.
 and with async submission that is now cheap to spam. Would be a Postgres
 counter before a new dependency.
 
-**Small jobs are bound by the poll intervals, not by their data.** Below roughly
-15,000 records a job spends most of its wall clock waiting to be noticed: a tick
-before the first batch exists, then a tick before any of it is published. At the
-original 250 ms, a filter matching 5,050 records settled in 390–470 ms and one
+**Small jobs are bound by the poll intervals, not by their data.** A job waits a
+tick before the first batch exists, then a tick before any of it is published. At
+the original 250 ms, a filter matching 5,050 records settled in 390–470 ms and one
 matching 5,065 in 386–407 ms — indistinguishable, and both carrying roughly half a
 second of pure waiting. Halving both ticks to 125 ms took those to **335–341 ms**
-and **275–336 ms**, a consistent ~100 ms across three runs.
+and **275–336 ms**, a consistent ~100 ms across three runs, and the 50,000-record
+job from 1.82–2.72 s to 1.52–2.37 s.
 
 That is a mitigation, not a fix. The wait is now ~125 ms of expectation rather
 than ~250 ms, and it is still there: a tick is a tick, and halving the interval
 halves the wait rather than removing it. Removing it means kicking the builder
 from `POST /bulk-moves` and kicking the relay after each page commits, leaving the
 timers as the recovery path for a crashed replica. Not built.
+
+It was not free. Queue wait roughly doubled — mean 116–280 ms against 21–144 ms —
+because publishing twice as often delivers a heavier stream to twelve consumers.
+The job a caller waits for got faster while internal queueing got worse.
 
 ## Exploring it
 
@@ -298,9 +302,12 @@ It reads Postgres directly, not the API, so it reflects what is actually stored.
 **Watch a job run.**
 
 ```bash
-docker compose logs -f bsm-worker     # one line per batch: pool wait, work time, slot
-docker compose logs -f bsm-transition # batching, per page, and the relay
+docker compose logs -f worker-service     # one line per batch: wait, work, pool pressure
+docker compose logs -f transition-service # batching, per page, and the relay
 ```
+
+Service names, not the `bsm-` container names — `docker compose logs` takes the
+former and fails on the latter.
 
 ## Tests
 

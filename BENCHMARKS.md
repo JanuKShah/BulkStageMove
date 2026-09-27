@@ -6,32 +6,54 @@ Measured on Windows 11, 12 logical cores, 15.7 GB, Node v24.21.0, PostgreSQL
 16.15, RabbitMQ 4.3.6 — one Compose project, all services sharing one Postgres.
 Not a portable SLA.
 
-## The job
+## 50k bulk job
 
-| 50,000 records | item table, 4 consumers | batches, 4 consumers | batches, 12 consumers | **+ scheduler, 12 consumers** |
-|---|---|---|---|---|
-| **Submission (returns job id)** | 8.40 s | 0.56 – 2.30 s | 0.56 – 2.30 s | **9.2 ms – 53 ms** |
-| Snapshot batching (before any batch exists) | inline in submit | inline in submit | inline in submit | **1.54 – 2.36 s** |
-| Drain — snapshot built to settled | 0.52 s | 5.18 s | **1.83 s** | overlaps the batching |
-| **Whole job — submit to settled** | **8.92 s** | **7.47 s** | **2.39 s** | **1.82 – 2.72 s** |
-| End-to-end rate | 5,605/sec | 6,693/sec | **20,921/sec** | **18,400 – 27,500/sec** |
-| | | | | |
-| Batches | 50,000 rows | 50 | **50** | **50** |
-| Work per batch, mean | — | — | — | **422 – 565 ms** |
-| Pool wait per batch, mean | — | — | — | **7.3 – 9.1 ms** |
-| Relay lag, mean (at the old 250 ms tick) | — | — | — | **185 – 202 ms** |
-| Queue wait, mean | — | — | — | **21 – 144 ms** |
-| Batches per consumer slot | — | — | — | 4–5 each, all 12 busy |
+| 50,000 records | item table, 4 consumers | batches, 4 consumers | batches, 12 consumers | **+ scheduler, 250 ms ticks** | **+ scheduler, 125 ms ticks** |
+|---|---|---|---|---|---|
+| **Submission (returns job id)** | 8.40 s | 0.56 – 2.30 s | 0.56 – 2.30 s | **9.2 ms – 53 ms** | **10 – 22 ms** |
+| Snapshot batching (before any batch exists) | inline in submit | inline in submit | inline in submit | **1.54 – 2.36 s** | **812 ms – 1.54 s** |
+| Drain — snapshot built to settled | 0.52 s | 5.18 s | **1.83 s** | overlaps the batching | overlaps the batching |
+| **Whole job — submit to settled** | **8.92 s** | **7.47 s** | **2.39 s** | **1.82 – 2.72 s** | **1.52 – 2.37 s** |
+| End-to-end rate | 5,605/sec | 6,693/sec | **20,921/sec** | **18,400 – 27,500/sec** | **21,300 – 27,300/sec** |
+| | | | | | |
+| Batches | 50,000 rows | 50 | **50** | **50** | **50** |
+| Work per batch | — | — | — | **422 – 565 ms** mean | **174 / 392 / 598 ms** min/mean/max |
+| Pool wait per batch, mean | — | — | — | **7.3 – 9.1 ms** | — |
+| Relay lag, mean | — | — | — | **185 – 202 ms** | **99 – 111 ms** |
+| Queue wait, mean | — | — | — | **21 – 144 ms** | **116 – 280 ms** |
+| Batches per consumer slot | — | — | — | 4–5 each, all 12 busy | 4–5 each, all 12 busy |
 
-**The whole job is 10% slower and submission is 250× faster.** That is the trade the
-scheduler makes, stated plainly rather than netted out: the walk still costs 1.5-2.4 s,
-it just no longer happens while somebody is waiting on an HTTP response.
+The two right-hand columns are the same design, and the only difference between
+them is the sweep and relay interval: 250 ms, then 125 ms. Everything left of those
+is a different design — batching the ids in memory, then moving the walk off the
+request path — and the row that matters across all of them is the one where
+submission collapses from seconds to milliseconds.
 
-**"Drain — snapshot built to settled" has no value in the last column** because it
-cannot be isolated: batches are consumed while the walk is still running. The
-drain's own length is the work total divided across twelve slots, and the two are within
-a few percent of each other - the same length, and overlapping them is why the whole
-job is 1.85-2.72 s rather than their sum.
+**Halving the tick made the job faster and the queue worse.** Whole job 1.82-2.72 s
+against 1.52-2.37 s, and relay lag's mean roughly halved from 185-202 ms to
+99-111 ms. But **queue wait more than doubled, 21-144 ms to 116-280 ms**, because
+publishing twice as often delivers a heavier stream to twelve consumers and batches
+sit in the broker longer. A caller waits less; a batch waits more. Three runs is
+thin for a range that wide, so the size of the regression is not settled.
+
+**The pool wait row has no 125 ms figure, and that is a measurement gap rather than
+an improvement.** The worker's per-batch line reports `pool=4conn/0queued` — a
+connection count and a queue depth, not a wait time — so the 7.3-9.1 ms in the
+250 ms column was read from something the current log line no longer carries. It
+was dropped rather than restated as a dash implying zero.
+
+**Submission is 250× faster, and the whole job is no slower.** That is the trade
+the scheduler makes: the walk still costs 0.8-1.5 s, it just no longer happens while
+somebody is waiting on an HTTP response. It is a trade rather than a free win
+because the walk competes with the workers for the same Postgres — but at the
+125 ms tick the job is faster end to end than it was at 250 ms, so the cost has
+been more than paid back.
+
+**"Drain — snapshot built to settled" has no value in either scheduler column**
+because it cannot be isolated: batches are consumed while the batching is still
+running. The drain's own length is the work total divided across twelve slots, and
+in both scheduler columns it is the longer of the two — overlapping them is why the
+whole job is 1.82-2.72 s and 1.52-2.37 s rather than their sums.
 
 A dash means the instrumentation that measures it did not exist for that
 configuration, not that the figure is zero. The phase rows come from
@@ -44,56 +66,72 @@ consumers gave 0.58, 1.59, 1.75, 2.16, 2.21 and 2.30 s.
 
 ## Where the time goes
 
-Three consecutive runs, fresh volume each time, from the four timestamps on each
-batch row plus the worker's own in-process timing.
+Three consecutive runs at the current 125 ms tick, fresh volume each time, from
+the four timestamps on each batch row plus the worker's own in-process timing.
 
 | phase | run 1 | run 2 | run 3 |
 |---|---|---|---|
-| **Whole job -- submit to settled** | **1.85 s** | **2.70 s** | **2.72 s** |
-| Sweep wait to first page | 62 ms | -- | -- |
-| Batching, per page (1 thread), min/mean/max | 15/41/75 ms | 23/47/98 ms | 20/45/80 ms |
-| Batching total | 2.04 s | 2.36 s | 2.25 s |
-| Work, per consumer slot | 1,757 ms | 2,353 ms | 2,273 ms |
-| **Batching / work-per-slot** | **1.16x** | **1.00x** | **1.01x** |
-| Relay lag, written to published | 185 ms | 202 ms | 194 ms |
-| Queue wait, in RabbitMQ | 21 ms | 108 ms | 144 ms |
-| Pool wait | 9.1 ms | 8.7 ms | 8.1 ms |
+| **Whole job — submit to settled** | **1.84 s** | **1.52 s** | **1.74 s** |
+| Sweep wait to first page | 32 ms | 7 ms | 12 ms |
+| Batching, per page (1 thread), min/mean/max | 15/31/63 ms | 6/16/54 ms | 8/20/57 ms |
+| Batching total | 1.54 s | 812 ms | 985 ms |
+| Work, per consumer slot | 1.72 s | 1.49 s | 1.69 s |
+| **Batching / work-per-slot** | **0.89x** | **0.55x** | **0.58x** |
+| Relay lag, written to published | 43/99/166 ms | 53/105/159 ms | 55/111/172 ms |
+| Queue wait, in RabbitMQ | 11/116/238 ms | 6/280/614 ms | -5/202/625 ms |
+| Claim gap, claim txn → work txn | 2/9/32 ms | 2/9/50 ms | 2/7/21 ms |
+| Overlapping earned | 1.42 s | 780 ms | 935 ms |
 
-**Batching and the drain are the same length** -- 1.00x and 1.01x in two of the
-three runs. That is the finding, and it replaces the earlier claim that the batching
-was 90% of wall clock on its own.
+**Batching is no longer the same length as the drain — it is now clearly the
+shorter of the two, at 0.55x-0.89x.** That reverses the finding this section used to
+lead with, which was 1.00x and 1.01x. The drain is the constraint now, and
+shortening batching alone cannot help: at 812 ms of batching against 1.49 s of work
+per slot there is 678 ms of headroom the job was never waiting on.
 
-Because the two overlap, the job costs roughly the longer of them rather than
-their sum. In run 1 that is 1.85 s measured against 2.75 s sequential, so
-**overlapping earns about 900 ms, a third of the job.** The corollary is the part
-worth keeping: shortening *either* phase alone moves the total very little,
-because the other becomes the constraint immediately. A 30% win needs both.
+**That is unexplained.** Batching got faster — per-page mean 41-47 ms before,
+16-31 ms now — and the tick is not on the path of a page write. The likeliest
+explanation is that publishing sooner shifts when the twelve workers are busy
+relative to the builder, and per-page cost is contention-bound rather than its own
+work. But the direction is backwards from what the new overlap predicts. Three runs
+is a thin basis for a 2x move in either direction, so it is recorded as an
+observation rather than a result.
 
-**Stable across runs:** pool wait at 7-9 ms (~1.5% of work) and relay lag at
-**Stable across runs:** pool wait at 7-9 ms (~1.5% of work) and relay lag at
-185-202 ms, which *was* the 250 ms tick. Both rows above predate the halving to
-125 ms and have not been re-measured. **Variable:** work per batch spans 34%
-and queue wait spans 7x, with no configuration change. Neither is a fixed cost,
-and quoting either as one would be wrong.
+**Queue wait got materially worse, and that is the price of the tighter tick.**
+Mean 116-280 ms against 21-144 ms, max 614-625 ms against 144 ms, sum up to 14.00 s
+against 5.78 s. Publishing every 125 ms instead of every 250 ms delivers a heavier
+stream to twelve consumers, so batches sit in the broker longer. The job a caller
+waits for got faster — 1.52-2.37 s against 1.82-2.72 s — while internal queueing
+roughly doubled. Treat the size of that as unsettled: three runs is thin for a
+range this wide.
+
+**Relay lag halved, and its minimum is the real number.** Mean 99-111 ms against
+185-202 ms, and minimum 43-55 ms against a previously flat 185 ms. The old figure
+was almost entirely tick rather than work, which is exactly why it looked so
+stable. With the tick halved, the underlying distribution is finally visible at
+43-172 ms.
+
+**Sweep wait fell to 7-32 ms** from 62 ms, which is the whole point of the halving
+for a job small enough to feel it.
+
 Pages within a job cannot be parallelised -- page N+1's keyset cursor is page N's
 last row. Different jobs can be, which is what batching's advisory claim is for.
 
 **Work cannot be read from the database.** `now()` in Postgres is the transaction
-*start* time, so `completed_at - started_at` is the gap between two `BEGIN`s --
-14 ms against a real 422-565 ms apply. The apply happens inside the work
-transaction, after `now()` is captured. It appears only in the worker's log,
-which is why the `work=` field on each batch line is load-bearing, and why
+*start* time, so `completed_at - started_at` is the gap between two `BEGIN`s -- a
+few ms against a real 174-598 ms apply. The apply happens inside the work
+transaction, after `now()` is captured. It appears only in the worker's log, which
+is why the `work=` field on each batch line is load-bearing, and why
 `benchmark.ts` shells out to read it back.
 
-**The per-page mean is inflated by contention.** Measured against a quiet table a
-page costs ~7 ms (1.1-3.6 ms read, 3.3 ms write). The 41-47 ms above is what it
-costs while twelve workers share the same buffers and WAL. The two have not been
-separated, so it is not yet known how much of the batching is its own work.
+**The per-page mean is contention-bound.** Measured against a quiet table a page
+costs ~7 ms (1.1-3.6 ms read, 3.3 ms write). The 16-31 ms above is what it costs
+while twelve workers share the same buffers and WAL. The two have still not been
+separated, and the gap moved by 2x when only a timer changed — which is itself
+evidence that most of it is not the batching's own work.
 
 **Queue wait can read negative** — a worker claimed a batch before the relay's
-`markPublished` committed. Correct, and harmless, but `published_at` records that
-publication happened, not an ordering guarantee.
-
+`markPublished` committed, which run 3 shows at -5 ms. Correct, and harmless, but
+`published_at` records that publication happened, not an ordering guarantee.
 ## Filter selectivity
 
 `npx tsx test/happyflow/filter-bench.ts` - one freshly seeded 50,000 record
@@ -111,7 +149,7 @@ measure different things: *batching* is records per second of **finding** them,
 
 `matched` and `pages` are exact and identical every run. Everything else is a
 range, because the per-batch work varies 34% run to run and queue wait 7× — the
-same instability documented under "The job". The wide batching/s band on the first
+same instability documented under "50k bulk job". The wide batching/s band on the first
 two rows is that, not a property of the filter.
 
 **Halving both ticks from 250 ms to 125 ms took ~100 ms off every small job**, and
@@ -160,11 +198,17 @@ only the warm pass is reported, which is why the numbers moved.
 filter** — 32.3–41.0k/s against 14.8–15.1k/s — on a job moving five thousand
 records instead of fifty thousand. The data is not the reason: the two small cases
 land within a few tens of milliseconds of each other, **335–341 ms and 275–336 ms**,
-whatever they match, across all three runs. What is left of that is still mostly
-waiting to be noticed — one tick before the first batch exists, one before any of
-it is published. **Below roughly 15,000 records that fixed cost is the job.** A
-caller filtering for five thousand records waits about as long as one filtering for
-five thousand *and sixty-five*.
+whatever they match, across all three runs. About 125 ms of that is still waiting
+to be noticed — one tick before the first batch exists, one before any of it is
+published — and the rest is work on 5,000-6,000 records.
+
+**The crossover has moved and has not been re-measured.** At the 250 ms tick the
+tick-wait was ~250 ms and swamped everything under roughly 15,000 records. At
+125 ms it is ~125 ms, so the point where waiting stops dominating real work must be
+lower — on these figures, work is ~200 ms at 5,000 records, so the crossover is
+probably somewhere in the low thousands. The smallest filter measured here is 5,050
+records, which is not small enough to locate it. **No threshold should be quoted
+until a filter bench runs cases below 1,000.**
 
 Neither rate alone is the honest figure, which is the point of reporting both.
 Counting only the batching flatters a selective filter — it did less work; counting
@@ -214,10 +258,15 @@ entire workspace.
   because each page's keyset cursor is the previous page's last row.
 - Batching's per-page cost has not been separated from contention, so how much of
   the batching is its own work is still unknown.
-- **Below ~15,000 records a job is bound by its polling intervals, not by its
-  data.** A sweep tick before the first batch exists, then a relay tick before any
-  of it is published. Halved from 250 ms to 125 ms, which took ~100 ms off every
-  small job: 5,050 records settled in 335–341 ms against 390–470 ms, and 5,065 in
-  275–336 ms against 386–407 ms. The floor is now ~125 ms of expectation rather
-  than ~250 ms, and is still a floor — removing it needs a kick rather than a
-  shorter tick. See "Filter selectivity" above.
+- **A small job is bound by its polling intervals, not by its data.** A sweep tick
+  before the first batch exists, then a relay tick before any of it is published.
+  Halved from 250 ms to 125 ms, which took ~100 ms off every small job: 5,050
+  records settled in 335–341 ms against 390–470 ms, and 5,065 in 275–336 ms against
+  386–407 ms. The floor is now ~125 ms of expectation rather than ~250 ms, and is
+  still a floor — removing it needs a kick rather than a shorter tick. The record
+  count at which waiting stops dominating has moved with it and is not re-measured;
+  see "Filter selectivity" above.
+- Queue wait roughly doubled when the tick was halved, which is the cost of it.
+  Unsettled at three runs. See "Where the time goes".
+- Batching got about 2x faster when only a timer changed, and nothing in the tick
+  is on the path of a page write. Unexplained. See "Where the time goes".
