@@ -1,10 +1,11 @@
-import { pool } from '../helpers';
+import { pool, waitForJobSettled, waitForSnapshot } from '../helpers';
 import {
   createHappyFlowWorkspace,
   jobFilter,
   HAPPY_FLOW_SIZE,
   type HappyFlowWorkspace,
 } from './fixture';
+import { withDeadlockRetry } from '../helpers';
 
 /**
  * Regression: the submit page loop must advance over rows that share a timestamp.
@@ -39,7 +40,13 @@ describe('submit pages over rows sharing a created_at', () => {
 
   afterAll(async () => {
     // The pool is shared with the suite below, so only the last one closes it.
-    if (ws) await pool.query('DELETE FROM workspace WHERE id = $1', [ws.workspaceId]);
+    //
+    // Retried, because the delete cascades across opportunity, bulk_job_outbox
+    // and opportunity_transition while the worker may still be settling the job
+    // - and settleJob takes a row lock on bulk_job that this delete needs. The
+    // two deadlock, Postgres kills one, and the suite fails after every test in it
+    // has already passed. Same reason every other suite's teardown retries.
+    if (ws) await withDeadlockRetry(() => pool.query('DELETE FROM workspace WHERE id = $1', [ws.workspaceId]));
   });
 
   it('snapshots every matching record, not just the first page', async () => {
@@ -53,10 +60,12 @@ describe('submit pages over rows sharing a created_at', () => {
         ...jobFilter(ws.to, 2_500),
       }),
     });
-    const body = (await res.json()) as { jobId: string; itemsCreated: number };
+    const body = (await res.json()) as { jobId: string };
     expect(res.status).toBe(201);
-    // 2,500 of 2,500: if the cursor stalled this would be 1,000.
-    expect(body.itemsCreated).toBe(2_500);
+    // 2,500 of 2,500: if the cursor stalled this would be 1,000. Read from the
+    // job rather than the response, because the batches are built after it.
+    const snapshot = await waitForSnapshot(ws.workspaceId, body.jobId, 30_000);
+    expect(snapshot.totalMatched).toBe(2_500);
 
     const { rows } = await pool.query<{ n: number; batches: number }>(
       `SELECT coalesce(sum(cardinality(item_ids)), 0)::int AS n, count(*)::int AS batches
@@ -88,16 +97,15 @@ describe('happy flow: 50,000 opportunities in one job', () => {
     const body = (await res.json()) as { jobId: string; itemsCreated: number };
     expect(res.status).toBe(201);
     jobId = body.jobId;
-    expect(body.itemsCreated).toBe(HAPPY_FLOW_SIZE);
 
-    for (let i = 0; i < 1_500; i++) {
-      const { rows } = await pool.query<{ status: string }>(
-        'SELECT status FROM bulk_job WHERE id = $1',
-        [jobId],
-      );
-      if (rows[0]?.status === 'completed' || rows[0]?.status === 'failed') return;
-      await new Promise((r) => setTimeout(r, 200));
-    }
+    // The response carries no count. The batches are built after it is sent, and
+    // the count that matters is the one that landed in them - a record can leave
+    // the filter while the walk runs, so a count taken up front would already be
+    // stale. So this waits, then reads totalMatched from the job.
+    const snapshot = await waitForSnapshot(ws.workspaceId, jobId, 60_000);
+    expect(snapshot.totalMatched).toBe(HAPPY_FLOW_SIZE);
+
+    await waitForJobSettled(ws.workspaceId, jobId, 180_000);
   });
 
   afterAll(async () => {
