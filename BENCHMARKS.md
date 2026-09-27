@@ -80,16 +80,6 @@ Mean of five runs, fresh volume each time, from the four timestamps on each batc
 | Queue wait, in RabbitMQ | 177 ms |
 | Claim gap, claim txn to work txn | 9 ms |
 | Batching + work, if sequential | 2.15 s |
-| Earned by overlapping | 750 ms |
-
-- **The drain is the constraint, not batching**, 0.70x of the work per slot, so a third of the batching is headroom the job was never waiting on.
-- **Batching's per-page cost is contention, not its own work**, 18 ms measured against ~7 ms for a page on a quiet table, because twelve workers share the same buffers and WAL.
-- **Queue wait is the largest single cost in the pipeline** at 177 ms mean, and halving the tick barely moved it (195 ms before), the streams of 85-321 ms across five runs overlap, so the tick is not what sets it.
-- **Relay lag averages 208 ms** and the sweep adds 10 ms, so a small job spends roughly 220 ms waiting to be noticed.
-- **Work cannot be read from the database.** `now()` is the transaction *start* time, so `completed_at - started_at` is the gap between two `BEGIN`s, a few ms against a real 174-598 ms apply.
-- **It exists only in the worker's log,** which is why the `work=` field on each batch line is load-bearing and why `benchmark.ts` shells out to read it back.
-- **Pages cannot be parallelised within a job,** because page N+1's keyset cursor is page N's last row; different jobs can be, which is what the advisory claim is for.
-- **Queue wait can read negative,** because a worker claimed a batch before the relay's `markPublished` committed, `published_at` records that publication happened, not an ordering guarantee.
 
 ## Filter selectivity
 
