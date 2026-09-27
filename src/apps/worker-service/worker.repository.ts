@@ -56,6 +56,18 @@ interface JobSpec {
   target_stage_id: string;
   /** The filter's stage list, or null when the filter did not name stages. */
   filter_stage_ids: string[] | null;
+  /**
+   * The job's watermark, as timestamptz text rather than a timestamptz.
+   *
+   * Text because this value is compared against `stage_decided_at` by other jobs
+   * at full microsecond precision, and a JS Date holds milliseconds. Read as a
+   * timestamptz it would be truncated here and every comparison would be made
+   * against a value a fraction of a millisecond below the truth.
+   *
+   * snapshot_at is written once, at insert, and never updated, so one read serves
+   * both uses below.
+   */
+  snapshot_at: string;
 }
 
 /**
@@ -319,8 +331,15 @@ export class WorkerRepository {
     // records it was not given. The filter's stage list comes along too, because
     // "has this record left the set the job was asked to move" is the question
     // that decides whether to touch it at all.
+    //
+    // The watermark comes along for the same reason, and this is now the only
+    // read of bulk_job in this method. It used to be fetched twice more - a cross
+    // join against bulk_job to reach snapshot_at for the live read below, and a
+    // subquery inside the UPDATE - so the job row was read three times per batch
+    // for one row of one column. It is read once here and the value is reused.
     const job = await client.query<JobSpec>(
-      `SELECT target_stage_id, filter->'stageId' AS filter_stage_ids
+      `SELECT target_stage_id, filter->'stageId' AS filter_stage_ids,
+              snapshot_at::text AS snapshot_at
          FROM bulk_job WHERE id = $1 AND workspace_id = $2`,
       [jobId, workspaceId],
     );
@@ -349,17 +368,19 @@ export class WorkerRepository {
     //
     // decided_since is the logical clock, and it is computed here in SQL rather
     // than in the loop below for two reasons. The comparison is
-    // stage_decided_at > snapshot_at, column against column, so no timestamp
-    // crosses the wire: timestamptz carries microseconds and a JS Date carries
-    // milliseconds, and with no type parser override both sides would truncate.
-    // And it is free - this query already fetches per-record state, and a boolean
-    // comes back where a Date would have.
+    // stage_decided_at > snapshot_at done in the database, so the answer comes
+    // back as a boolean and no timestamp has to be read into JS and compared
+    // there. And it is free - this query already fetches per-record state.
+    //
+    // snapshot_at arrives as the lossless text read at the top of this method,
+    // cast back to timestamptz so the comparison is column against value on the
+    // same scale. The cross join against bulk_job this replaces existed only to
+    // hand the column to the comparison; the value is the same one, already read.
     const live = await client.query<OpportunityRef & { decided_since: boolean }>(
-      `SELECT o.id, o.stage_id, o.stage_decided_at > j.snapshot_at AS decided_since
-         FROM opportunity o, bulk_job j
-        WHERE o.workspace_id = $1 AND o.id = ANY($2::uuid[])
-          AND j.id = $3 AND j.workspace_id = $1`,
-      [workspaceId, ids, jobId],
+      `SELECT o.id, o.stage_id, o.stage_decided_at > $3::timestamptz AS decided_since
+         FROM opportunity o
+        WHERE o.workspace_id = $1 AND o.id = ANY($2::uuid[])`,
+      [workspaceId, ids, spec.snapshot_at],
     );
     const present = new Map(live.rows.map((r) => [r.id, r.stage_id]));
     // Read separately rather than folded into `present`, which is keyed by stage
@@ -468,16 +489,20 @@ export class WorkerRepository {
       // writing the wall clock instead would make this last-writer-wins and let an
       // older job still draining beat a newer one.
       //
-      // Read from the row rather than bound as a parameter, for the same reason
-      // the read above avoids binding one: a JS Date would truncate microseconds
-      // on a value other jobs compare at full precision. Naming the column also
-      // stands the stage_decided_at trigger down, which is how one trigger serves
-      // both a person's edit and a job's.
+      // Bound as timestamptz text, read once at the top of this method, rather
+      // than fetched again by a subquery. The subquery this replaces was not
+      // about the value - assigning the column is what stands the stage_decided_at
+      // trigger down, and an assignment does that whether the right side is a
+      // subquery or a parameter. It was about the timestamp crossing the wire: a
+      // JS Date holds milliseconds where this column holds microseconds, so
+      // binding one would stamp these records a fraction of a millisecond below
+      // the truth, and a job submitted inside that fraction would read them as
+      // unchanged since submission and move records it should have skipped.
       const moved = await client.query<{ id: string }>(
         `WITH moved AS (
            UPDATE opportunity o
               SET stage_id = $2, updated_at = now(),
-                  stage_decided_at = (SELECT snapshot_at FROM bulk_job WHERE id = $5)
+                  stage_decided_at = $6::timestamptz
              FROM unnest($3::uuid[], $4::uuid[]) AS t(id, from_stage)
             WHERE o.workspace_id = $1 AND o.id = t.id AND o.stage_id = t.from_stage
            RETURNING o.id, o.stage_id AS previous_stage
@@ -486,7 +511,14 @@ export class WorkerRepository {
            (workspace_id, opportunity_id, from_stage_id, to_stage_id, job_id)
          SELECT $1, m.id, m.previous_stage, $2, $5 FROM moved m
          RETURNING opportunity_id AS id`,
-        [workspaceId, targetId, movable.map((m) => m.id), movable.map((m) => m.stage_id), jobId],
+        [
+          workspaceId,
+          targetId,
+          movable.map((m) => m.id),
+          movable.map((m) => m.stage_id),
+          jobId,
+          spec.snapshot_at,
+        ],
       );
       movedCount = moved.rows.length;
       if (movedCount !== movable.length) {
