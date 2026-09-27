@@ -98,3 +98,88 @@ Mean of five runs, fresh volume each time, from the four timestamps on each batc
 
 At 500,000 the job still completes cleanly — 500,000 moved, 0 failed, 58.71 s
 end-to-end.
+
+## A single 50,000-record job
+
+`npm run bench`, fresh volume, one run. The 50k table above is a mean of five; this
+is the single run that accompanied the two measurements below, so the conditions
+match each other and not the table.
+
+| 50,000 records | |
+|---|---|
+| **Processed / failed** | **50,000 / 0** |
+| **End-to-end from submit** | **2.12 s** |
+| **Sustained throughput** | **23,878 records/sec** |
+| Submission, returns job id | 23 ms |
+| Batches | 50 |
+| Per-batch completion p50 / p95 / p99 | 906 ms / 1.61 s / 1.71 s |
+| Per-batch min / max | 244 ms / 1.71 s |
+
+## Interactive reads while a bulk job runs
+
+`npm run bench:interactive` — `GET /opportunities?limit=20`, sampled every 200 ms
+against two workspaces, so the cost of a bulk job can be separated from the cost of
+being the tenant running it. 15 s quiet baseline, then a 500,000-record job, sampled
+until it settled in **52.68 s**.
+
+| 500,000-record job running | n | p50 | p95 | p99 | max |
+|---|---|---|---|---|---|
+| same workspace — quiet | 70 | 7.1 | 11.3 | 15.6 | 15.6 |
+| **same workspace** — during | 246 | 5.7 | 11.8 | **30.9** | 56.5 |
+| different workspace — quiet | 70 | 7.1 | 10.7 | 19.0 | 19.0 |
+| **different workspace** — during | 246 | 5.5 | 10.6 | **13.4** | 16.0 |
+
+- **p95 barely moves: 1.04x in the job's own workspace, 0.98x in a different one.**
+  A half-million-record job does not make ordinary reads slower.
+- **The cost is all in the p99 tail, and only in the tenant running the job** —
+  15.6 → 30.9 ms, while another tenant's p99 went 19.0 → 13.4. That is the
+  measurable form of the isolation claim in `DESIGN.md` § 5, which otherwise only
+  argues it structurally.
+- **p50 got *faster* during the run** (7.1 → 5.7 ms), which is not the job helping:
+  the 15 s baseline pays cold-start cost. It makes the quiet row a pessimistic
+  reference, so the p99 result is if anything conservative.
+- **The quiet p99 is not a real p99.** Over 70 samples, nearest-rank p99 is
+  effectively the maximum, so that row is really "max of 70" against a 246-sample
+  p99. The p50 and p95 comparisons are the sounder ones; treat the 2x tail as
+  indicative. A longer baseline (`BASELINE_MS`) fixes it.
+
+Run at 500,000 rather than 50,000 deliberately: a 50k job settles in ~1.5 s, which at
+one sample per 200 ms is about seven samples, and a p99 over seven samples is not a
+percentile. The harness warns when it collects fewer than 30.
+
+## Kill the builder mid-walk
+
+`npm run bench:killresume` — `SIGKILL` to `transition-service` once the walk has
+written 10 of its 50 batches, so the cursor is genuinely mid-flight and a graceful
+shutdown gets no chance to tidy up. The container is then started again, which is
+what an orchestrator would do. This is the measurement behind the `DESIGN.md` § 1
+claim that a half-built job is finished rather than restarted.
+
+| 50,000 records, killed after batch 10 | |
+|---|---|
+| **Kill to settled** | **5.03 s** |
+| kill to service answering again | 3.47 s |
+| service answering to settled | 1.56 s |
+| Processed / failed | **50,000 / 0** |
+
+**Is the result correct?** All six checks pass, and the harness exits non-zero if any
+fails — a benchmark that reports a wrong result and exits 0 is worse than none.
+
+| check | result |
+|---|---|
+| every record in the target stage | 50,000 of 50,000 |
+| exactly one transition per record | 50,000 transitions |
+| no record moved twice | 50,000 distinct opportunities |
+| **no batch re-walked after the kill** | 50 rows, 50 distinct `batch_no`, 0..49 |
+| the filter margin was left alone | 50,000 moved + 2,000 excluded |
+| no failed records | 0 |
+
+The fourth row is the one that matters. If the cursor were not committed in the same
+transaction as the batch it follows, the resumed walk would re-emit batches 0-9 and
+`count(DISTINCT batch_no)` would come back under 50. It is exactly 50, contiguous
+from 0, so the walk resumed from the cursor and re-walked nothing. The third row is
+the same claim from the other side: 50,000 transitions across 50,000 *distinct*
+opportunities, so nothing was applied twice.
+
+**The 3.47 s is Docker, not the application.** It is container start plus health
+check, and it dominates the 5.03 s total — the actual resumed work took 1.56 s.

@@ -20,6 +20,8 @@
     "dump": "tsx scripts/cli.ts dump-db",
     "verify": "npm run up && npm run seed && npm run dump && npm test",
     "bench": "tsx test/happyflow/benchmark.ts",
+    "bench:interactive": "tsx test/happyflow/interactive-latency.ts",
+    "bench:killresume": "tsx test/happyflow/kill-resume.ts",
     "test": "jest --runInBand",
     "test:safety": "jest --runInBand --selectProjects safety",
     "test:endpoints": "jest --runInBand --selectProjects endpoints",
