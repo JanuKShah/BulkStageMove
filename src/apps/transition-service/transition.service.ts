@@ -255,8 +255,17 @@ export class TransitionService {
  */
 function canonicalFilter(filter: ReturnType<typeof parseListFilter>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  if (filter.stageIds?.length) out['stageId'] = [...filter.stageIds].sort();
-  if (filter.ownerIds?.length) out['ownerId'] = [...filter.ownerIds].sort();
+  // `!== undefined`, not `?.length`, and it is load-bearing. An outcome is resolved
+  // to a stage list before this runs, so `outcome: 'lost'` in a workspace with no
+  // lost stage arrives with stageIds set to an empty array. Dropping it here
+  // stored the filter as `{}`, and a job with no stage filter matches the whole
+  // workspace - so asking to move the lost deals moved everything instead.
+  //
+  // Keeping the empty list is also what makes the filter hashable as distinct: a
+  // job for "lost" and a job for the whole workspace must not share an identity,
+  // and with the key omitted they were the same filter.
+  if (filter.stageIds !== undefined) out['stageId'] = [...filter.stageIds].sort();
+  if (filter.ownerIds !== undefined) out['ownerId'] = [...filter.ownerIds].sort();
   if (filter.minValue !== undefined) out['minValue'] = filter.minValue;
   if (filter.maxValue !== undefined) out['maxValue'] = filter.maxValue;
   if (filter.createdFrom) out['createdFrom'] = filter.createdFrom.toISOString();

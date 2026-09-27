@@ -108,6 +108,38 @@ separated, so it is not yet known how much of the build is its own work.
 `markPublished` committed. Correct, and harmless, but `published_at` records that
 publication happened, not an ordering guarantee.
 
+## Filter selectivity
+
+`npx tsx test/happyflow/filter-bench.ts` - one freshly seeded 50,000 record
+workspace per case, one build per filter, each run twice with only the second
+pass reported.
+
+| filter | matched | pages | build | per page |
+|---|---|---|---|---|
+| no filter | 50,000 | 50 | 1.34 s | 25 ms |
+| outcome | 12,500 | 13 | 333 ms | 22 ms |
+| value range | 5,050 | 6 | 199 ms | 29 ms |
+| date range | 5,065 | 6 | 78 ms | 12 ms |
+
+**Total build tracks the page count**, which is matched records over 1,000. A
+selective filter is faster for the uninteresting reason that there is less to do.
+
+**Per page does not show the cost of selectivity**, which is the column this was
+written to find. Across four filters it sits in a 12-29 ms band with no ordering,
+so at this scale a page costs about what a page costs whatever matched it. The
+walk's per-page work is dominated by the batch write - a 1,000-element uuid array
+and a commit - not by how many rows the stage filter discarded on the way.
+
+An earlier reading of 25 ms against 13 ms looked like a selectivity effect and was
+not: the cases ran in order, and the first was always the coldest thing in shared
+buffers after 50,000 rows had just been inserted. Each case now runs twice and
+only the warm pass is reported, which is why the numbers moved.
+
+This does not rule the effect out at 500,000, where a selective filter walks
+proportionally further past rows it discards. It says the question is not
+answerable here, so the `stage_id`-in-the-index decision should not be argued
+from these numbers.
+
 ## Why 12 consumers
 
 Consumer count was measured, not guessed. The per-batch time is the evidence: 0.41 s
@@ -191,8 +223,15 @@ the scheduler, resume from a partial cursor, and the per-job build claim.
   because each page's keyset cursor is the previous page's last row.
 - The build and the drain are the same length, so neither alone is the lever:
   shortening one leaves the other as the constraint.
-- The build's per-page cost has not been separated from contention, so how much of the
-  build is its own work is still unknown.
+- The build's per-page cost has not been separated from contention, so how much of
+  the build is its own work is still unknown.
+- Filter selectivity does not measurably change the cost of a page at this scale,
+  so whether `stage_id` belongs in the walk's index is not answered here. See
+  "Filter selectivity" above.
+- The filter benchmark needs its own fixture: the happy-flow one has two stages
+  both with outcome `open`, no created_at spread, and a value range too narrow
+  to bound, so three of the four filters would match nothing and the fourth
+  everything.
 - An earlier version of this file claimed a chunk-size win of 1.21× that was really
   1.04×. The false figure is in the message of pushed commit `8f2052b`.
 - Work per batch varies 34% and queue wait 7x between identical runs, so neither is a

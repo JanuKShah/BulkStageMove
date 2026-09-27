@@ -50,6 +50,15 @@ export function parseListFilter(query: Record<string, unknown>): ParsedFilter {
     if (query[key] === null) {
       throw new BadRequestException(`${key} must not be null; omit it instead`);
     }
+    // An empty list is the same hazard by another route. A body carrying
+    // {"stageId": []} - a client with nothing selected - parses to undefined,
+    // because the list is read as a string and an empty array yields no first
+    // element. That reads as "no stage filter", and a job with no stage filter
+    // matches the whole workspace: asking to move the deals in no stages at all
+    // moved every deal. Refused rather than coerced, the same way null is.
+    if (Array.isArray(query[key]) && query[key].length === 0) {
+      throw new BadRequestException(`${key} must not be an empty list; omit it instead`);
+    }
   }
 
   const filter: ParsedFilter = { limit: parseLimit(query['limit']) };

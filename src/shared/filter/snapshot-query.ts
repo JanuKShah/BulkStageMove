@@ -73,8 +73,19 @@ function buildPredicate(
     where += ` AND ${clause.replace('$?', `$${params.length}`)}`;
   };
 
-  if (filter.stageId?.length) add('stage_id = ANY($?::uuid[])', filter.stageId);
-  if (filter.ownerId?.length) add('owner_id = ANY($?::uuid[])', filter.ownerId);
+  // `!== undefined`, not `?.length`. A filter that named stages and resolved to
+  // none has to match nothing, and the difference between "named none" and "named
+  // nothing" is the whole bug: `?.length` treated both as absent and dropped the
+  // clause, so the predicate became every other condition alone.
+  //
+  // An outcome is resolved to a stage list at submission, so `outcome: 'lost'` in
+  // a workspace with no lost stages arrives here as an empty array. Measured
+  // before this was fixed: that filter stored as `{}` and matched all 10 records
+  // in the workspace instead of none. `= ANY('{}')` is false for every row, so
+  // passing the empty array through is both correct and still index-friendly -
+  // no `AND false` needed.
+  if (filter.stageId !== undefined) add('stage_id = ANY($?::uuid[])', filter.stageId);
+  if (filter.ownerId !== undefined) add('owner_id = ANY($?::uuid[])', filter.ownerId);
   if (filter.minValue !== undefined) add('value >= $?', filter.minValue);
   if (filter.maxValue !== undefined) add('value <= $?', filter.maxValue);
   if (filter.createdFrom) add('created_at >= $?', filter.createdFrom);
