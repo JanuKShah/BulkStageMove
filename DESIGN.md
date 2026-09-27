@@ -55,7 +55,6 @@ Six checks, fixed order. The order is load-bearing.
 - **A manual move and the job on one record, the person wins.** Before the watermark the job takes the new stage as its start; after it the record is skipped and the shortfall reported.
 - **`stage_decided_at` is a logical clock.** A person stamps the wall clock, a job stamps its own `snapshot_at`, so the comparison is submission order. Newest job wins however long the older takes, and every timestamp comes from the one Postgres, so no clock sync.
 - **Two `WHEN` clauses on the trigger, both load-bearing.** `OLD.stage_id IS DISTINCT FROM NEW.stage_id`, so a rename cannot drop a record from an in-flight job. `NEW.stage_decided_at IS NOT DISTINCT FROM OLD.stage_decided_at` is the opt-out: the worker sets the column, so the trigger stands down. Without it a job would stamp 1,000 rows with the wall clock and defeat the design.
-- **No `version` column**, the second save wins. See 7.
 
 ## 4. Snapshot vs live
 
