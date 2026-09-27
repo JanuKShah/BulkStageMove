@@ -8,6 +8,8 @@ claim are in `TESTSTRATEGY.md`.
 
 ![Design diagram](docs/design.png)
 
+[Open the diagram in Excalidraw](https://excalidraw.com/#json=FUTAuUrtz0pet73BnEvH9,_tKFacJdiSVmEmuwPRX9KA)
+
 After step 1 the job row is the only thing that exists; nothing is held in memory.
 
 | # | step | what it does | the part that is not obvious |
