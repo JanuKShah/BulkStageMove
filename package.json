@@ -23,6 +23,7 @@
     "bench:interactive": "tsx test/happyflow/interactive-latency.ts",
     "bench:killresume": "tsx test/happyflow/kill-resume.ts",
     "test": "jest --runInBand",
+    "test:unit": "jest --runInBand --selectProjects unit",
     "test:safety": "jest --runInBand --selectProjects safety",
     "test:endpoints": "jest --runInBand --selectProjects endpoints",
     "test:happyflow": "jest --runInBand --selectProjects happyflow",

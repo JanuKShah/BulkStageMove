@@ -45,7 +45,7 @@ crosses.
 | `pg` 8 | driver, raw SQL, no ORM |
 | RabbitMQ 4 + `amqplib` 2 | batch dispatch between services |
 | nginx | the edge, mints the correlation id |
-| Jest + ts-jest | 216 tests across 19 suites |
+| Jest + ts-jest | 253 tests across 24 suites |
 | tsx | runs the migrate, seed, cli and benchmark scripts |
 | ESLint + Prettier | lint and format |
 | Docker Compose | 10 containers |
@@ -65,7 +65,7 @@ migrations, and blocks until healthy. `npm run down` tears the stack down and
 | `npm run up` / `npm run down` | start / stop, with a fresh volume |
 | `npm run seed` | seed a workspace and print its id |
 | `npm run seed:large` | the 500,000 record dataset |
-| `npm run test` | 216 tests, in band |
+| `npm run test` | 253 tests, in band |
 | `npm run test:safety` / `:endpoints` / `:happyflow` | one project |
 | `npm run bench` | the 50,000 record benchmark, see `BENCHMARKS.md` |
 | `npx tsx test/happyflow/filter-bench.ts` | filter selectivity against batching |
@@ -109,7 +109,7 @@ Tenant scoping is a required `X-Workspace-Id` header.
 **Built and measured.** Async submit returning in ~13 ms; a resumable keyset walk
 that commits each batch with the cursor after it; batches of 1,000 dispatched over
 an outbox to 12 consumers; `stage_decided_at` so a person's edit is never
-overwritten and the newest job wins; composite-FK tenant isolation; 216 tests; a
+overwritten and the newest job wins; composite-FK tenant isolation; 253 tests; a
 50,000-record job in **1.40 s**, and 500,000 in 58.71 s. A CLI with a job watcher
 that polls to completion, and a database dump for checking a move by eye.
 
@@ -154,14 +154,11 @@ docker compose logs -f transition-service # batching, per page, and the relay
 
 ## Tests
 
-**216 tests across 19 suites**, see **[`TESTSTRATEGY.md`](TESTSTRATEGY.md)** for what each one covers and why.
+**253 tests across 24 suites**, see **[`TESTSTRATEGY.md`](TESTSTRATEGY.md)** for what each one covers and why.
 
 | command | |
 |---|---|
-| `npm test` | all 216, in band |
+| `npm test` | all 253, in band |
+| `npm run test:unit` | pure functions, no database needed |
 | `npm run test:safety` | the ones that go red when a guard is removed |
 | `npm run test:endpoints` / `:happyflow` | routes and failure paths / one 50,000 record job end to end |
-
-No test asserts a timing. Wall-clock assertions fail on a loaded machine and pass
-on a fast one; the numbers live in `BENCHMARKS.md` and the measurement lives in
-`benchmark.ts`.

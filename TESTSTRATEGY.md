@@ -1,12 +1,13 @@
 # Test strategy
 
-216 tests, 19 suites, in three projects. `npm test` runs all; `npm run test:safety`
+253 tests, 24 suites, in four projects. `npm test` runs all; `npm run test:safety`
 is the one to read first.
 
 | project | files | tests | scope |
 |---|---|---|---|
-| `safety` | 11 | 119 | the mechanisms below |
-| `endpoints` | 7 | 87 | routes, failure paths, tenant scoping |
+| `unit` | 2 | 17 | pure functions, no database |
+| `safety` | 13 | 132 | the mechanisms below |
+| `endpoints` | 8 | 94 | routes, failure paths, tenant scoping |
 | `happyflow` | 1 | 10 | one 50,000-record job through the broker |
 
 ## Delivery is at-least-once, so duplicates are the normal case
