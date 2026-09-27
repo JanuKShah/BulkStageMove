@@ -205,6 +205,82 @@ describe('bulk job safety', () => {
       expect(counters.rows[0]!.processed_count).toBe(counters.rows[0]!.total_matched);
     });
 
+    it('a duplicate arriving while the first is still in flight is refused, not queued', async () => {
+      // The status predicate cannot catch this one, which is why it needs its own
+      // test. A redelivery after the first attempt finished is handled by
+      // `status IN ('pending','running')` and is covered above. But two consumers
+      // holding the same message *at the same moment* both read 'pending', so both
+      // pass the predicate. What stops the second is the per-batch advisory lock,
+      // taken before the claim.
+      //
+      // The order is load-bearing and the failure is quiet: with the predicate
+      // first and the lock second, the second UPDATE waits on the first's row lock,
+      // then matches the row the first already moved to 'running' - so the batch
+      // applies twice and every record reports as already-moved, which is
+      // indistinguishable from a clean retry unless you count.
+      const ids = await seedOpportunitiesInStage(ws.workspaceId, contacted(), 5);
+      const target = ws.stages['closedWon'];
+      const { jobId, batchNo } = await createJobWithItems(ws.workspaceId, target, ids, {
+        enqueue: false,
+      });
+      const lockKey = `${jobId}:${batchNo}`;
+
+      // Stands in for the first consumer: it holds the batch and has not finished.
+      const first = await pool.connect();
+      try {
+        const got = await first.query<{ locked: boolean }>(
+          'SELECT pg_try_advisory_lock(hashtext($1)) AS locked',
+          [lockKey],
+        );
+        expect(got.rows[0]!.locked).toBe(true);
+
+        // Advisory locks are re-entrant per session, so if the worker happened to
+        // run on *this* backend it would take the same lock successfully and the
+        // test would pass without proving anything. Assert the two are different
+        // sessions before relying on the refusal below.
+        const heldPid = await first.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        const probe = await pool.connect();
+        let workerPid: number;
+        try {
+          workerPid = (await probe.query<{ pid: number }>('SELECT pg_backend_pid() AS pid'))
+            .rows[0]!.pid;
+        } finally {
+          probe.release();
+        }
+        expect(workerPid).not.toBe(heldPid.rows[0]!.pid);
+
+        const duplicate = await processBatchForTest(ws.workspaceId, jobId, batchNo);
+        expect(duplicate.disposition).toBe('skipped');
+        expect(duplicate.moved).toBe(0);
+        expect(duplicate.attempts).toBe(0);
+
+        // Untouched: still claimable, and not one record moved.
+        const batch = await pool.query<{ status: string; attempts: number }>(
+          'SELECT status, attempts FROM bulk_job_outbox WHERE job_id = $1 AND batch_no = $2',
+          [jobId, batchNo],
+        );
+        expect(batch.rows[0]!.status).toBe('pending');
+        expect(batch.rows[0]!.attempts).toBe(0);
+
+        const untouched = await pool.query<{ n: number }>(
+          'SELECT count(*)::int AS n FROM opportunity WHERE id = ANY($1::uuid[]) AND stage_id = $2',
+          [ids, contacted()],
+        );
+        expect(untouched.rows[0]!.n).toBe(5);
+      } finally {
+        await first
+          .query('SELECT pg_advisory_unlock(hashtext($1))', [lockKey])
+          .catch(() => undefined);
+        first.release();
+      }
+
+      // And the refusal defers work rather than discarding it: once the first
+      // consumer is gone the very same batch is claimable as normal.
+      const after = await processBatchForTest(ws.workspaceId, jobId, batchNo);
+      expect(after.moved).toBe(5);
+      expect(after.failed).toBe(0);
+    });
+
     it('deleting a job removes its batches and its failures', async () => {
       const job = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
       await pool.query(

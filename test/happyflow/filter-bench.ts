@@ -4,11 +4,11 @@
  *   npx tsx test/happyflow/filter-bench.ts
  *
  * A filter is not only a predicate - it decides how much work the job is. This
- * measures a build and a full job per filter, so the two rates can be told apart:
- * the build rate is records per second of *finding* records, and the end-to-end
+ * measures a batching pass and a full job per filter, so the two rates can be told apart:
+ * the batching rate is records per second of *finding* records, and the end-to-end
  * rate includes the drain and is what a submitter actually waits for.
  *
- * Each case gets its own freshly seeded workspace. They cannot share one: a build
+ * Each case gets its own freshly seeded workspace. They cannot share one: a batching pass
  * moves every record it matched, so the second case would filter over a
  * distribution the first had already rearranged, and the comparison would be
  * between two datasets rather than four filters.
@@ -138,7 +138,7 @@ const JOB_COST = `
  * The created_at spread is deliberately a past year. A job's watermark is
  * `created_at <= now()`, so a spread running into the current year had its
  * future-dated records excluded from every job - which showed up as 36,989
- * matched against a 50,000 fixture and read as a build that stopped early.
+ * matched against a 50,000 fixture and read as a batching pass that stopped early.
  */
 async function seed(): Promise<{ workspaceId: string; target: string }> {
   const created = await pool.query<{ id: string }>(
@@ -201,7 +201,7 @@ async function seed(): Promise<{ workspaceId: string; target: string }> {
     d.rows[0]!.lo.getTime() + 0.9 * (d.rows[0]!.hi.getTime() - d.rows[0]!.lo.getTime()),
   ).toISOString();
 
-  // Asserted rather than assumed. A build that stops early still returns a
+  // Asserted rather than assumed. A batching pass that stops early still returns a
   // number, and a number is not a count.
   const { rows: check } = await pool.query<{ n: number }>(
     'SELECT count(*)::int AS n FROM opportunity WHERE workspace_id = $1',
@@ -234,10 +234,10 @@ async function run(workspaceId: string, target: string, c: Case, report: boolean
 
   const t0 = Date.now();
   let matched = 0;
-  let buildMs = 0;
+  let batchingMs = 0;
   let settledMs = 0;
 
-  // Two stops, not one. The build ends when the snapshot is done; the job ends
+  // Two stops, not one. Batching ends when the snapshot is done; the job ends
   // when every batch has settled. Reporting only the second would hide how much
   // of a small job is spent waiting to be noticed, which is the interesting part.
   for (;;) {
@@ -250,8 +250,8 @@ async function run(workspaceId: string, target: string, c: Case, report: boolean
         batches: Record<string, number>;
       };
       matched = st.totalMatched;
-      if (!st.snapshotInProgress && buildMs === 0) buildMs = Date.now() - t0;
-      if (buildMs > 0) {
+      if (!st.snapshotInProgress && batchingMs === 0) batchingMs = Date.now() - t0;
+      if (batchingMs > 0) {
         const done = st.status === 'completed' || st.status === 'failed';
         const idle = (st.batches['pending'] ?? 0) === 0 && (st.batches['running'] ?? 0) === 0;
         if (done && idle) {
@@ -277,13 +277,41 @@ async function run(workspaceId: string, target: string, c: Case, report: boolean
     console.log(
       `  ${c.label.padEnd(12)} ${String(matched).padStart(6)} matched  ` +
         `${String(rows[0]?.pages ?? 0).padStart(3)} pages  ` +
-        `build ${ms(buildMs).padStart(7)}  ` +
+        `batching ${ms(batchingMs).padStart(8)}   ` +
         `${String(rows[0]?.per_page_ms ?? 0).padStart(3)}ms/page  ` +
-        `${perSec(matched, buildMs).padStart(7)}/sec  |  ` +
+        `${perSec(matched, batchingMs).padStart(10)}/sec  |  ` +
         `moved ${String(processed).padStart(6)} in ${ms(settledMs).padStart(7)}  ` +
-        `${perSec(processed, settledMs).padStart(7)}/sec`,
+        `${perSec(processed, settledMs).padStart(10)}/sec`,
     );
   }
+}
+
+/**
+ * The header, placed by right edge rather than typed as one string.
+ *
+ * The column names are as wide as the columns they head - "batching" is eight
+ * characters over an eight-wide number - so a hand-typed header either collides
+ * with its neighbour or drifts, and the only symptom is a table that reads wrong
+ * without looking broken. Every padStart below has a fixed width, so the row is
+ * always the same length and these right edges are stable.
+ */
+const HEADER_LABELS: ReadonlyArray<readonly [number, string]> = [
+  [20, 'matched'],
+  [33, 'pages'],
+  [57, 'batching'],
+  [70, 'per page'],
+  [81, 'batching/s'],
+  [91, 'moved'],
+  [102, 'total'],
+  [121, 'total/s'],
+];
+
+function header(): string {
+  let out = ' '.repeat(126);
+  for (const [edge, label] of HEADER_LABELS) {
+    out = out.slice(0, edge - label.length) + label + out.slice(edge);
+  }
+  return out;
 }
 
 async function main(): Promise<void> {
@@ -291,10 +319,9 @@ async function main(): Promise<void> {
   console.log(
     'One freshly seeded workspace and one full job per filter, twice, warm pass shown.\n',
   );
-  console.log(
-    '  filter         matched  pages      build   per page   build/s  |    moved     total     total/s',
-  );
-  console.log('  ' + '-'.repeat(98));
+  const head = header();
+  console.log(head);
+  console.log('  ' + '-'.repeat(head.length - 2));
 
   // Boundaries come from one throwaway seed so every case filters by the same
   // yardstick, and it is cleaned up - the version that left it behind put 50,000
@@ -322,7 +349,7 @@ async function main(): Promise<void> {
   console.log(
     `
   Throughput is the column that says something useful, and it says the opposite
-  of what the per-page column was written to show. Build rate is high and flat -
+  of what the per-page column was written to show. Batching rate is high and flat -
   tens of thousands of records a second - because a page costs about what a page
   costs whatever matched it.
 
@@ -334,7 +361,7 @@ async function main(): Promise<void> {
   it is published. Below roughly 15,000 records that fixed cost is the job.
 
   Those two rates are also the reason the earlier framing was wrong. Counting
-  only the build flatters a selective filter - it does less work - while counting
+  only the batching flatters a selective filter - it does less work - while counting
   only the end-to-end figure punishes it for being small. Neither alone is the
   number a caller waits on.
 

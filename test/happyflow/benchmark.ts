@@ -220,7 +220,7 @@ async function main(): Promise<void> {
               j.created_at AS job_created, j.completed_at AS job_done,
               EXTRACT(EPOCH FROM (o.created_at
                 - LAG(o.created_at, 1, j.created_at) OVER (ORDER BY o.batch_no))) * 1000
-                AS build_ms,
+                AS batching_ms,
               EXTRACT(EPOCH FROM (o.published_at - o.created_at)) * 1000 AS relay_ms,
               EXTRACT(EPOCH FROM (o.started_at  - o.published_at)) * 1000 AS queue_ms,
               EXTRACT(EPOCH FROM (o.completed_at - o.started_at))  * 1000 AS work_ms
@@ -239,8 +239,8 @@ async function main(): Promise<void> {
             round(EXTRACT(EPOCH FROM (min(created_at) - min(job_created))) * 1000)::bigint,
             NULL, NULL, NULL FROM b
      UNION ALL
-     SELECT 'build       per page', round(min(build_ms))::bigint, round(avg(build_ms))::bigint,
-            round(max(build_ms))::bigint, round(sum(build_ms))::bigint FROM b
+     SELECT 'batching    per page', round(min(batching_ms))::bigint, round(avg(batching_ms))::bigint,
+            round(max(batching_ms))::bigint, round(sum(batching_ms))::bigint FROM b
      UNION ALL
      SELECT 'relay lag   written -> published', round(min(relay_ms))::bigint,
             round(avg(relay_ms))::bigint, round(max(relay_ms))::bigint,
@@ -296,7 +296,7 @@ async function main(): Promise<void> {
     // silently printed as zero, which is what a bare fallback would produce.
   }
 
-  // Build against drain. The two are the same length, and that is the finding:
+  // Batching against drain. The two are the same length, and that is the finding:
   // they are not sequential, so the job costs roughly the longer of the two
   // rather than their sum, and shortening only one of them moves the total very
   // little.
@@ -307,21 +307,21 @@ async function main(): Promise<void> {
   // sequential time of 16601 seconds. Milliseconds are nowhere near 2^53, so the
   // safety the string buys is worth nothing here and the arithmetic is.
   const total = Number(phases.find((p) => p.phase.startsWith('whole job'))?.min_ms ?? 0);
-  const buildTotal = Number(phases.find((p) => p.phase.startsWith('build'))?.sum_ms ?? 0);
+  const batchingTotal = Number(phases.find((p) => p.phase.startsWith('batching'))?.sum_ms ?? 0);
   const slots = Number(process.env.RABBITMQ_CONSUMER_CONCURRENCY ?? 12);
   if (perBatchWork.length > 0) {
-    // Both figures are already milliseconds: the build's sum_ms comes from the
+    // Both figures are already milliseconds: the batching's sum_ms comes from the
     // query and the work figures are parsed straight out of the worker's log.
     const workPerSlot = perBatchWork.reduce((a, b) => a + b, 0) / slots;
     console.log(
-      `\n  build total ${ms(buildTotal)} against ${ms(workPerSlot)} of work per slot ` +
+      `\n  batching total ${ms(batchingTotal)} against ${ms(workPerSlot)} of work per slot ` +
         `across ${perBatchWork.length} batches on ${slots} consumers.`,
     );
-    line('build / work-per-slot', `${(buildTotal / Math.max(workPerSlot, 1)).toFixed(2)}x`);
-    line('build + work, if sequential', ms(buildTotal + workPerSlot));
+    line('batching / work-per-slot', `${(batchingTotal / Math.max(workPerSlot, 1)).toFixed(2)}x`);
+    line('batching + work, if sequential', ms(batchingTotal + workPerSlot));
     line('measured whole job', ms(total));
     // The gap between the sum and the measurement is what overlapping is worth.
-    line('earned by overlapping', ms(buildTotal + workPerSlot - total));
+    line('earned by overlapping', ms(batchingTotal + workPerSlot - total));
   } else {
     console.log(
       '\n  (worker log unavailable, so per-batch apply time is not reported here;\n' +
