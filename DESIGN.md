@@ -1,82 +1,61 @@
 # Design
 
-How a bulk stage move is chunked, made idempotent, kept correct while people edit
-the same records, and isolated. Numbers referenced here are in `BENCHMARKS.md`;
-the tests that guard each claim are in `TESTSTRATEGY.md`.
+How a bulk stage move is chunked, made idempotent, kept correct while people edit the
+same records, and isolated. Numbers are in `BENCHMARKS.md`; the tests guarding each
+claim are in `TESTSTRATEGY.md`.
 
-## 1. How the job is chunked, and how the cursor survives a restart
+## 0. The shape of it
 
-**A job's match set is never materialised.** Submission writes one `bulk_job` row
-and returns in single-digit milliseconds. The walk that turns a filter into batches
-runs afterwards, in `SnapshotBuilder`, paging 1,000 ids at a time.
+![Design diagram](docs/design.png)
 
-**The index that makes it cheap** is `opportunity_workspace_created_id_idx` on
-`(workspace_id, created_at, id)`. Column order is the whole design: the filter's
-workspace is an equality, `created_at <= snapshot_at` is a range, and the cursor is
-`(created_at, id)` — so a page is a contiguous index range that starts where the
-previous one stopped. Recorded cost for a 1,000-row page against a 50,000-row
-table: **2.2 ms**.
+After step 1 the job row is the only thing that exists; nothing is held in memory.
 
-**There is no `OFFSET` anywhere in the job path.** With `OFFSET`, the page at
-offset 49,000 reads and discards 49,000 index entries to return the last thousand,
-making the sweep quadratic in the number of batches. The worker does not page at
-all — it reads ids off its batch row.
+| # | step | what it does | the part that is not obvious |
+|---|---|---|---|
+| 1 | **Submit** | Resolves the filter to stage ids, writes **one** job row with `snapshot_at = now()`, returns `201` in ~13 ms | No batch exists yet, so the row defaults to `preparing` — the state a job with no batches is actually in |
+| 2 | **Batching** | A 125 ms sweep claims the job with an advisory lock, walks the filter keyset-style, 1,000 ids per page | Each page commits its batch **and** the cursor after it, in one transaction |
+| 3 | **Relay** | A 125 ms timer publishes unpublished batch rows | Marked published only *after* the broker confirms, so a crash re-publishes rather than loses |
+| 4 | **Drain** | 12 consumers take a per-batch lock, claim `pending → running`, apply in one transaction | Those two guards make at-least-once effectively-once — see 3 |
+| 5 | **Status** | `GET /bulk-moves/:id` — progress, batches, failures, dead letters | A dead-lettered message does not stop the rest of the job |
 
-**The cursor is two columns on the job row**, `snapshot_cursor` and
-`snapshot_cursor_id`, and it is committed **in the same transaction as the batch it
-precedes**. That is what makes it trustworthy: the cursor can never claim progress
-the data does not have. A crash between batches loses at most one page of work and
-resumes from the last committed cursor.
+## 1. Chunking, and surviving a restart
 
-The cursor is resolved by **subquery, never by binding a JavaScript `Date`**:
-
-```sql
-AND (created_at, id) > (
-  SELECT created_at, id FROM opportunity WHERE id = $n AND workspace_id = $1)
-```
-
-`timestamptz` carries microseconds and a JS `Date` carries milliseconds, so binding
-the cursor truncates it: every remaining row then compares greater than the
-truncated value, the same page returns for ever, and every later page conflicts.
-The same trap is why the worker reads its stage from a column-to-column comparison
-in SQL rather than round-tripping a timestamp.
+- **The match set is never materialised.** Submit writes one row; the walk pages
+  1,000 ids at a time afterwards.
+- **The index:** `opportunity_workspace_created_id_idx` on
+  `(workspace_id, created_at, id)`. Equality, range, cursor — so a page is a
+  contiguous index range starting where the last stopped. Recorded 2.2 ms for
+  1,000 rows against a 50,000-row table.
+- **No `OFFSET` anywhere in the job path.** At offset 49,000 it would read and
+  discard 49,000 entries to return the last thousand, making the sweep quadratic.
+  The worker does not page at all — it reads ids off its batch row.
+- **The cursor** is `snapshot_cursor` + `snapshot_cursor_id` on the job row,
+  committed **in the same transaction as the batch it follows** — so it can never
+  claim progress the data does not have. A crash loses at most one page.
+- **Resolved by subquery, never a bound `Date`:** `timestamptz` has microseconds,
+  a JS `Date` has milliseconds, so binding truncates and the same page returns for
+  ever. Same trap made the worker compare column-to-column in SQL rather than
+  round-tripping a timestamp.
 
 ## 2. Idempotency
 
-**The key is caller-supplied**, required non-empty, and stored on the job row.
-Enforced by `CONSTRAINT bulk_job_workspace_idempotency_uniq UNIQUE
-(workspace_id, idempotency_key)`.
+- **Key:** caller-supplied, required, stored on the job row, enforced by
+  `UNIQUE (workspace_id, idempotency_key)`.
+- **Not derived from the request.** A hash of `(workspace, target, filter)` can only
+  detect an *identical* request, and a deliberate re-run is identical — it would be
+  refused as a replay. A client key keeps "retry this" distinct from "do it again".
+- **Protects:** a client retrying `POST` gets the original `jobId` and creates
+  nothing; the body reports `replay: true`.
+- **Held by the database, not the application** — the service does read-then-insert,
+  which two callers can both pass.
+- **Where a retry still slips through:** a different key for the same intent (a
+  client minting a fresh uuid is asking for a second move); a retry after the job
+  row is deleted (no tombstone); a same-key retry with a changed filter or target is
+  rejected 409, deliberately.
 
-A derived key — a hash of `(workspace, target, filter)` — was rejected on purpose.
-It can only detect an *identical* request, and a deliberate re-run of the same
-filter is identical, so it would be refused as a replay. A client key keeps "retry
-this" distinguishable from "do it again", which is the distinction a client
-actually needs.
+## 3. Concurrency on one opportunity
 
-**What it protects.** A client that retries `POST /bulk-moves` — because it timed
-out, or because a proxy retried — gets the original `jobId` back and creates
-nothing. The service returns `replay: true` so the caller can tell.
-
-**The check is in the database, not the application.** The service does a
-read-then-insert, which two concurrent callers can both pass; the unique
-constraint is what actually holds. Verified by deleting the service check and
-confirming the tests still pass, and separately by racing N callers and asserting
-exactly one job exists.
-
-**Where a retry could still slip through** — the honest list:
-
-- **A different key for the same intent** creates a second job. Nothing can prevent
-  this; a client that mints a fresh uuid per attempt is asking for a second move.
-- **A retry after the job row is deleted** creates a new job, because the key dies
-  with the row. There is no tombstone.
-- **A retry with a different filter or target under the same key is rejected** (409),
-  which is deliberate: it means the client changed its mind mid-retry, and silently
-  reusing the old job would be worse.
-
-## 3. Concurrency on a single opportunity
-
-Two actors can want the same record: a person moving it, and a bulk job. The
-worker applies six checks in a fixed order, and the order is load-bearing.
+Six checks, fixed order. The order is load-bearing.
 
 | # | check | outcome |
 |---|---|---|
@@ -87,180 +66,174 @@ worker applies six checks in a fixed order, and the order is load-bearing.
 | 5 | a permitted transition to the target exists | fail |
 | 6 | — | **move**, insert one transition |
 
-**Check 2 must precede check 3.** A person who moves a record *to* the target has
-stamped it with a time newer than the job's, so testing the clock first would
-report a skip — under-counting a job that in fact achieved its intent. It also
-makes retries idempotent: a record a half-finished batch already moved is counted
-as moved, not as a failure.
+- **Check 2 must precede 3.** A person who moves a record *to* the target stamped it
+  newer than the job, so testing the clock first reports a skip and under-counts a
+  job that achieved its intent. It also makes retries idempotent.
+- **A manual move and the job on one record → the person wins.** Before the
+  watermark, the job takes the new stage as its starting point; after it, the record
+  is skipped and the shortfall reported.
+- **`stage_decided_at` is a logical clock.** A person stamps the wall clock, a job
+  stamps its own `snapshot_at`, so `skip if record.stage_decided_at > job.snapshot_at`
+  compares *submission* order — newest job wins however long the older takes.
+- **No synchronised clocks needed:** every timestamp in that comparison comes from
+  the one Postgres.
+- **The trigger has two `WHEN` clauses, both load-bearing:**
+  `OLD.stage_id IS DISTINCT FROM NEW.stage_id` (so a rename or owner change cannot
+  drop a record from an in-flight job) **and**
+  `NEW.stage_decided_at IS NOT DISTINCT FROM OLD.stage_decided_at` (the opt-out —
+  the worker sets the column, so the trigger stands down; without it a bulk job
+  would stamp 1,000 rows with the wall clock and defeat the design).
+- **No `version` column.** Two people editing one deal: the second save wins. See 7.
 
-**So: a manual move and the job hitting the same record → the person wins.** If
-their edit lands before the job's watermark, the job treats the new stage as the
-starting point. If it lands after, the record is skipped and counted as a
-shortfall, which the job reports rather than hiding.
+## 4. Snapshot vs live
 
-**`stage_decided_at` is a logical clock, not a timestamp of change.** A person
-stamps the wall clock. A bulk job stamps **its own `snapshot_at`**. The rule is
-`skip if record.stage_decided_at > job.snapshot_at`, which compares *when jobs were
-submitted* rather than when rows were written — so the newest job wins no matter
-which finishes first. Writing the wall clock would make it last-writer-wins, and an
-older job still draining would beat a newer one.
+- **Neither — the predicate is frozen, the result set is not.** A watermark on
+  `bulk_job.snapshot_at`, bound at submission, plus `created_at <= snapshot_at`.
+- **Sound because `created_at` is immutable:** same filter plus same watermark
+  resolves to the same set, for every worker, every time. Bound once at insert, not
+  `now()` per query, which would advance mid-walk and re-open the set.
+- **This is what replaced a materialised snapshot** — 50 batch rows of 1,000 uuids
+  instead of 50,000 item rows, which were 81% of the time to the `201`.
+- **Consequence:** the count is not knowable at submit. `totalMatched` is 0 while
+  `preparing`. There is no cheap pre-count that stays correct, because records leave
+  the filter while the walk runs.
+- **Consequence for correctness:** filter membership is frozen, *stage* membership
+  is not — a record can be in the match set and no longer in a named stage, which
+  is what check 4 catches.
 
-**It needs no synchronised clocks**, because every timestamp in the comparison
-comes from the one Postgres: the job's `snapshot_at` is `now()` at insert, the
-trigger's `now()` is the same clock, and the worker reads its stamp from its own
-row rather than its own system time.
+## 5. Isolation, and the hole
 
-The clock is maintained by a trigger with **two** `WHEN` clauses, both load-bearing:
-
-```sql
-WHEN (  OLD.stage_id IS DISTINCT FROM NEW.stage_id
-    AND NEW.stage_decided_at IS NOT DISTINCT FROM OLD.stage_decided_at )
-```
-
-- The first stops a rename or an owner change from bumping the clock, which would
-  silently drop the record from every in-flight job — a cosmetic edit cancelling
-  real work.
-- The second is the opt-out. The worker sets the column to its own `snapshot_at`,
-  making `NEW` distinct from `OLD`, so the trigger stands down. Without it a bulk
-  job would stamp 1,000 rows with the wall clock and defeat the entire design.
-
-**No `version` column.** Two people editing the same deal is the gap: the second
-save wins. See § 7.
-
-## 4. Snapshot vs live filter set
-
-**Neither, exactly — the predicate is frozen and the result set is not.** A
-watermark on `bulk_job.snapshot_at` is bound at submission, and every page resolves
-`created_at <= snapshot_at`. A record created after submission can never be swept
-up; a record that existed at submission is found whenever the walk reaches it.
-
-This is what replaced a materialised snapshot, and it is what lets submit write 50
-rows instead of 50,000 — 50 batch rows of 1,000 uuids rather than 50,000 item rows,
-which were **81% of the time to the `201`**.
-
-**It is sound because `created_at` is immutable.** The same filter and the same
-watermark resolve to the same set, every time, for every worker. The watermark is
-bound once at insert rather than being `now()` per query, which would advance with
-each transaction and re-open the set mid-walk.
-
-**The consequence is that the match count is not known at submission.** It is
-reported only once the walk has counted, so `totalMatched` is 0 while a job is
-`preparing`. A client that wanted "how many would this match?" has to ask after
-the fact — there is no cheap pre-count that stays correct, because records leave
-the filter while the walk runs.
-
-**The consequence that matters for correctness:** the *filter* is frozen but
-*stage membership is not*. A record can be in the match set and no longer in a
-stage the filter named, which is exactly what check 4 catches.
-
-## 5. Isolation, and the hole it leaves
-
-**Every table carries `workspace_id NOT NULL`, and every cross-table reference is a
-composite foreign key on `(id, workspace_id)`.** So an opportunity *cannot* point
-at another workspace's stage or owner — the insert fails whatever the service does.
-This is enforced by the database, not by application checks that a future endpoint
-might forget.
-
-```
-opportunity_stage_fk  FOREIGN KEY (stage_id, workspace_id)
-                      REFERENCES stage (id, workspace_id)
-```
-
-`NOT NULL` on `email` is load-bearing too: NULLs are distinct in a unique index, so
-a nullable `UNIQUE (workspace_id, email)` would let any number of nameless users
-share a workspace unjudged by the constraint.
-
-**Query scoping is separate and is the weaker half.** Every repository query filters
-on `workspace_id` explicitly, because a `WHERE` clause is not implied by a foreign
-key. That is a convention, not a guarantee — a forgotten predicate leaks rows.
-
-**There is no endpoint that enumerates workspaces.** A caller cannot discover other
-tenants by asking. The CLI reads the database directly instead, for exactly this
-reason: it already holds the credentials, and adding a route would give the
-capability to anyone who can reach the API.
-
-**The hole this still leaves:** isolation is enforced at the *row* level, not the
-*connection* level. Every service shares one Postgres and one credential set, so a
-bug in any single query that omits `workspace_id` returns another tenant's rows
-with no error. There is no row-level security, no separate database or role per
-tenant, and no test that can prove the absence of a future mistake — only tests
-that the queries written *so far* are correct. Row-level security policies would
-close it at the cost of a predicate on every query.
+- **Composite foreign keys.** Every table carries `workspace_id NOT NULL`; every
+  cross-table reference is `(id, workspace_id)`. An opportunity *cannot* point at
+  another workspace's stage — the insert fails whatever the service does.
+- **`email` is `NOT NULL`** because NULLs are distinct in a unique index, so a
+  nullable `UNIQUE (workspace_id, email)` would let nameless users share a
+  workspace unjudged by the constraint.
+- **Query scoping is the weaker half.** Every repository query filters on
+  `workspace_id` explicitly, because a `WHERE` clause is not implied by a foreign
+  key. That is convention, not guarantee.
+- **No endpoint enumerates workspaces** — a caller cannot discover tenants by
+  asking. The CLI reads the database directly for this reason.
+- **The hole:** isolation is enforced per *row*, not per *connection*. One shared
+  database and one credential set means one forgotten predicate leaks another
+  tenant's rows with no error. No row-level security, and no test can prove the
+  absence of a future mistake.
 
 ## 6. What breaks at 10×
 
-**At 500,000 records in one job it still completes cleanly** — 500,000 moved, 0
-failed, 57.34 s. The first thing to break at that size was submission, and it is
-already fixed: the old inline walk was super-linear, 0.56 s at 50,000 became
-**32.06 s at 500,000**, because it accumulated every batch's ids in memory before
-writing any — roughly 50–100 MB of uuid strings. It now streams, one page at a
-time, so response time is flat and memory is bounded by one page.
+- **500,000 in one job still completes** — 500,000 moved, 0 failed, 57.34 s.
+- **What already broke and is fixed:** submission was super-linear, 0.56 s at 50,000
+  became **32.06 s at 500,000**, accumulating every id in memory (50–100 MB). It now
+  streams one page at a time.
+- **What breaks next: the index depth, and the symptom is batching, not the drain.**
+  `shared_buffers` is **128MB**; `opportunity_workspace_created_id_idx` is already
+  **44MB at 50,000 rows**. At 20M rows it is ~17GB, ~130× the cache, so every page
+  is a disk read. Batching scales linearly in rows; the drain is fixed at ~1.27 s of
+  work per slot.
+- **Fix, in order:** (1) partition `opportunity` by `created_at` range so the
+  watermark prunes to one partition — biggest win, and it enables retention;
+  (2) parallel range scans over pre-computed partition bounds, which needs the
+  uniqueness guarantee item 1 of 7 does not have; (3) covering index including
+  `id, stage_id, created_at` for index-only scans; (4) then revisit the 1,000 batch
+  size, which is a guess rather than a measurement.
+- **What does not break:** the drain — bounded by per-batch work (392 ms) across 12
+  slots, independent of workspace size. The outbox is 20,000 rows at 20M
+  opportunities, which is nothing.
+- **What I cannot claim:** the 500,000 figure **predates the streaming fix**, so it is
+  a lower bound, not a measurement of the current design.
 
-**The first thing that will fail at 20M opportunities in a workspace is the
-`opportunity_workspace_created_id_idx` depth, and the symptom is the batching
-phase, not the drain.**
+## 7. Another week, ranked
 
-Why, in numbers: `shared_buffers` on this host is **128 MB**, and that index is
-already **44 MB at 50,000 rows** — a third of the entire buffer cache, for one
-workspace's worth of one column. At 20M rows the same index is roughly **17 GB**,
-about 130× the cache, so every 1,000-row page becomes a real disk read. Measured
-per-page cost is 18 ms at 50,000 with a warm cache against ~7 ms on a quiet table;
-that gap is contention, and it widens with index size rather than staying flat.
+1. **Re-measure at 500,000.** The only number here not verified against current code.
+2. **`opportunity.version`** — the one real concurrency gap. `WHERE version = $expected`,
+   reject the later save 409. **A bulk job must never bump it**, or a job moving
+   1,000 records hands every affected user a 409 about a field they never edited.
+3. **Kick the pipeline instead of polling it** — removes the ~125 ms floor entirely.
+   Polling imposes a wait, so halving the interval only halves it.
+4. **Expose a records-moved count** — the endpoint reports batches settled and records
+   failed, not records moved, so `job-watch` can only report batches.
+5. **Shard the relay by workspace** so one tenant's backlog cannot delay another's.
+6. **Rate limit on submit** — a Postgres counter, no new dependency.
+7. **Row-level security**, closing the gap in 5.
+8. **Retention** — nothing prunes `bulk_job` or `opportunity_transition`.
 
-Extrapolating from the 1.40 s whole job: batching scales linearly in rows while the
-drain is fixed at ~1.27 s of work per slot, independent of workspace size. So
-somewhere past a few million records batching dominates, and the job becomes bound
-by sequential index scans over an index that does not fit in memory.
+## 8. Deliberately not built
 
-**What I would do, in order:**
+- **Redis.** Added, then removed: every piece of state is either durable in Postgres
+  or per-process, so there is nothing a cache could hold that is safe to hold.
+- **Six services, not one per noun.** Split by *write ownership*; the only
+  cross-service traffic is a handful of `stage-service` lookups per request.
+- **Websockets for progress.** The CLI polls every 2 s, which is the right trade
+  while the poll is 2 s.
+- **A gateway in front of every service** — only `transition-service` sits behind
+  nginx, because it is the only one a client calls.
+- **Zookeeper, Redis or etcd for coordination.** Every lock and every create today
+  is a Postgres operation — `pg_try_advisory_lock` for the build claim and the
+  per-batch claim, a unique constraint for the idempotency key. None of that needs
+  a second system at this scale, and moving a lock out of Postgres would trade a
+  transactional guarantee for a network round trip. It earns its place when
+  bringing up workers and schedulers across zones needs a lease a database
+  transaction cannot span.
+- **Multi-region.** Scaling past one region needs quorum consensus, a coordinator
+  with a real lease, and geo-aware placement of the worker pool. Nothing here is
+  designed for it and nothing here prevents it.
 
-1. **Partition `opportunity` by `created_at` range** (monthly), so the watermark
-   prunes to one partition and the index per partition stays small. This is the
-   single biggest win and it is also what makes retention possible.
-2. **Parallelise the walk across pages.** It is serialised only because page N+1's
-   cursor is page N's last row. A fixed number of parallel range scans over
-   pre-computed partition bounds would break that dependency — but only if each
-   worker writes batches for a disjoint id range, which needs the uniqueness
-   guarantee that does not currently exist (§ 7).
-3. **Raise `shared_buffers` and move to a covering index** including the columns the
-   walk selects (`id, stage_id, created_at`), so a page is an index-only scan.
-4. **Then** reconsider the batch size. 1,000 is a guess, not a measurement: the
-   worker's per-batch time is flat from 4 to 12 consumers, which says the batch is
-   not the unit of contention.
+## 9. Known gaps
 
-**What does not break, and why I am confident:** the drain. It is bounded by
-per-batch work (392 ms mean) divided across 12 slots, and it is independent of
-workspace size. The outbox is also fine — 50 batch rows per 50,000 records, so
-20M opportunities is 20,000 rows, which is nothing.
+Things that are true now and would bite at scale, stated plainly.
 
-**What I cannot claim:** the 500,000 figure **predates the streaming fix**, so it is
-a lower bound on the current design's behaviour, not a measurement of it. It has
-not been re-run since.
+- **A dead-lettered batch cannot be retried.** Nothing consumes `bulk.move.dlq`, by
+  design: a batch that has exhausted its 3 attempts should not be resurrected
+  automatically, and the queue's own TTL (7 days) and length cap discard it
+  eventually. The consequence is that those records are **in neither the per-record
+  failures nor the job's counters — they are simply not moved**, and the only
+  durable record is the batch row's `deadLettered` field. Re-submitting the job is
+  the only recovery, and a new idempotency key is required.
+- **Idempotency keys are never cleared.** A key lives as long as its `bulk_job` row,
+  so the unique constraint grows without bound and a key cannot be reused even after
+  its job is deleted. A retention window on completed jobs would fix both, and
+  interacts with the point above: a job must outlive any retry a client might make.
+- **Nothing prunes `bulk_job` or `opportunity_transition`.** Both grow without bound,
+  and `opportunity_transition` is the audit trail, so it cannot simply be deleted.
+- **Batching's per-page cost has not been separated from contention**, so how much of
+  the 18 ms is the walk's own work is unknown. Measured against a quiet table a page
+  costs ~7 ms.
+- **Batching got about 2x faster when only a timer changed** — per-page mean 41-47 ms
+  to 16-31 ms — and the tick is not on the page-write path. Unexplained; the likeliest
+  cause is that per-page cost is contention-bound, but the direction is backwards from
+  what the new overlap predicts.
+- **Queue wait is the largest cost in the pipeline at 177 ms, and the tick does not
+  set it** — halving the interval moved it only 195 ms to 177 ms. An earlier 3-run
+  reading said it doubled; 5 runs per tick says otherwise, and the two sets of runs
+  overlap, so it is not yet attributed.
+- **The record count at which waiting stops dominating a small job is not
+  re-measured.** The floor is ~125 ms now instead of ~250 ms, so the crossover moved,
+  but the smallest filter measured is 5,050 records. No threshold should be quoted
+  until the bench runs cases below 1,000.
+- **Batching is single-threaded per job** and cannot be otherwise, because each
+  page's keyset cursor is the previous page's last row. Only *different* jobs
+  parallelise, which is what the per-job advisory claim is for.
 
-## 7. What I would do with another week, ranked
+## 10. Design decisions
 
-1. **Re-measure at 500,000 records.** The only number in this document I have not
-   verified against the current code. Everything above is extrapolation until it is.
-2. **Add `opportunity.version`.** The one real concurrency gap left. A
-   `version integer` with `WHERE version = $expected`, rejecting the later save with
-   a 409. The constraint that makes it safe: **a bulk job must never bump it**, or a
-   job moving 1,000 records hands every affected user a 409 about a field they never
-   edited. Not built because there is no UI to make it observable.
-3. **Kick the pipeline instead of polling it.** `POST /bulk-moves` waking the
-   builder, and the builder waking the relay after each page commits, leaving the
-   timers as the recovery path. Removes the ~125 ms floor for small jobs entirely;
-   the timers already exist and already re-entrancy-guard.
-4. **Separate retry queues by workspace** or shard the relay, so one tenant's
-   backlog cannot delay another's.
-5. **Add a rate limit on submit.** A Postgres counter, no new dependency. Async
-   submission made job creation cheap enough to spam.
-6. **Row-level security**, closing the query-scoping gap in § 5 at the cost of a
-   predicate per query.
-7. **Retention.** Nothing prunes `bulk_job` or `opportunity_transition`; both grow
-   without bound. Partitioning (item 1 above) makes this a drop-partition rather
-   than a delete.
+One line each; the sections above are the reasoning.
 
-**Not on the list, deliberately:** Redis. Every piece of state here is either
-durable in Postgres or per-process, so there is nothing a cache could hold that is
-safe to hold. It would earn its place for leader election at high replica counts, or
-for a read path `EXPLAIN` shows hammering Postgres. Neither is true yet.
+- **Submission returns before the work starts** — the walk runs in `SnapshotBuilder`
+  afterwards, resumed from a cursor.
+- **A job row defaults to `preparing`, not `pending`** — a job exists before its
+  batches do; the opposite default produced a silent hang.
+- **Batches hold ids, not one row per record** — 50 rows of 1,000 uuids.
+- **`stage_decided_at` is a logical clock** — newest job wins, no clock sync. See 3.
+- **One batching pass per job, enforced by the database** — an advisory lock, so it
+  is Postgres's rule rather than a property of there being one replica.
+- **Dispatch is an outbox** — batch rows and the intent to send them commit together.
+- **The scheduler is in-process, not a broker message** — so an abandoned job is
+  picked up by whichever replica is alive.
+- **A correlation id is minted at the edge**, validated against
+  `^[A-Za-z0-9._:-]{1,64}$` — a newline in a caller-supplied id would let a client
+  forge a log line.
+- **Five queues: one work, one dead-letter, three retry**, one per backoff step
+  (1 s, 5 s, 30 s), because a queue carries one TTL. The backoff waits in the
+  broker, so a retrying batch holds no worker slot — which matters at `prefetch: 1`.
+- **A dash in a benchmark table** means the instrumentation did not exist for that
+  configuration, not that the figure is zero.

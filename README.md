@@ -96,82 +96,32 @@ migrations, and blocks until healthy. `npm run down` tears the stack down and
 | `OutboxRelay` | transition-service | 125 ms | 50 unpublished rows | one at a time |
 | `BatchWorker` | worker-service | message-driven | — | **12 slots**, one channel each |
 
-**Batching cannot be widened** — a page's keyset cursor is the previous page's last row — but different jobs can run in parallel, which is what the advisory lock is for. Twelve workers is the widest thing here, matched to this host's 12 cores.
+Twelve workers is the widest thing here, matched to this host's 12 cores; why batching itself cannot be widened is in `DESIGN.md` § 1.
 
 **"DB pool of N" is a ceiling on Postgres connections** for that process (`PG_POOL_MAX` becomes `pg`'s `max`), opened on demand — the idle stack held 8 while this was written. Five pools of 10 plus the worker's 12 is **62 against Postgres' 100** `max_connections`, which is why the worker gets 12 and the rest 10. The ceiling is per process, so it multiplies by replica count: three worker replicas put the stack at 86, and a fourth breaches the limit.
 
-**Five queues: one work, one dead-letter, three retry** — one per backoff step (1 s, 5 s, 30 s), because a queue carries one TTL. The backoff waits in the broker, not in a consumer, so a retrying batch holds no worker slot.
+**Five queues: one work, one dead-letter, three retry.** The reasoning for the shape
+is in `DESIGN.md` § 10.
 
-Only **transition-service** sits behind nginx; the other four keep direct ports, since the brief asks for the boundaries rather than a gateway. Tenant scoping is a required `X-Workspace-Id` header.
+Tenant scoping is a required `X-Workspace-Id` header.
 
-## The main logic
+## What works, what does not
 
-The original design, hand-drawn:
+**Built and measured.** Async submit returning in ~13 ms; a resumable keyset walk
+that commits each batch with the cursor after it; batches of 1,000 dispatched over
+an outbox to 12 consumers; `stage_decided_at` so a person's edit is never
+overwritten and the newest job wins; composite-FK tenant isolation; 216 tests; a
+50,000-record job in **1.40 s**, and 500,000 in 57.34 s. A CLI with a job watcher
+that polls to completion, and a database dump for checking a move by eye.
 
-![Design diagram](docs/design.png)
+**Deliberately not built.** Redis — every piece of state is already durable in
+Postgres or per-process. `opportunity.version` — the one real concurrency gap, not
+observable without a UI. A gateway, websockets, or one service per noun. Event-driven
+job kick — the timers are the floor, and a shorter tick only lowers it.
 
-Five steps, and after step 1 the job row is the only thing that exists — every
-later step reads it or the rows it produces, and nothing is held in memory.
-
-| # | step | what it does | the part that is not obvious |
-|---|---|---|---|
-| 1 | **Submit** | Resolves the filter to a list of stage ids, writes **one** job row with `snapshot_at = now()`, returns `201` + `jobId` in ~9 ms | No batch exists yet, so the row defaults to `preparing` — the state a job with no batches is actually in, and the state the sweep looks for |
-| 2 | **Batching** | A 125 ms sweep claims a job with a Postgres advisory lock, then walks the filter keyset-style, 1,000 ids per page | Each page commits its batch **and** the cursor that follows it in one transaction, so a crash resumes instead of restarting — and the advisory lock makes "one batching pass per job" something Postgres enforces, not a property of there being one replica |
-| 3 | **Relay** | A 125 ms timer publishes unpublished batch rows to RabbitMQ | A row is marked published only *after* the broker confirms, so a crash in between re-publishes rather than loses the batch |
-| 4 | **Drain** | 12 consumers take a per-batch advisory lock, claim the batch `pending → running` by compare-and-set, then apply it in one transaction: move the records, insert one transition each, write back the counts | Those two database guards are what turn at-least-once delivery into effectively-once — see below. A duplicate batch is harmless; a lost one hangs the job for ever |
-| 5 | **Status** | `GET /bulk-moves/:id` — progress, batches by state, failures, dead letters | A dead-lettered message goes to a dead-letter queue and **the rest of the job keeps draining** |
-
-**A record is moved only if it survives all six checks, in this order:**
-
-| # | check | if it fires |
-|---|---|---|
-| 1 | the record still exists | **fail** — deleted since the batch was built |
-| 2 | it is **already in the target stage** | count as **moved** |
-| 3 | `record.stage_decided_at <= job.snapshot_at` | **skip** — somebody decided after this job was submitted |
-| 4 | it is still in a stage the filter names | **skip** — it left scope |
-| 5 | its current stage has a permitted transition to the target | **fail** — no permitted move |
-| 6 | — | **move it**, and insert one transition |
-
-**Check 2 must stay ahead of check 3** — the mirror of the obvious order. A person who moves a record *to* the target has stamped it newer than the job, so testing the clock first would report a skip and under-count a job that achieved its intent. Check 2 also makes a retry idempotent, so a batch that dies halfway does not turn every record it finished into a failure.
-
-**Two guards sit in front of all six checks, and they cover different accidents:**
-
-- **A per-batch advisory lock, taken first.** Two consumers holding the same message both read `pending`, so only the lock catches a *concurrent* duplicate; the second is refused without touching a row.
-- **A `pending → running` compare-and-set, taken second.** A batch that already committed is `completed` and matches nothing, so a redelivery after the fact claims no rows.
-
-Both are in the database, not process memory, so a second replica is excluded too. Neither is a unique index — `0001_schema.sql` records why one is not needed on `(job_id, opportunity_id)`.
-
-## Design decisions
-
-**Submission returns before the work starts.** The walk that turns a filter into batches runs in `SnapshotBuilder` after the response, resumed from a cursor, because the old inline walk was super-linear — 0.56 s at 50,000 became 32.06 s at 500,000.
-
-**A job row is 'preparing' by default, not 'pending'.** A job exists before its batches do, so that is the state it is actually in; the opposite default produced a silent hang.
-
-**Batches hold record ids, not one row per record.** 50 rows of 1,000 uuids instead of 50,000 item rows, which were 81% of the time to the `201`.
-
-**`stage_decided_at` is a logical clock, not a timestamp of change.** A person stamps the wall clock, a job stamps its own submission time, so the newest job wins however long the older one takes.
-
-**It needs no synchronised clocks,** because every timestamp in that comparison comes from the one Postgres — the job's `snapshot_at` and the trigger's `now()` are the same clock.
-
-**One batching pass per job, enforced by the database.** A page's keyset cursor is the previous page's last row, so a job cannot be walked twice at once; the advisory lock makes that Postgres's rule rather than a property of there being one replica.
-
-**Dispatch is an outbox, so the batch rows and the intent to send them commit together,** which makes delivery at-least-once and lets the worker's two database guards make it effectively-once.
-
-**The scheduler is in-process, not a broker message.** `SnapshotBuilder` sweeps on a 125 ms timer and walks whatever is still `preparing`, so an abandoned job is picked up by whichever replica is alive rather than being lost with the process that accepted it.
-
-**A correlation id is minted at the edge and carried on every log line,** validated against `^[A-Za-z0-9._:-]{1,64}$` because a caller-supplied id ends up in log lines and a newline would let a client forge one.
-
-## Left for later
-
-- **Redis — considered, added, then removed.** Every piece of state is either durable in Postgres or per-process, so there is nothing a cache could hold that is safe to cache.
-- **Six services, not one per noun in the domain.** The split is by *write ownership*, not by entity; splitting further adds a network hop and a shared-database contract per call, and the only cross-service traffic today is a handful of `stage-service` lookups per request.
-- **`opportunity.version` — not added, because there is no UI.** `stage_decided_at` covers job-versus-record; two people editing one deal is the other half, the second save silently wins, and it is only observable with two humans on one record.
-- **A bulk job must never bump that version,** or a job moving 1,000 records would hand every user a 409 about a field they never edited.
-- **No rate limit on submit.** Nothing bounds how many jobs one tenant can create, and async submission made that cheap to spam.
-- **Small jobs are bound by the poll intervals, not by their data.** Two ticks sit between submitting and the first batch running, so a 5,000-record job still carries ~125 ms of pure waiting.
-- **That floor is mitigated, not removed.** Halving both ticks to 125 ms took ~100 ms off every small job and doubled queue wait; removing the wait needs a kick from `POST /bulk-moves`, not a shorter timer.
-- **Progress is reported in batches, not records.** The endpoint returns how many batch rows settled and how many records failed, but not how many records moved — that number is in the database and is not exposed.
-- **Websockets for progress, not polling.** The diagram says "short polling now, websocket later"; the CLI polls every 2 s and no socket exists, which is the right trade while the poll is 2 s.
+**Known gaps, in `DESIGN.md` § 9.** A dead-lettered batch cannot be retried and its
+records are in no counter. Idempotency keys are never cleared. Queue wait is the
+largest cost and is not yet attributed to anything.
 
 ## Exploring it
 

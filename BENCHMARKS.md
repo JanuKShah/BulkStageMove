@@ -72,28 +72,3 @@ Mean of five runs, fresh volume each time, from the four timestamps on each batc
 
 At 500,000 the job still completes cleanly — 500,000 moved, 0 failed, 57.34 s
 end-to-end.
-
-## Tests
-
-| suite | files | tests | time |
-|---|---|---|---|
-| `safety` | 11 | 119 | 9.3 s |
-| `endpoints` | 7 | 87 | 4.8 s |
-| `happyflow` | 1 | 10 | 36.4 s |
-| **all three** | **19** | **216** | passing |
-
-Run individually, so the times are not three projects sharing one process. The
-suite grew from 185 because the async snapshot needed tests the old shape had no
-use for — the scheduler, resume from a partial cursor, and the per-job batching claim
-— and because the filter tests found a data-loss bug, where a filter naming no
-records was stored as an empty object and a job with no stage filter matched the
-entire workspace.
-
-## Known limits
-
-- Batching is single-threaded per job, because each page's keyset cursor is the previous page's last row.
-- Batching's per-page cost has not been separated from contention, so how much is its own work is unknown.
-- **A small job is bound by its polling intervals, not by its data** — ~125 ms of waiting, halved from 250 ms and still a floor. The record count at which waiting stops dominating has moved with it and is not re-measured. See "Filter selectivity".
-- Queue wait is the largest cost in the pipeline, and the tick change moved it only 195 ms to 177 ms — it did **not** double, as a 3-run reading suggested. See "Where the time goes".
-- Batching got about 2x faster when only a timer changed. Unexplained. See "Where the time goes".
-
