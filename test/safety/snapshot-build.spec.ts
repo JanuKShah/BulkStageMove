@@ -140,8 +140,15 @@ describe('the snapshot is built after the response', () => {
     // already written: the resumed walk then re-read the other 29 and the job
     // reported 59 records for a 30 record fixture. The duplicate-count assertion
     // below caught it, which is the argument for having that assertion at all.
-    const page = await pool.query<{ id: string; created_at: Date }>(
-      `SELECT id, created_at FROM opportunity
+    // created_at as text, and that is load-bearing rather than incidental. The
+    // stored cursor is the position the resumed walk continues from, so it has to
+    // carry the same precision the builder writes - microseconds. Reading this as
+    // a timestamptz hands back a JS Date holding milliseconds, and the planted
+    // cursor then sits below the rows it already covers, so the resume re-reads
+    // them: 40 records for a 30 record fixture. That is what the builder writes,
+    // so that is what has to be planted.
+    const page = await pool.query<{ id: string; created_at: string }>(
+      `SELECT id, created_at::text AS created_at FROM opportunity
         WHERE workspace_id = $1 AND stage_id = $2 ORDER BY created_at, id LIMIT 10`,
       [ws.workspaceId, stageId],
     );

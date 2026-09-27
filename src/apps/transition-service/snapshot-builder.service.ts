@@ -3,6 +3,7 @@ import { DatabaseService } from '../../shared/database/database.service';
 import { RABBIT_CONFIG, type RabbitConfig } from '../../shared/rabbit/rabbit.config';
 import { elapsedMs, ms1, startTimer } from '../../shared/observability/timing';
 import { pageMatching, parseStoredFilter, BATCH_SIZE } from '../../shared/filter/snapshot-query';
+import type { KeysetCursor } from '../../shared/filter/keyset-cursor';
 
 /**
  * Builds a job's batches after the response has been sent.
@@ -162,13 +163,16 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
     const spec = await this.db.query<{
       filter: unknown;
       snapshot_at: Date;
-      snapshot_cursor: Date | null;
+      // Text, not timestamptz. node-pg would hand this back as a Date and the
+      // microseconds would be gone, so the resumed walk would restart from a
+      // position below the row it had already passed - and re-emit that batch.
+      snapshot_cursor: string | null;
       snapshot_cursor_id: string | null;
       created_at: Date;
       correlation_id: string | null;
     }>(
-      `SELECT filter, snapshot_at, snapshot_cursor, snapshot_cursor_id,
-              created_at, correlation_id
+      `SELECT filter, snapshot_at, snapshot_cursor::text AS snapshot_cursor,
+              snapshot_cursor_id, created_at, correlation_id
          FROM bulk_job
         WHERE id = $1 AND workspace_id = $2
           -- Preparing, and only preparing. The claim normally guarantees this
@@ -188,7 +192,10 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
     const query = <T>(sql: string, params: unknown[]): Promise<T[]> =>
       this.db.query<T>(sql, params);
 
-    let cursor: { createdAt: Date; id: string } | null =
+    // A position, carried rather than re-derived. Resuming used to re-read the
+    // cursor row, which meant a row deleted between batches left the walk with no
+    // position at all, and it reported a short match with no error anywhere.
+    let cursor: KeysetCursor | null =
       job.snapshot_cursor && job.snapshot_cursor_id
         ? { createdAt: job.snapshot_cursor, id: job.snapshot_cursor_id }
         : null;
@@ -234,7 +241,9 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
       if (page.length === 0) break;
 
       const last = page[page.length - 1]!;
-      const nextCursor = { createdAt: last.created_at, id: last.id };
+      // created_at came back from the page query as text, so this position is
+      // exact. It is written to a timestamptz column, which round-trips.
+      const nextCursor: KeysetCursor = { createdAt: last.created_at, id: last.id };
 
       await this.db.transaction(async (client) => {
         await client.query(

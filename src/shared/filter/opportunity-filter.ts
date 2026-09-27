@@ -1,5 +1,6 @@
 import { BadRequestException } from '@nestjs/common';
 import { UUID_RE } from '../../shared/tenancy/workspace-guard';
+import { decodeCursor } from './keyset-cursor';
 
 export const OUTCOMES = ['open', 'won', 'lost', 'abandoned'] as const;
 export type Outcome = (typeof OUTCOMES)[number];
@@ -93,7 +94,11 @@ export function parseListFilter(query: Record<string, unknown>): ParsedFilter {
   }
 
   if (query['cursor'] !== undefined)
-    filter.cursor = requireValue('cursor', query['cursor'], UUID_RE);
+    // A cursor is an opaque token carrying its own position, not a uuid. It is
+    // validated by decoding it rather than by pattern-matching the id alone:
+    // checking only that it looks like a uuid would accept a bare id, which is the
+    // old format and carries no position.
+    filter.cursor = requireCursor('cursor', query['cursor']);
 
   return filter;
 }
@@ -173,5 +178,21 @@ function requireValue(field: string, raw: unknown, pattern: RegExp): string {
   const value = first(raw);
   if (value === undefined) throw new BadRequestException(`${field} must not be empty`);
   if (!pattern.test(value)) throw new BadRequestException(`${field} must be a uuid`);
+  return value;
+}
+
+/**
+ * A cursor is only accepted if it decodes to a position.
+ *
+ * Decoding rather than pattern-matching is what keeps a bare uuid out: that is the
+ * format this replaced, it carries no timestamp, and accepting it would hand the
+ * caller a page built by a lookup that is no longer there.
+ */
+function requireCursor(field: string, raw: unknown): string {
+  const value = first(raw);
+  if (value === undefined) throw new BadRequestException(`${field} must not be empty`);
+  if (!decodeCursor(value)) {
+    throw new BadRequestException(`${field} is not a valid pagination cursor`);
+  }
   return value;
 }

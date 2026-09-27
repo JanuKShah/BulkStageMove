@@ -24,6 +24,8 @@
  * records get processed twice or not at all - so it lives here rather than being
  * declared independently in each service.
  */
+import type { KeysetCursor } from './keyset-cursor';
+
 export const BATCH_SIZE = 1000;
 
 export interface StoredFilter {
@@ -135,27 +137,39 @@ export async function pageMatching(
   workspaceId: string,
   filter: StoredFilter,
   snapshotAt: Date,
-  after: { createdAt: Date; id: string } | null,
+  after: KeysetCursor | null,
   limit: number,
-): Promise<(OpportunityRef & { created_at: Date })[]> {
+): Promise<(OpportunityRef & { created_at: string })[]> {
   const params: unknown[] = [workspaceId, snapshotAt];
   let where = buildPredicate(params, 1, filter, 2);
 
   if (after) {
-    // The cursor position is resolved by subquery, never by binding a JS Date.
-    // created_at is timestamptz and carries microseconds while a Date carries
-    // milliseconds, so binding it truncates: every remaining row compares greater
-    // than the truncated cursor, the same page returns for ever, and every
-    // subsequent page conflicts.
-    params.push(after.id);
-    where += ` AND (created_at, id) > (
-      SELECT created_at, id FROM opportunity WHERE id = $${params.length} AND workspace_id = $1)`;
+    // The position is bound, not looked up. It used to be re-read from the cursor
+    // row with a subquery, which meant a cursor row that had been deleted made the
+    // comparison UNKNOWN and silently dropped every remaining record - a job that
+    // reported a short total_matched with no error anywhere.
+    //
+    // The timestamp is bound as text in the database's own timestamptz form and
+    // cast back, never as a JS Date. A Date holds milliseconds where timestamptz
+    // holds microseconds, so binding one truncates the cursor to below its own row
+    // and the same page returns for ever.
+    params.push(after.createdAt, after.id);
+    where += ` AND (created_at, id) > ($${params.length - 1}::timestamptz, $${params.length}::uuid)`;
   }
   params.push(limit);
 
-  return query<OpportunityRef & { created_at: Date }>(
-    `SELECT id, stage_id, created_at FROM opportunity WHERE ${where}
-     ORDER BY created_at, id LIMIT $${params.length}`,
+  return query<OpportunityRef & { created_at: string }>(
+    // created_at comes back as text so the next cursor is lossless. Selecting the
+    // column itself would hand back a Date and the microseconds would be gone
+    // before the cursor was built.
+    //
+    // The ORDER BY is qualified deliberately. An unqualified `created_at` resolves
+    // to the output alias - the text projection - and the sort then happens on
+    // text, which the index cannot supply: measured, that turned a 1ms index scan
+    // into an 83ms seq scan plus top-N sort. Binding the column keeps the row
+    // comparison and the ordering both on the raw timestamptz.
+    `SELECT id, stage_id, created_at::text AS created_at FROM opportunity WHERE ${where}
+     ORDER BY opportunity.created_at, opportunity.id LIMIT $${params.length}`,
     params,
   );
 }

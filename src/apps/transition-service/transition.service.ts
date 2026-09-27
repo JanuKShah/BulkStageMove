@@ -9,6 +9,7 @@ import { isUniqueViolation } from '../../shared/database/unique-violation';
 import { ServiceClient } from '../../shared/http/service-client';
 import { currentRequestId } from '../../shared/http/request-context';
 import { parseListFilter, type Outcome } from '../../shared/filter/opportunity-filter';
+import { decodeCursor } from '../../shared/filter/keyset-cursor';
 import { BulkJob, BulkJobRepository } from './bulk-job.repository';
 import { JobTransitionRepository } from './job-transition.repository';
 import { OutboxRepository } from './outbox.repository';
@@ -260,24 +261,24 @@ export class TransitionService {
       Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_LIMIT,
       MAX_LIMIT,
     );
-    if (
-      query.cursor &&
-      !(await this.jobTransitions.cursorBelongsToJob(workspaceId, jobId, query.cursor))
-    ) {
+    // Decoded once here so the "does this cursor belong to this job" check has an
+    // id to look up, and so a malformed cursor is rejected as a bad request rather
+    // than being passed down to a query that would treat it as no cursor at all.
+    const at = query.cursor ? decodeCursor(query.cursor) : null;
+    if (query.cursor && !at) {
+      throw new BadRequestException('cursor is not a valid pagination cursor');
+    }
+    if (at && !(await this.jobTransitions.cursorBelongsToJob(workspaceId, jobId, at.id))) {
       throw new BadRequestException('cursor does not belong to this job');
     }
 
-    const { items, hasMore } = await this.jobTransitions.list(
+    const { items, nextCursor } = await this.jobTransitions.list(
       workspaceId,
       jobId,
       limit,
       query.cursor ?? null,
     );
-    const last = items.at(-1);
-    return {
-      items,
-      nextCursor: hasMore && last ? encodeCursor(last) : null,
-    };
+    return { items, nextCursor };
   }
 
   /**

@@ -1,6 +1,7 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import type { PoolClient } from 'pg';
 import { DatabaseService } from '../../shared/database/database.service';
+import { decodeCursor, encodeCursor } from '../../shared/filter/keyset-cursor';
 import type { Outcome } from '../../shared/filter/opportunity-filter';
 
 export interface Opportunity {
@@ -75,7 +76,7 @@ export class OpportunityRepository {
   async list(
     workspaceId: string,
     filter: ListFilter,
-  ): Promise<{ items: Opportunity[]; hasMore: boolean }> {
+  ): Promise<{ items: Opportunity[]; hasMore: boolean; nextCursor: string | null }> {
     const params: unknown[] = [workspaceId];
     let where = 'o.workspace_id = $1';
 
@@ -109,19 +110,45 @@ export class OpportunityRepository {
     if (filter.cursor) {
       // Keyset pagination on (created_at, id) stays stable while rows are being
       // inserted, unlike OFFSET which can skip or repeat under concurrent writes.
-      params.push(filter.cursor);
-      where += ` AND (o.created_at, o.id) < (
-        SELECT created_at, id FROM opportunity WHERE id = $${params.length} AND workspace_id = $1
-      )`;
+      //
+      // The position travels in the cursor rather than being re-read from the row
+      // it points at. The subquery this replaced returned NULL if that row had
+      // been deleted - and a deleted cursor row is ordinary here, since deleting a
+      // workspace cascades to its opportunities - which made the comparison
+      // UNKNOWN and dropped every remaining row. A caller paging a large set got
+      // a short list and no error.
+      //
+      // The timestamp is text in the database's own timestamptz form, bound back
+      // as a timestamptz. A JS Date holds milliseconds where timestamptz holds
+      // microseconds, so binding one would truncate the cursor below its own row
+      // and the same page would return for ever.
+      const at = decodeCursor(filter.cursor);
+      if (!at) throw new BadRequestException('cursor is not a valid pagination cursor');
+      params.push(at.createdAt, at.id);
+      where += ` AND (o.created_at, o.id) < ($${params.length - 1}::timestamptz, $${params.length}::uuid)`;
     }
     params.push(filter.limit + 1);
 
-    const rows = await this.db.query<Opportunity>(
-      `SELECT ${READ_COLUMNS} ${FROM_JOINED} WHERE ${where}
+    const rows = await this.db.query<Opportunity & { cursor_at: string }>(
+      // cursor_at is the lossless timestamp for the next page. The response's own
+      // created_at stays a timestamptz, because that is what a client reads.
+      `SELECT ${READ_COLUMNS}, o.created_at::text AS cursor_at ${FROM_JOINED} WHERE ${where}
        ORDER BY o.created_at DESC, o.id DESC LIMIT $${params.length}`,
       params,
     );
-    return { items: rows.slice(0, filter.limit), hasMore: rows.length > filter.limit };
+    // The cursor is built here rather than in the service, so cursor_at never
+    // reaches the client: it is an implementation detail of the position, and the
+    // response should carry the opaque token and nothing else.
+    const page = rows.slice(0, filter.limit);
+    const last = page.at(-1);
+    return {
+      items: page,
+      hasMore: rows.length > filter.limit,
+      nextCursor:
+        rows.length > filter.limit && last
+          ? encodeCursor({ createdAt: last.cursor_at, id: last.id })
+          : null,
+    };
   }
 
   async listTransitions(workspaceId: string, opportunityId: string): Promise<Transition[]> {

@@ -186,8 +186,8 @@ export class OpportunityService {
       filter.stageIds = await this.stageIdsForOutcome(workspaceId, filter.outcome);
     }
 
-    const { items, hasMore } = await this.repository.list(workspaceId, filter);
-    return { items, nextCursor: hasMore ? (items.at(-1)?.id ?? null) : null };
+    const { items, nextCursor } = await this.repository.list(workspaceId, filter);
+    return { items, nextCursor };
   }
 
   transitions(workspaceId: string, opportunityId: string): Promise<Transition[]> {
