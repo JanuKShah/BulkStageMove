@@ -104,49 +104,21 @@ Six checks, fixed order. The order is load-bearing.
 
 ## 7. Another week, ranked
 
-By dependency, not size: 2 enables 3, and 5 enables 6.
-
-1. **`opportunity.version`**, the one real concurrency gap. `WHERE version =
-   $expected`, reject the later save 409. **A bulk job must never bump it**, or a
-   job moving 1,000 records hands every affected user a 409 about a field they
-   never edited.
-2. **Retention at 60 days** on `bulk_job`, `bulk_job_outbox` and
-   `bulk_job_failure`. **Not** `opportunity_transition` - the audit trail must
-   outlive the job row. Makes 3 possible; 60 days is far longer than any client
-   retry window.
-3. **Clear the idempotency key past retention**, closing the section 8 gap, a key is
-   reserved for the life of its row and nothing ever frees it, so the unique index
-   grows without bound and a key can never be reused.
-4. **Redis, for two of the three things it is wanted for**, a token bucket for
-   the rate limit, and replacing the session-scoped advisory locks so the design
-   survives connection pooling, which is what would make PgBouncer usable.
-   **Not the idempotency key:** the unique constraint is transactional and durable
-   where a Redis key is neither, and Redis cannot commit atomically with the
-   insert, so the constraint stays regardless and the lookup gains roughly nothing
-   against a 13–22 ms submit.
-5. **ZooKeeper or etcd for worker and scheduler membership, one, not both.**
-   Both give ephemeral leases and watches, which is what "bring up a worker as
-   required" needs and what a database transaction cannot span. **etcd** is the
-   cheaper bet, a static binary, gRPC, the library Kubernetes already ships.
-   **ZooKeeper** is heavier but has more very-large-cluster evidence. Register on
-   start, deregister on shutdown, watch for peers instead of waking on a timer.
-6. **Multi-region, which needs 5 first**, quorum consensus, the coordination
-   service, geo-aware worker placement. It opens a question this design does not
-   answer: a bulk move crossing a border is a data-residency problem, not a
-   latency one.
+1. **`opportunity.version`,** to solve the race between two parallel UI changes on one opportunity. Reject the later save with 409. A bulk job must never bump it, or a job moving 1,000 records hands every affected user a 409 about a field they never edited.
+2. **Retention at 60 days** on `bulk_job`, `bulk_job_outbox` and `bulk_job_failure`, and clear the idempotency key past that. A key is reserved for the life of its row and nothing ever frees it, so the unique index grows without bound and a key can never be reused.
+3. **Redis,** for two of the three things it is wanted for: a token bucket for the rate limit, and replacing the session-scoped advisory locks so the design survives connection pooling, which is what would make PgBouncer usable. Not the idempotency key, the unique constraint is transactional and durable where a Redis key is neither.
+4. **ZooKeeper or etcd** for worker and service membership, one and not both. Both give ephemeral leases and watches, which is what "bring up a worker as required" needs and what a database transaction cannot span. etcd is the cheaper bet, a static binary and the library Kubernetes already ships. Register on start, deregister on shutdown, watch for peers instead of waking on a timer.
+5. **Sharding and partitioning** the database by `workspace_id`, so data can be scoped to one tenant and then distributed.
+6. **A load balancer,** so the microservices can be managed behind it.
+7. **Geo-located multi-region servers,** for low latency and to survive a data centre crash. Needs 4 first, because a region needs a membership service. A bulk move crossing a border is a data-residency problem, not a latency one.
+8. **A retry mechanism and a DLQ for failed batches.** Today a given-up batch is only marked in the database, and it starts again when a caller asks through `POST /bulk-moves/:id/retry-failed`.
+9. **Rate limits at workspace, user and job level,** not only per request.
+10. **More RabbitMQ queues, partitioned by `workspace_id`.** Every worker subscribes to every queue but treats one as its priority, so a noisy tenant cannot delay another, and a worker with spare capacity can still pick up load from a single tenant.
 
 ## 8. Known gaps
 
 True now, and would bite at scale.
 
-- **A given-up batch is retried only when a caller asks**,
-  `POST /bulk-moves/:id/retry-failed` resets it to `pending` and clears
-  `published_at`, so the relay republishes it. Nothing retries on its own: the
-  condition that stopped the batch is usually gone by the time anyone notices, and
-  a silent retry would hide the failure it was retrying. Until it is called, those
-  records are **in neither the per-record failures nor the job's counters - they
-  are simply not moved** - which is why `deadLettered` is reported on the status
-  response and worth alerting on.
 - **Idempotency keys are never cleared**, a key lives as long as its row, so the
   constraint grows without bound and a key cannot be reused even after its job is
   deleted. A retention window fixes both, and a job must outlive any retry a
