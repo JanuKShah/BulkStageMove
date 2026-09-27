@@ -41,6 +41,20 @@ export interface OpportunityRef {
 }
 
 /**
+ * Narrows a job's stored jsonb filter to the shape the predicate builder expects.
+ *
+ * A defensive cast rather than a validation: the value was written by
+ * canonicalFilter, so it is already in this shape, and a row that somehow was not
+ * would produce an over-broad match rather than a crash - which is the wrong way
+ * to fail, but failing loudly on a job mid-flight is worse than moving what the
+ * stored filter actually describes.
+ */
+export function parseStoredFilter(raw: unknown): StoredFilter {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  return raw;
+}
+
+/**
  * Builds the WHERE clause for a job's filter at its watermark.
  *
  * `params` starts as the caller's fixed arguments, so the numbering continues

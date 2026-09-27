@@ -10,6 +10,7 @@ import {
   recordJobTransition,
   seedOpportunities,
   submitBulkMove,
+  waitForSnapshot,
   type TestWorkspace,
 } from '../helpers';
 
@@ -36,13 +37,14 @@ describe('bulk-moves endpoints', () => {
       );
       const res = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() });
       expect(res.status).toBe(201);
-      expect(res.body.itemsCreated).toBe(expected.rows[0]!.n);
+      const snap = await waitForSnapshot(ws.workspaceId, res.body.jobId);
+      expect(snap.totalMatched).toBe(expected.rows[0]!.n);
 
       const items = await pool.query<{ n: number }>(
         'SELECT coalesce(sum(cardinality(item_ids)), 0)::int AS n FROM bulk_job_outbox WHERE job_id = $1',
         [res.body.jobId],
       );
-      expect(items.rows[0]!.n).toBe(res.body.itemsCreated);
+      expect(items.rows[0]!.n).toBe(snap.totalMatched);
     });
 
     it('total_matched agrees with the records written into batches', async () => {
@@ -68,7 +70,8 @@ describe('bulk-moves endpoints', () => {
          WHERE o.workspace_id = $1 AND s.outcome = 'won'`,
         [ws.workspaceId],
       );
-      expect(res.body.itemsCreated).toBe(expected.rows[0]!.n);
+      const snap = await waitForSnapshot(ws.workspaceId, res.body.jobId);
+      expect(snap.totalMatched).toBe(expected.rows[0]!.n);
     });
 
     // Built inside the test, not in the table literal: the table is evaluated
@@ -120,7 +123,11 @@ describe('bulk-moves endpoints', () => {
         minValue: 999_999_999,
       });
       expect(res.status).toBe(201);
-      expect(res.body.itemsCreated).toBe(0);
+      // A job that matched nothing has no batches, so nothing would ever settle
+      // it. The build marks it completed rather than leaving it pending for ever.
+      const snap = await waitForSnapshot(ws.workspaceId, res.body.jobId);
+      expect(snap.totalMatched).toBe(0);
+      expect(snap.status).toBe('completed');
     });
 
     it('JSON key order does not change the job identity', async () => {
@@ -159,7 +166,7 @@ describe('bulk-moves endpoints', () => {
       }>(BASE.transition, `/bulk-moves/${job.body.jobId}`, { workspaceId: ws.workspaceId });
 
       expect(res.status).toBe(200);
-      expect(res.body.totalMatched).toBe(job.body.itemsCreated);
+      expect(res.body.totalMatched).toBe((await waitForSnapshot(ws.workspaceId, job.body.jobId)).totalMatched);
       expect(Number.isNaN(Date.parse(res.body.snapshotAt))).toBe(false);
 
       // The counts are batches, not records: there is no per-record state left to

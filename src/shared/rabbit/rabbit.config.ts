@@ -29,6 +29,14 @@ export interface RabbitConfig {
   deadLetterMaxLength: number;
   heartbeatSeconds: number;
   consumerConcurrency: number;
+  /**
+   * How often the transition service looks for jobs whose snapshot is unfinished.
+   *
+   * It is the only thing that drives the build now - submission returns before
+   * the batches exist - so this is the latency between a job being accepted and
+   * its first batch being written, not a background nicety.
+   */
+  snapshotSweepIntervalMs: number;
   /** How often the outbox relay looks for unpublished batches. */
   relayIntervalMs: number;
   relayBatchSize: number;
@@ -47,7 +55,8 @@ const DEFAULTS: RabbitConfig = {
   deadLetterTtlMs: 7 * 24 * 60 * 60 * 1_000,
   deadLetterMaxLength: 10_000,
   heartbeatSeconds: 30,
-  consumerConcurrency: 4,
+  consumerConcurrency: 12,
+  snapshotSweepIntervalMs: 250,
   relayIntervalMs: 250,
   relayBatchSize: 50,
 };
@@ -88,6 +97,7 @@ export function rabbitConfig(): RabbitConfig {
     deadLetterMaxLength: int('RABBITMQ_DLQ_MAX_LENGTH', DEFAULTS.deadLetterMaxLength),
     heartbeatSeconds: int('RABBITMQ_HEARTBEAT', DEFAULTS.heartbeatSeconds),
     consumerConcurrency: int('RABBITMQ_CONSUMER_CONCURRENCY', DEFAULTS.consumerConcurrency),
+    snapshotSweepIntervalMs: int('SNAPSHOT_SWEEP_INTERVAL_MS', DEFAULTS.snapshotSweepIntervalMs),
     relayIntervalMs: int('RABBITMQ_RELAY_INTERVAL_MS', DEFAULTS.relayIntervalMs),
     relayBatchSize: int('RABBITMQ_RELAY_BATCH_SIZE', DEFAULTS.relayBatchSize),
   };

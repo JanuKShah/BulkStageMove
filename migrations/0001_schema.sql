@@ -113,7 +113,6 @@ CREATE TABLE bulk_job (
     idempotency_key  text        NOT NULL,
     filter           jsonb       NOT NULL,
     target_stage_id  uuid        NOT NULL,
-    status           text        NOT NULL DEFAULT 'pending',
     total_matched    integer     NOT NULL DEFAULT 0,
     processed_count  integer     NOT NULL DEFAULT 0,
     failed_count     integer     NOT NULL DEFAULT 0,
@@ -131,18 +130,44 @@ CREATE TABLE bulk_job (
     -- is the same instant as created_at, so a job row written by anything other
     -- than the submit path stays coherent instead of tripping NOT NULL.
     snapshot_at      timestamptz NOT NULL DEFAULT now(),
+    -- Where the snapshot build got to. Null once the build has finished, which is
+    -- also how a preparing job is told apart from a finished one.
+    snapshot_cursor    timestamptz,
+    snapshot_cursor_id uuid,
     created_at       timestamptz NOT NULL DEFAULT now(),
     updated_at       timestamptz NOT NULL DEFAULT now(),
     started_at       timestamptz,
     completed_at     timestamptz,
+    -- Defaults to 'preparing' rather than 'pending' on purpose. A job is created
+    -- before its batches exist, so that is the state it is actually in, and it is
+    -- the one the snapshot sweep looks for. The opposite default produced a
+    -- silent hang: a job inserted without an explicit status sat in 'pending'
+    -- with no batches, nothing for the relay to publish, and nothing to notice it
+    -- had stalled. Getting this wrong now means a job gets built that should not
+    -- have been, which is recoverable, rather than one that never runs at all.
+    --
+    -- A path that genuinely means "batches exist, waiting for a worker" has to say
+    -- so - the test fixtures do.
+    status           text        NOT NULL DEFAULT 'preparing',
+    -- 'preparing' is also distinct from 'pending' as a caller-facing state.
+    -- 'pending' means the batches are built and waiting for a worker;
+    -- 'preparing' means they are still being written. A client polling a preparing
+    -- job is not looking at a stalled one, and merging the two would make that
+    -- indistinguishable.
+    --
+    -- The snapshot cursor makes the walk resumable. The build commits one batch
+    -- and the cursor that follows it in the same transaction, so the cursor never
+    -- claims progress the data does not have, and a process that dies mid-build
+    -- resumes rather than restarting.
     CONSTRAINT bulk_job_status_valid
-        CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+        CHECK (status IN ('preparing', 'pending', 'running', 'completed', 'failed')),
     CONSTRAINT bulk_job_counts_non_negative
         CHECK (total_matched >= 0 AND processed_count >= 0 AND failed_count >= 0),
     -- One job per (workspace, key). Several unfinished jobs may run in one
     -- workspace; the key makes a retry safe, it is not a lock on the workspace.
     CONSTRAINT bulk_job_workspace_idempotency_uniq UNIQUE (workspace_id, idempotency_key),
-    -- FK target for the composite reference from bulk_job_item
+    -- FK target for the composite reference from bulk_job_outbox and
+    -- bulk_job_failure, which is what carries workspace_id through the job tables.
     CONSTRAINT bulk_job_id_workspace_uniq UNIQUE (id, workspace_id),
     CONSTRAINT bulk_job_target_stage_fk
         FOREIGN KEY (target_stage_id, workspace_id)

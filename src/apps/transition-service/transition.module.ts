@@ -7,6 +7,7 @@ import { BulkJobRepository } from './bulk-job.repository';
 import { JobTransitionRepository } from './job-transition.repository';
 import { OutboxRelay } from './outbox-relay';
 import { OutboxRepository } from './outbox.repository';
+import { SnapshotBuilder } from './snapshot-builder.service';
 import { RabbitBatchPublisher } from './rabbit-batch.publisher';
 import { RabbitService } from '../../shared/rabbit/rabbit.service';
 import { RABBIT_CONFIG, rabbitConfig } from '../../shared/rabbit/rabbit.config';
@@ -22,6 +23,7 @@ import { TransitionService } from './transition.service';
     JobTransitionRepository,
     OutboxRepository,
     OutboxRelay,
+    SnapshotBuilder,
     RabbitBatchPublisher,
     RabbitService,
     DatabaseService,

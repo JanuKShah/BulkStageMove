@@ -156,8 +156,11 @@ export async function createJobWithItems(
   try {
     await client.query('BEGIN');
     const job = await client.query<{ id: string }>(
-      `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id, snapshot_at)
-       VALUES ($1, $2, '{}'::jsonb, $3, now()) RETURNING id`,
+      // 'pending', not the column default. This fixture hands over batches that
+      // already exist, so the job must not claim to still be building them - the
+      // snapshot sweep would pick it up and rebuild over the top.
+      `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id, snapshot_at, status)
+       VALUES ($1, $2, '{}'::jsonb, $3, now(), 'pending') RETURNING id`,
       [workspaceId, `test-${randomUUID()}`, targetStageId],
     );
     const jobId = job.rows[0]!.id;
@@ -305,6 +308,72 @@ export async function submitBulkMove(
     body: JSON.stringify({ idempotencyKey: key, ...body }),
   });
   return { status: response.status, body: response.body };
+}
+
+export interface JobStatus {
+  id: string;
+  status: string;
+  totalMatched: number;
+  snapshotAt: string;
+  snapshotInProgress: boolean;
+  failedCount: number;
+  error: string | null;
+  batches: Record<string, number>;
+  deadLettered?: { batches: number; records: number; reasons: { reason: string; batches: number }[] };
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+/**
+ * Waits for a submitted job to finish building its batches, and returns its status.
+ *
+ * Submission returns before the batches exist - that is the point of the change -
+ * so any test that wants to count records, or the batches holding them, has to
+ * wait for the snapshot phase to end first. `totalMatched` is the count that
+ * actually landed in batches, which is deliberately not knowable at submit time:
+ * a record can leave the filter while the walk is running.
+ *
+ * Fails the test rather than returning a half-built job, so a stalled build shows
+ * up as a timeout here rather than as a confusing count mismatch further down.
+ */
+export async function waitForSnapshot(
+  workspaceId: string,
+  jobId: string,
+  timeoutMs = 30_000,
+): Promise<JobStatus> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const res = await api<JobStatus>(BASE.transition, `/bulk-moves/${jobId}`, { workspaceId });
+    if (res.status === 200 && !res.body.snapshotInProgress) return res.body;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `job ${jobId} was still preparing after ${timeoutMs}ms (status ${res.status})`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+/** Waits for a job to settle: completed or failed, and no batches left pending. */
+export async function waitForJobSettled(
+  workspaceId: string,
+  jobId: string,
+  timeoutMs = 120_000,
+): Promise<JobStatus> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const res = await api<JobStatus>(BASE.transition, `/bulk-moves/${jobId}`, { workspaceId });
+    const done =
+      res.status === 200 &&
+      (res.body.status === 'completed' || res.body.status === 'failed') &&
+      (res.body.batches['pending'] ?? 0) === 0 &&
+      (res.body.batches['running'] ?? 0) === 0;
+    if (done) return res.body;
+    if (Date.now() > deadline) {
+      throw new Error(`job ${jobId} did not settle in ${timeoutMs}ms (status ${res.body?.status})`);
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
 }
 
 /**

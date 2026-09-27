@@ -47,6 +47,10 @@ export class BulkJobRepository {
     filter: unknown;
     targetStageId: string;
   }): Promise<BulkJob> {
+    // status is left to the column default, which is 'preparing' - the state a
+    // job is actually in when it is created, since its batches do not exist yet
+    // and SnapshotBuilder writes them. Saying it here as well would be a second
+    // place to change it when the lifecycle does.
     const rows = await this.db.query<BulkJob>(
       `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id, snapshot_at)
        VALUES ($1, $2, $3, $4, now()) RETURNING ${COLUMNS}`,

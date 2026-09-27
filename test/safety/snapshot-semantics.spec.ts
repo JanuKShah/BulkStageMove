@@ -8,6 +8,7 @@ import {
   seedOpportunities,
   seedOpportunitiesInStage,
   submitBulkMove,
+  waitForSnapshot,
   withDeadlockRetry,
   type TestWorkspace,
 } from '../helpers';
@@ -46,7 +47,8 @@ describe('batches hold records instead of rows', () => {
       stageId: contacted(),
     });
     expect(res.status).toBe(201);
-    expect(res.body.itemsCreated).toBe(2_530);
+    const snap = await waitForSnapshot(ws.workspaceId, res.body.jobId);
+    expect(snap.totalMatched).toBe(2_530);
 
     const { rows } = await pool.query<{ batches: number; records: number }>(
       `SELECT count(*)::int AS batches, sum(cardinality(item_ids))::int AS records
@@ -77,7 +79,10 @@ describe('batches hold records instead of rows', () => {
     );
     // A record in two batches would be moved twice and counted twice.
     expect(rows[0]!.total).toBe(rows[0]!.distinct_ids);
-    expect(rows[0]!.total).toBe(res.body.itemsCreated);
+    // And the count agrees with what the job reports, which is the number that
+    // actually landed in batches rather than one taken before the walk.
+    const snap = await waitForSnapshot(ws.workspaceId, res.body.jobId);
+    expect(rows[0]!.total).toBe(snap.totalMatched);
   });
 
   it('excludes an opportunity created after the watermark', async () => {
@@ -181,7 +186,7 @@ describe('batches hold records instead of rows', () => {
         outcome: 'won',
       });
       expect(res.status).toBe(201);
-      expect(res.body.itemsCreated).toBe(0);
+      expect((await waitForSnapshot(ws.workspaceId, res.body.jobId)).totalMatched).toBe(0);
 
       // No batches means nothing would ever settle it, so it is finished on
       // creation. A job stuck at pending for ever is the failure mode here.
