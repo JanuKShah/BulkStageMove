@@ -157,6 +157,17 @@ describe('batches hold records instead of rows', () => {
       jobId,
       JSON.stringify({ stageId: [contacted()] }),
     ]);
+    // ...and age this job's watermark past the records' logical clock, so leaving
+    // the stage is the ONLY thing that makes the record out of scope.
+    //
+    // Without this the two conditions are true at once - a stage change after
+    // submission is exactly what stage_decided_at records - and whichever check
+    // runs first decides the outcome. The test would still pass, but it would no
+    // longer be testing the scope check it names, and the scope check would have
+    // no coverage of its own. The clock is covered in stage-decided-at.spec.ts.
+    await pool.query(`UPDATE bulk_job SET snapshot_at = now() + interval '1 hour' WHERE id = $1`, [
+      jobId,
+    ]);
 
     // A user moves one of them out of the filtered stage before the batch runs.
     const moved = ids[0]!;
