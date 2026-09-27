@@ -100,7 +100,7 @@ migrations, and blocks until healthy. `npm run down` tears the stack down and
 
 **One exchange, one queue.** No dead letter queue: a batch that runs out of attempts
 is marked `failed` in Postgres and the message is acked, so `POST
-/bulk-moves/:id/retry-failed` can put it back. The reasoning is in `DESIGN.md` § 9.
+/bulk-moves/:id/retry-failed` can put it back. The reasoning is in `DESIGN.md` section 9.
 
 Tenant scoping is a required `X-Workspace-Id` header.
 
@@ -119,7 +119,7 @@ observable without a UI. A gateway, websockets, or one service per noun. An
 event-driven *relay* kick, submit kicks the sweep inline, but a committed batch
 still waits out the relay's next tick.
 
-**Known gaps, in `DESIGN.md` § 8.** A given-up batch's records sit in no counter
+**Known gaps, in `DESIGN.md` section 8.** A given-up batch's records sit in no counter
 until someone calls `retry-failed`. Idempotency keys are never cleared. Queue wait
 is the largest cost and is not yet attributed to anything.
 

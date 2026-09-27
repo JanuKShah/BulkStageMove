@@ -160,7 +160,7 @@ against that frozen copy, the request is never consulted again.**
      *large* jobs from one tenant; a request-rate limit cannot, since one request
      can be 500,000 records.
   2. **Rate limit on submit**, a Postgres counter. Meter on row creation, not
-     the replay path, so a retry is not charged twice. Not a volume limit: § 4
+     the replay path, so a retry is not charged twice. Not a volume limit: section 4
      leaves `totalMatched` at 0 until the walk ends, so records-per-minute must be
      metered in the builder.
   3. **Partition `opportunity` by `workspace_id`**, sub-partitioned by
@@ -168,7 +168,7 @@ against that frozen copy, the request is never consulted again.**
      leading index column, so pruning is exact with no query change. The PK widens
      to `(workspace_id, id)`, but `opportunity_id_workspace_uniq` already has
      that shape, so the transition FK survives.
-  4. **Row-level security in the same change as 3**, partitioning turns § 5's
+  4. **Row-level security in the same change as 3**, partitioning turns section 5's
      missing predicate into a full-partition scan.
   5. **Replicas**, more builders is the only way to speed one huge job, because
      page N+1's cursor is page N's last row; more workers drain concurrent jobs,
@@ -194,7 +194,7 @@ By dependency, not size: 2 enables 3, and 5 enables 6.
    `bulk_job_failure`. **Not** `opportunity_transition` - the audit trail must
    outlive the job row. Makes 3 possible; 60 days is far longer than any client
    retry window.
-3. **Clear the idempotency key past retention**, closing the § 8 gap, a key is
+3. **Clear the idempotency key past retention**, closing the section 8 gap, a key is
    reserved for the life of its row and nothing ever frees it, so the unique index
    grows without bound and a key can never be reused.
 4. **Redis, for two of the three things it is wanted for**, a token bucket for

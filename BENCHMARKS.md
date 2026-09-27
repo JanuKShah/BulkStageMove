@@ -133,7 +133,7 @@ until it settled in **52.68 s**.
   A half-million-record job does not make ordinary reads slower.
 - **The cost is all in the p99 tail, and only in the tenant running the job**,
   15.6 → 30.9 ms, while another tenant's p99 went 19.0 → 13.4. That is the
-  measurable form of the isolation claim in `DESIGN.md` § 5, which otherwise only
+  measurable form of the isolation claim in `DESIGN.md` section 5, which otherwise only
   argues it structurally.
 - **p50 got *faster* during the run** (7.1 → 5.7 ms), which is not the job helping:
   the 15 s baseline pays cold-start cost. It makes the quiet row a pessimistic
@@ -152,7 +152,7 @@ percentile. The harness warns when it collects fewer than 30.
 `npm run bench:killresume`, `SIGKILL` to `transition-service` once the walk has
 written 10 of its 50 batches, so the cursor is genuinely mid-flight and a graceful
 shutdown gets no chance to tidy up. The container is then started again, which is
-what an orchestrator would do. This is the measurement behind the `DESIGN.md` § 1
+what an orchestrator would do. This is the measurement behind the `DESIGN.md` section 1
 claim that a half-built job is finished rather than restarted.
 
 | 50,000 records, killed after batch 10 | |
