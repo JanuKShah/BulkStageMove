@@ -71,7 +71,9 @@ function main(): void {
     const last = samples[samples.length - 1]!;
     console.log(`    tests        ${last.passed} passed, ${last.failed} failed`);
     console.log(`    min / median ${pct(times, 0).toFixed(1)}s / ${pct(times, 50).toFixed(1)}s`);
-    console.log(`    p95 / max    ${pct(times, 95).toFixed(1)}s / ${times[times.length - 1]!.toFixed(1)}s`);
+    console.log(
+      `    p95 / max    ${pct(times, 95).toFixed(1)}s / ${times[times.length - 1]!.toFixed(1)}s`,
+    );
     console.log(`    mean         ${(total / times.length).toFixed(1)}s`);
     console.log();
   }

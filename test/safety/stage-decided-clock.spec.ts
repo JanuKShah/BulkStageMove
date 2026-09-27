@@ -36,7 +36,10 @@ describe('the stage_decided_at trigger', () => {
     await pool.end();
   });
 
-  const seed = async (stageId: string, name = `clock-${randomUUID().slice(0, 8)}`): Promise<string> => {
+  const seed = async (
+    stageId: string,
+    name = `clock-${randomUUID().slice(0, 8)}`,
+  ): Promise<string> => {
     const { rows } = await pool.query<{ id: string }>(
       `INSERT INTO opportunity (workspace_id, stage_id, name, value)
        VALUES ($1, $2, $3, 100) RETURNING id`,
@@ -105,10 +108,9 @@ describe('the stage_decided_at trigger', () => {
     // column exists precisely because updated_at is too coarse to be one.
     const id = await seed(a());
     const before = await clock(id);
-    await pool.query(
-      `UPDATE opportunity SET updated_at = now() + interval '1 day' WHERE id = $1`,
-      [id],
-    );
+    await pool.query(`UPDATE opportunity SET updated_at = now() + interval '1 day' WHERE id = $1`, [
+      id,
+    ]);
     const after = await clock(id);
     expect(after.decided.getTime()).toBe(before.decided.getTime());
     // updated_at really did move, so the assertion above is not vacuous.
@@ -138,10 +140,10 @@ describe('the stage_decided_at trigger', () => {
     // is every manual edit the product makes.
     const id = await seed(a());
     const before = await clock(id);
-    await pool.query(
-      `UPDATE opportunity SET stage_id = $2, updated_at = now() WHERE id = $1`,
-      [id, b()],
-    );
+    await pool.query(`UPDATE opportunity SET stage_id = $2, updated_at = now() WHERE id = $1`, [
+      id,
+      b(),
+    ]);
     const after = await clock(id);
     expect(after.decided.getTime()).toBeGreaterThan(before.decided.getTime());
   });

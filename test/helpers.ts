@@ -115,10 +115,7 @@ export async function provisionWorkspace(label: string): Promise<TestWorkspace> 
  * Without this, teardown fails intermittently and the suite reports a failed run
  * with every test passing, which is a misleading signal.
  */
-export async function withDeadlockRetry<T>(
-  fn: () => Promise<T>,
-  attempts = 6,
-): Promise<T> {
+export async function withDeadlockRetry<T>(fn: () => Promise<T>, attempts = 6): Promise<T> {
   for (let i = 1; ; i++) {
     try {
       return await fn();
@@ -131,9 +128,7 @@ export async function withDeadlockRetry<T>(
 }
 
 export async function destroyWorkspace(workspaceId: string): Promise<void> {
-  await withDeadlockRetry(() =>
-    pool.query('DELETE FROM workspace WHERE id = $1', [workspaceId]),
-  );
+  await withDeadlockRetry(() => pool.query('DELETE FROM workspace WHERE id = $1', [workspaceId]));
 }
 
 /**
@@ -232,10 +227,7 @@ export async function resetBatchTo(
  * stage_workspace_name_uniq is per workspace, and two tests in the same file
  * would otherwise collide.
  */
-export async function createPrivateStage(
-  workspaceId: string,
-  label = 'private',
-): Promise<string> {
+export async function createPrivateStage(workspaceId: string, label = 'private'): Promise<string> {
   const { rows } = await pool.query<{ id: string }>(
     `INSERT INTO stage (workspace_id, name, outcome)
      VALUES ($1, $2, 'open') RETURNING id`,
@@ -344,7 +336,11 @@ export interface JobStatus {
   failedCount: number;
   error: string | null;
   batches: Record<string, number>;
-  deadLettered?: { batches: number; records: number; reasons: { reason: string; batches: number }[] };
+  deadLettered?: {
+    batches: number;
+    records: number;
+    reasons: { reason: string; batches: number }[];
+  };
   startedAt: string | null;
   completedAt: string | null;
 }

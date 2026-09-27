@@ -105,8 +105,10 @@ describe('the build claims a job before walking it', () => {
     }
   };
 
-  const heldClients: Array<{ query: (q: string, v?: unknown[]) => Promise<unknown>; release: () => void }> =
-    [];
+  const heldClients: Array<{
+    query: (q: string, v?: unknown[]) => Promise<unknown>;
+    release: () => void;
+  }> = [];
 
   const releaseLock = async (jobId: string): Promise<void> => {
     for (const c of heldClients.splice(0)) {

@@ -33,7 +33,9 @@ describe('batches hold records instead of rows', () => {
 
   afterAll(async () => {
     await closeWorkerHarness();
-    await withDeadlockRetry(() => pool.query('DELETE FROM workspace WHERE id = $1', [ws.workspaceId]));
+    await withDeadlockRetry(() =>
+      pool.query('DELETE FROM workspace WHERE id = $1', [ws.workspaceId]),
+    );
     await pool.end();
   });
 
@@ -206,11 +208,9 @@ describe('batches hold records instead of rows', () => {
     expect(result.moved).toBe(0);
     expect(result.failed).toBe(3);
 
-    const res = await api<unknown[]>(
-      'http://localhost:3005',
-      `/bulk-moves/${jobId}/failures`,
-      { workspaceId: ws.workspaceId },
-    );
+    const res = await api<unknown[]>('http://localhost:3005', `/bulk-moves/${jobId}/failures`, {
+      workspaceId: ws.workspaceId,
+    });
     expect(res.status).toBe(200);
     // The endpoint answers with the array itself, not an envelope.
     expect(res.body).toHaveLength(3);
@@ -325,9 +325,7 @@ describe('batches hold records instead of rows', () => {
     expect(res.status).toBe(200);
     expect(res.body.deadLettered.batches).toBe(1);
     expect(res.body.deadLettered.records).toBe(5);
-    expect(res.body.deadLettered.reasons).toEqual([
-      { reason: 'attempts exhausted', batches: 1 },
-    ]);
+    expect(res.body.deadLettered.reasons).toEqual([{ reason: 'attempts exhausted', batches: 1 }]);
     // These five records are unmoved, and totalMatched is the honest figure they
     // are measured against - it is not quietly reduced to hide the loss.
     expect(res.body.totalMatched).toBe(5);
@@ -435,11 +433,7 @@ describe('batches hold records instead of rows', () => {
     expect(same.body.replay).toBe(true);
     expect(same.body.jobId).toBe(first.body.jobId);
 
-    const different = await submitBulkMove(
-      ws.workspaceId,
-      { targetStageId: newLead() },
-      key,
-    );
+    const different = await submitBulkMove(ws.workspaceId, { targetStageId: newLead() }, key);
     expect(different.status).toBe(409);
   });
 });

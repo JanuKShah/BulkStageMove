@@ -125,7 +125,10 @@ export class BulkJobRepository {
    * record that it happened, and this is the only way a caller learns of it
    * without paging all fifty batches.
    */
-  async deadLettered(workspaceId: string, jobId: string): Promise<{
+  async deadLettered(
+    workspaceId: string,
+    jobId: string,
+  ): Promise<{
     batches: number;
     records: number;
     reasons: { reason: string; batches: number }[];

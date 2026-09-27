@@ -14,8 +14,6 @@ import { RequestIdMiddleware } from './request-id.middleware';
 @Module({})
 export class RequestContextModule implements NestModule {
   configure(consumer: MiddlewareConsumer): void {
-    consumer
-      .apply(RequestIdMiddleware)
-      .forRoutes({ path: '*path', method: RequestMethod.ALL });
+    consumer.apply(RequestIdMiddleware).forRoutes({ path: '*path', method: RequestMethod.ALL });
   }
 }

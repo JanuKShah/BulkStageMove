@@ -92,9 +92,7 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
           // Left preparing on purpose. The next sweep retries from the cursor, and
           // a job that cannot be built is one an operator should see rather than
           // one that silently completed having moved nothing.
-          this.logger.error(
-            `snapshot build failed for job ${job.id}: ${(error as Error).message}`,
-          );
+          this.logger.error(`snapshot build failed for job ${job.id}: ${(error as Error).message}`);
         }
       }
     } finally {
@@ -187,7 +185,7 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
     if (!job) return;
 
     const filter = parseStoredFilter(job.filter);
-    const query = <T,>(sql: string, params: unknown[]): Promise<T[]> =>
+    const query = <T>(sql: string, params: unknown[]): Promise<T[]> =>
       this.db.query<T>(sql, params);
 
     let cursor: { createdAt: Date; id: string } | null =

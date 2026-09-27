@@ -106,11 +106,7 @@ export class WorkerRepository {
    * Postgres drops the advisory lock when the connection dies, so a killed
    * worker leaves nothing stranded.
    */
-  async processBatch(
-    workspaceId: string,
-    jobId: string,
-    batchNo: number,
-  ): Promise<BatchResult> {
+  async processBatch(workspaceId: string, jobId: string, batchNo: number): Promise<BatchResult> {
     // Timed here rather than inside the work, because the wait for a connection
     // is the one part of a batch that no column records. The claim stamps
     // started_at after it lands, so by the time any row knows this batch was
@@ -264,7 +260,14 @@ export class WorkerRepository {
       // spends the budget records the failure - reporting 'dead' without writing
       // it would dead-letter the message and leave the batch running forever.
       if (attempts >= this.config.maxAttempts) {
-        const failed = await this.failBatch(client, workspaceId, jobId, batchNo, reason, prior.failed);
+        const failed = await this.failBatch(
+          client,
+          workspaceId,
+          jobId,
+          batchNo,
+          reason,
+          prior.failed,
+        );
         return {
           disposition: 'dead',
           moved: 0,

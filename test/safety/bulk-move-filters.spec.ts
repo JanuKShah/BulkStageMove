@@ -66,28 +66,17 @@ describe('a bulk move filters on status, date and value', () => {
               timestamptz '2026-03-01 00:00:00Z' + ($5 + g) * interval '1 day'
          FROM generate_series(1, $6::int) g
        RETURNING id`,
-      [
-        ws.workspaceId,
-        stageId,
-        opts.from ?? 1000,
-        opts.step ?? 100,
-        opts.day ?? 0,
-        count,
-      ],
+      [ws.workspaceId, stageId, opts.from ?? 1000, opts.step ?? 100, opts.day ?? 0, count],
     );
     return rows.map((r) => r.id);
   };
 
   const submit = async (body: Record<string, unknown>): Promise<string> => {
-    const res = await api<{ jobId: string }>(
-      'http://localhost:3005',
-      '/bulk-moves',
-      {
-        method: 'POST',
-        workspaceId: ws.workspaceId,
-        body: JSON.stringify({ idempotencyKey: `bf-${randomUUID()}`, ...body }),
-      },
-    );
+    const res = await api<{ jobId: string }>('http://localhost:3005', '/bulk-moves', {
+      method: 'POST',
+      workspaceId: ws.workspaceId,
+      body: JSON.stringify({ idempotencyKey: `bf-${randomUUID()}`, ...body }),
+    });
     expect(res.status).toBe(201);
     return res.body.jobId;
   };
@@ -181,9 +170,7 @@ describe('a bulk move filters on status, date and value', () => {
     });
     const snap = await waitForSnapshot(ws.workspaceId, jobId);
 
-    const expected = await sqlIds(
-      `stage_id = '${src}' AND value >= 50000 AND value <= 95000`,
-    );
+    const expected = await sqlIds(`stage_id = '${src}' AND value >= 50000 AND value <= 95000`);
     expect(snap.totalMatched).toBe(expected.length);
     expect(snap.totalMatched).toBeGreaterThan(0);
     expect(snap.totalMatched).toBeLessThan(40);

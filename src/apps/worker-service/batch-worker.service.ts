@@ -1,4 +1,10 @@
-import { Inject, Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  Logger,
+  type OnModuleDestroy,
+  type OnModuleInit,
+} from '@nestjs/common';
 import type { ConsumeMessage } from 'amqplib';
 import { RabbitService } from '../../shared/rabbit/rabbit.service';
 import { ms1 } from '../../shared/observability/timing';

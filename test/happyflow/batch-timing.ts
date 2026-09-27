@@ -49,10 +49,13 @@ async function main(): Promise<void> {
 
   const batches: Row[] = rows.map((r) => ({ ...r, gap_ms: 0 }));
   for (let i = 0; i < batches.length; i++) {
-    batches[i]!.gap_ms = i === 0 ? batches[0]!.done_ms : batches[i]!.done_ms - batches[i - 1]!.done_ms;
+    batches[i]!.gap_ms =
+      i === 0 ? batches[0]!.done_ms : batches[i]!.done_ms - batches[i - 1]!.done_ms;
   }
 
-  console.log(`job ${job.id}  ${job.total_matched.toLocaleString()} records in ${batches.length} batches\n`);
+  console.log(
+    `job ${job.id}  ${job.total_matched.toLocaleString()} records in ${batches.length} batches\n`,
+  );
   console.log('batch  records  completed at   gap from previous');
   for (const b of batches) {
     console.log(
@@ -73,17 +76,26 @@ async function main(): Promise<void> {
   console.log(`  mean    ${ms(d.mean)}`);
 
   const total = done[done.length - 1]!;
-  const slowest = gaps.slice().sort((a, b) => b - a).slice(0, 5);
+  const slowest = gaps
+    .slice()
+    .sort((a, b) => b - a)
+    .slice(0, 5);
   console.log(`\nWHOLE JOB (submit -> last batch committed)  ${ms(total)}`);
   console.log(`  records                                  ${job.total_matched.toLocaleString()}`);
-  console.log(`  throughput                               ${Math.round(job.total_matched / (total / 1000)).toLocaleString()} per second`);
+  console.log(
+    `  throughput                               ${Math.round(job.total_matched / (total / 1000)).toLocaleString()} per second`,
+  );
   console.log(`  mean gap between batches                 ${ms(total / batches.length)}`);
   console.log(`  5 slowest gaps                           ${slowest.map((g) => ms(g)).join(', ')}`);
 
   const head = gaps.slice(0, Math.ceil(gaps.length / 2));
   const tail = gaps.slice(Math.ceil(gaps.length / 2));
-  console.log(`\n  first half of the gaps  mean ${ms(head.reduce((a, b) => a + b, 0) / head.length)}`);
-  console.log(`  second half of the gaps mean ${ms(tail.reduce((a, b) => a + b, 0) / tail.length)}`);
+  console.log(
+    `\n  first half of the gaps  mean ${ms(head.reduce((a, b) => a + b, 0) / head.length)}`,
+  );
+  console.log(
+    `  second half of the gaps mean ${ms(tail.reduce((a, b) => a + b, 0) / tail.length)}`,
+  );
 
   void percentile;
   await pool.end();

@@ -161,7 +161,13 @@ describe('bulk-moves endpoints', () => {
         [job.body.jobId],
       );
       for (const r of rows) {
-        await recordJobTransition(ws.workspaceId, job.body.jobId, r.opportunity_id, null, newLead());
+        await recordJobTransition(
+          ws.workspaceId,
+          job.body.jobId,
+          r.opportunity_id,
+          null,
+          newLead(),
+        );
       }
 
       const res = await api<{

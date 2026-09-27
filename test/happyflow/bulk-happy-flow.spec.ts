@@ -46,7 +46,10 @@ describe('submit pages over rows sharing a created_at', () => {
     // - and settleJob takes a row lock on bulk_job that this delete needs. The
     // two deadlock, Postgres kills one, and the suite fails after every test in it
     // has already passed. Same reason every other suite's teardown retries.
-    if (ws) await withDeadlockRetry(() => pool.query('DELETE FROM workspace WHERE id = $1', [ws.workspaceId]));
+    if (ws)
+      await withDeadlockRetry(() =>
+        pool.query('DELETE FROM workspace WHERE id = $1', [ws.workspaceId]),
+      );
   });
 
   it('snapshots every matching record, not just the first page', async () => {

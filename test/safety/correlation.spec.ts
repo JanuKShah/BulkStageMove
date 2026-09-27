@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { api, pool, provisionWorkspace, withDeadlockRetry, type TestWorkspace } from '../helpers';
-import { acceptOrMintRequestId, currentRequestId, newRequestId } from '../../src/shared/http/request-context';
+import {
+  acceptOrMintRequestId,
+  currentRequestId,
+  newRequestId,
+} from '../../src/shared/http/request-context';
 import { REQUEST_ID_HEADER } from '../../src/shared/http/request-id.middleware';
 import { ServiceCallError } from '../../src/shared/http/service-client';
 
