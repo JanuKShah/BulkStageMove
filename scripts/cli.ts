@@ -76,8 +76,20 @@ const indent = (text: string): string =>
 
 const rl = createInterface({ input: stdin, output: stdout });
 
+/**
+ * Asks one question and returns the trimmed answer.
+ *
+ * The trailing space is added here rather than at each call site. Half the
+ * prompts in this file ended with one and half did not, so typing an answer ran
+ * straight into the question text on some and not others, and there was no way to
+ * tell from reading a call site whether it had been handled. Normalising in one
+ * place means a new prompt cannot get it wrong.
+ *
+ * Trailing whitespace is stripped first, so a call site that already supplies a
+ * space does not end up with two.
+ */
 async function ask(question: string): Promise<string> {
-  const answer = (await rl.question(question)).trim();
+  const answer = (await rl.question(question.trimEnd() + ' ')).trim();
   return answer;
 }
 
@@ -261,24 +273,170 @@ function renderJobTransitions(reply: Reply): void {
   console.log(`  nextCursor: ${body.nextCursor ?? '(none)'}`);
 }
 
+/**
+ * A job as GET /bulk-moves/:id returns it.
+ *
+ * The batch counts are named `batches`, not `items`. Reading `items` compiled
+ * fine and threw at runtime on every call, because the field the API sends has
+ * never been called that: the type was declared here rather than derived from the
+ * response, so nothing checked the two against each other.
+ *
+ * There is no record-level progress in this shape. `batches` counts the 50 batch
+ * rows and `failedCount` counts records, but the records that *succeeded* are only
+ * in the database's processed_count, which the endpoint does not return. Anything
+ * showing a per-record figure here would be guessing from the batch size.
+ */
+interface JobStatus {
+  id: string;
+  status: string;
+  totalMatched: number;
+  failedCount: number;
+  error: string | null;
+  snapshotInProgress: boolean;
+  batches: { pending: number; running: number; completed: number; failed: number };
+  deadLettered: { batches: number; records: number; reasons: string[] };
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
 /** Renders a job's counts. Shared so the two modes cannot drift. */
 function renderJobStatus(reply: Reply): void {
   print(reply, 'bulk job');
   if (reply.status >= 400) return;
-  const b = reply.body as {
-    status: string;
-    totalMatched: number;
-    failedCount: number;
-    error: string | null;
-    items: Record<string, number>;
-  };
-  const done = (b.items['completed'] ?? 0) + (b.items['failed'] ?? 0);
-  console.log(`  progress: ${done}/${b.totalMatched}  status=${b.status}`);
-  if (b.error) console.log(`  error:    ${b.error}`);
-  const failed = b.items['failed'] ?? 0;
-  if (failed > 0) {
-    console.log(`\n  ${failed} record(s) did not move and are listed individually.`);
+  const b = reply.body as JobStatus;
+  const settled = b.batches.completed + b.batches.failed;
+  const total = b.batches.pending + b.batches.running + settled;
+  console.log(
+    `  batches:   ${settled}/${total} settled` +
+      (b.batches.running ? `  ${b.batches.running} running` : '') +
+      (b.batches.pending ? `  ${b.batches.pending} pending` : ''),
+  );
+  console.log(`  records:   ${b.totalMatched} matched, ${b.failedCount} failed`);
+  console.log(`  status:    ${b.status}`);
+  if (b.error) console.log(`  error:     ${b.error}`);
+  if (b.deadLettered.batches > 0) {
+    console.log(
+      `  dead letter: ${b.deadLettered.batches} batch(es), ` +
+        `${b.deadLettered.records} record(s) never attempted`,
+    );
+  }
+  if (b.failedCount > 0) {
+    console.log(`\n  ${b.failedCount} record(s) did not move and are listed individually.`);
     console.log('  The rest of each batch still applied. See them with: job-failures');
+  }
+}
+
+/** A status is finished when nothing is left that a worker could still take. */
+function isSettled(b: JobStatus): boolean {
+  const terminal = b.status === 'completed' || b.status === 'failed';
+  return terminal && b.batches.pending === 0 && b.batches.running === 0;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Polls a job every couple of seconds until it settles.
+ *
+ * Two seconds because that is the shortest interval that is still free: the sweep
+ * and the relay both tick every 125 ms, so a job submitted now has usually begun
+ * batching before the first poll, and by the time a caller is asking about a
+ * 50,000-record job the interesting part is the drain. Polling faster would report
+ * the same number more often.
+ *
+ * Progress is drawn in place on a terminal and appended line by line when piped,
+ * so the same command is readable live and readable in a log or a CI transcript.
+ *
+ * The timeout is not optional. A job whose worker died mid-flight stays `running`
+ * forever, and a watcher that never returns is indistinguishable from a hung one.
+ */
+async function watchJob(jobId: string, intervalMs: number, timeoutMs: number): Promise<void> {
+  const interactive = process.stdout.isTTY === true;
+  const started = Date.now();
+  let line = '';
+
+  for (;;) {
+    const reply = await cmdJobStatus(jobId);
+    if (reply.status === 404) {
+      console.log(`  no such job in this workspace: ${jobId}`);
+      return;
+    }
+    if (reply.status >= 400) {
+      print(reply, 'bulk job');
+      return;
+    }
+
+    const b = reply.body as JobStatus;
+    const elapsed = (Date.now() - started) / 1000;
+    // Rate is per batch, not per record: the endpoint does not return how many
+    // records have moved, only how many batches have settled, so a record rate
+    // here would be the batch size multiplied by guesswork.
+    //
+    // Suppressed for the first second. Over 0.1s the divisor is small enough that
+    // the quotient is mostly the shape of the poll - it reads as hundreds per
+    // second and then collapses, which looks like a stall rather than a start.
+    const settled = b.batches.completed + b.batches.failed;
+    const total = b.batches.pending + b.batches.running + settled;
+    const rate = elapsed >= 1 ? `${(settled / elapsed).toFixed(1)} batches/s` : '  -  ';
+
+    // While the snapshot is building there are no batches and totalMatched is
+    // still zero, so a percentage would be 0/0. Say what is actually happening
+    // instead of printing a bar that never moves.
+    const progress = b.snapshotInProgress
+      ? 'batching the filter'
+      : `${settled}/${total} batches  ${b.batches.running} running  ` +
+        `${b.batches.pending} pending`;
+
+    const next =
+      `  ${elapsed.toFixed(1).padStart(6)}s  ${b.status.padEnd(10)}  ${progress}  ${rate}` +
+      (b.failedCount > 0 ? `  ${b.failedCount} failed` : '');
+
+    if (interactive) {
+      // Pad to the previous width so the shorter line cannot leave debris.
+      line = next.padEnd(Math.max(line.length, next.length));
+      process.stdout.write(`\r${line}`);
+    } else {
+      console.log(next);
+    }
+
+    if (isSettled(b)) {
+      if (interactive) process.stdout.write('\n');
+      const secs = (Date.now() - started) / 1000;
+      console.log(
+        `\n  ${b.status} in ${secs.toFixed(1)}s  ` +
+          `${settled} batch(es), ${b.totalMatched} matched, ${b.failedCount} failed`,
+      );
+      if (b.error) console.log(`  error: ${b.error}`);
+      if (b.deadLettered.batches > 0) {
+        console.log(
+          `  ${b.deadLettered.batches} batch(es) dead-lettered, ` +
+            `${b.deadLettered.records} record(s) never attempted`,
+        );
+      }
+      if (b.failedCount > 0) {
+        console.log(`  see them with: job-failures --id=${jobId}`);
+      }
+      return;
+    }
+
+    const remaining = timeoutMs - (Date.now() - started);
+    if (remaining <= 0) {
+      if (interactive) process.stdout.write('\n');
+      // The elapsed time, not the configured bound: at 300 ms a bound rendered to
+      // whole seconds reads as "after 0s", which looks like it gave up instantly.
+      const gave = ((Date.now() - started) / 1000).toFixed(1);
+      console.log(
+        `\n  still ${b.status} after ${gave}s, giving up.` +
+          '  The job is not cancelled - it keeps running. Check it with job-status.',
+      );
+      return;
+    }
+
+    // Capped by what is left of the budget. Sleeping the full interval past the
+    // deadline means the check above is never reached, so a timeout shorter than
+    // one poll interval would silently never fire - which is the one case where
+    // the caller asked for a bound and did not get one.
+    await sleep(Math.min(intervalMs, remaining));
   }
 }
 
@@ -453,12 +611,22 @@ const COMMANDS: Record<
     if (result.status < 400) {
       const body = result.body as { jobId?: string };
       if (body.jobId)
-        console.log(`\n  follow it with:  npm run cli -- job-status --id=${body.jobId}`);
+        console.log(`\n  watch it with:  npm run cli -- job-watch --id=${body.jobId}`);
     }
   },
   'job-status': async (args) => {
     if (!args.id) throw new Error('usage: job-status --id=<uuid>');
     renderJobStatus(await cmdJobStatus(args.id));
+  },
+  'job-watch': async (args) => {
+    if (!args.id) throw new Error('usage: job-watch --id=<uuid> [--interval=ms] [--timeout=ms]');
+    const interval = Number(args.interval);
+    const timeout = Number(args.timeout);
+    await watchJob(
+      args.id,
+      Number.isFinite(interval) && interval >= 250 ? interval : 2000,
+      Number.isFinite(timeout) && timeout > 0 ? timeout : 300_000,
+    );
   },
   'job-transitions': async (args) => {
     if (!args.id) throw new Error('usage: job-transitions --id=<uuid> [--limit=N]');
@@ -536,6 +704,8 @@ const OPTION_SPEC = {
   sample: { type: 'string' },
   id: { type: 'string' },
   key: { type: 'string' },
+  interval: { type: 'string' },
+  timeout: { type: 'string' },
 } as const;
 
 async function runDirect(argv: string[]): Promise<void> {
@@ -699,7 +869,7 @@ async function interactiveMenu(): Promise<void> {
         print(result, 'bulk-moves');
         const body = result.body as { jobId?: string; replay?: boolean } | null;
         if (result.status < 400 && body?.jobId) {
-          console.log(`  track it with:  job-status  ${body.jobId}`);
+          console.log(`  watch it with:  job-watch  ${body.jobId}`);
         }
       },
     },
@@ -708,6 +878,16 @@ async function interactiveMenu(): Promise<void> {
       label: 'check bulk job status',
       run: async () => {
         renderJobStatus(await cmdJobStatus(await askUuid('  job id: ')));
+      },
+    },
+    {
+      key: 'jobwatch',
+      label: 'watch a bulk job until it finishes',
+      run: async () => {
+        const id = await askUuid('  job id: ');
+        const raw = await askOptional('  poll interval ms (blank = 2000)');
+        const interval = raw ? Number(raw) : 2000;
+        await watchJob(id, Number.isFinite(interval) && interval >= 250 ? interval : 2000, 300_000);
       },
     },
     {
