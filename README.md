@@ -120,7 +120,7 @@ later step reads it or the rows it produces, and nothing is held in memory.
 | # | check | if it fires |
 |---|---|---|
 | 1 | the record still exists | **fail** — deleted since the batch was built |
-| 2 | it is **not already in the target stage** | count as **moved** |
+| 2 | it is **already in the target stage** | count as **moved** |
 | 3 | `record.stage_decided_at <= job.snapshot_at` | **skip** — somebody decided after this job was submitted |
 | 4 | it is still in a stage the filter names | **skip** — it left scope |
 | 5 | its current stage has a permitted transition to the target | **fail** — no permitted move |
@@ -157,7 +157,9 @@ Both are in the database, not process memory, so a second replica is excluded to
 
 **Redis — considered, added, then removed.** Every piece of state is either durable in Postgres or per-process, so there is nothing a cache could hold that is safe to cache.
 
-**`opportunity.version` — the one concurrency gap left open.** `stage_decided_at` covers job-versus-record; two people editing the same deal is the other half, and the second save silently wins.
+**Six services, not one per noun in the domain.** The brief's diagram implies more — separate transition, opportunity, user and stage servers. They are here, but the split is by *write ownership*, not by entity: `transition-service` owns the job lifecycle, `opportunity-service` owns deals, and the other three are thin. Splitting further would add a network hop and a shared-database contract to every call while the only cross-service traffic today is a handful of `stage-service` lookups per request. Worth revisiting when a service needs its own database, not its own noun.
+
+**`opportunity.version` — not added, because there is no UI.** `stage_decided_at` covers job-versus-record; two people editing the same deal is the other half, and the second save silently wins. The fix is a `version integer` with `WHERE version = $expected`, rejecting the later save with a 409 — but it is only observable when two humans edit one record at once, and there is no UI here to do that. A bulk job must never bump it either, or a job moving 1,000 records would hand every user a 409 about a field they never edited.
 
 **No rate limit on submit.** Nothing bounds how many jobs one tenant can create, and async submission made that cheap to spam.
 
@@ -213,16 +215,14 @@ docker compose logs -f transition-service # batching, per page, and the relay
 
 ## Tests
 
-| suite | what it protects |
+**216 tests across 19 suites** — see **[`TESTSTRATEGY.md`](TESTSTRATEGY.md)** for what each one covers and why.
+
+| command | |
 |---|---|
-| `safety` | one test per safety mechanism — the ones that go red if a guard, constraint or trigger clause is removed |
-| `endpoints` | every route and its failure paths |
-| `happyflow` | the whole brief at full scale: one 50,000 record job end to end through the broker |
+| `npm test` | all 216, in band |
+| `npm run test:safety` | the ones that go red when a guard is removed |
+| `npm run test:endpoints` / `:happyflow` | routes and failure paths / one 50,000 record job end to end |
 
-No test asserts a timing. Wall-clock assertions fail on a loaded machine and
-pass on a fast one; the numbers live in `BENCHMARKS.md` and the measurement lives
-in `benchmark.ts`.
-
-Several safety tests are written to **fail when the thing they protect is
-removed** — the `stage_decided_at` trigger's two `WHEN` clauses, batching's
-advisory claim, the worker's compare-and-swap. That is checked, not assumed.
+No test asserts a timing. Wall-clock assertions fail on a loaded machine and pass
+on a fast one; the numbers live in `BENCHMARKS.md` and the measurement lives in
+`benchmark.ts`.

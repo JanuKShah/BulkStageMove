@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
+import { basename } from 'node:path';
 import { dumpDatabase } from './dump-db';
 import { databaseUrl } from './env';
 
@@ -113,7 +114,61 @@ async function askNumber(question: string): Promise<number | undefined> {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-// ---------------------------------------------------------------- rendering
+/**
+ * Every workspace in the database, read from Postgres rather than the API.
+ *
+ * There is deliberately no endpoint that enumerates workspaces: a caller must not
+ * be able to discover other tenants' identities by asking. That reasoning is about
+ * the *API*, though, and does not extend to a local developer tool that already
+ * holds the database credentials — `dump-db` reads every table in here for the
+ * same reason. So this lists what is in the database and adds no route.
+ *
+ * Returns [] rather than throwing when the database is unreachable, because the
+ * caller may already have a workspace id from a flag and not need this at all.
+ */
+async function listWorkspaces(): Promise<Array<{ id: string; name: string; count: number }>> {
+  try {
+    const { Pool } = await import('pg');
+    const pool = new Pool({ connectionString: databaseUrl(), max: 1 });
+    try {
+      const { rows } = await pool.query<{ id: string; name: string; count: string }>(
+        `SELECT w.id, w.name, count(o.id)::text AS count
+           FROM workspace w
+           LEFT JOIN opportunity o ON o.workspace_id = w.id
+          GROUP BY w.id, w.name
+          ORDER BY w.created_at`,
+      );
+      return rows.map((r) => ({ id: r.id, name: r.name, count: Number(r.count) }));
+    } finally {
+      await pool.end();
+    }
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Shows the workspaces that exist, so an interactive user can pick one by number
+ * instead of copying a uuid out of a terminal.
+ *
+ * Only shown in interactive mode with no workspace already resolved. Once
+ * --workspace or WORKSPACE_ID has named a tenant, listing the others is noise, and
+ * in a scripted run it would be output nobody asked for.
+ */
+async function showWorkspaces(): Promise<void> {
+  const found = await listWorkspaces();
+  if (found.length === 0) {
+    console.log('  no workspaces in the database. run "npm run seed" to create one.');
+    return;
+  }
+  console.log(`\n  ${found.length} workspace(s):`);
+  found.forEach((w, i) => {
+    console.log(`    ${i + 1}. ${w.name}  (${w.count} opportunities)  ${w.id}`);
+  });
+  console.log('  type a number, or paste a uuid.');
+}
+
+/** ---------------------------------------------------------------- rendering */
 
 /**
  * The workspace id is always supplied by the caller - via --workspace, the
@@ -142,9 +197,36 @@ async function resolveWorkspaceId(interactive: boolean): Promise<boolean> {
     );
     return false;
   }
-  const entered = await askUuid('workspace id: ');
+  const entered = await askWorkspaceChoice();
   currentWorkspace = entered;
   return true;
+}
+
+/**
+ * Prompts for a workspace, offering the ones that exist by number.
+ *
+ * Accepting a number is the point: a uuid is 36 characters that have to be copied
+ * by hand, and a typo is only caught by the API rejecting it. A number cannot be
+ * mistyped, and the uuid is printed beside it either way.
+ */
+async function askWorkspaceChoice(): Promise<string> {
+  await showWorkspaces();
+  for (;;) {
+    const answer = await ask('workspace: ');
+    const trimmed = answer.trim();
+    if (trimmed === '') continue;
+    if (/^\d+$/.test(trimmed)) {
+      const found = await listWorkspaces();
+      const picked = found[Number(trimmed) - 1];
+      if (!picked) {
+        console.log(`  there is no workspace ${trimmed} - pick 1-${found.length}`);
+        continue;
+      }
+      return picked.id;
+    }
+    if (UUID_RE.test(trimmed)) return trimmed;
+    console.log('  not a number or a uuid');
+  }
 }
 
 // ---------------------------------------------------------------- commands
@@ -946,12 +1028,44 @@ async function interactiveMenu(): Promise<void> {
 
 // ---------------------------------------------------------------- entry
 
+/**
+ * Writes db-state.txt before the menu opens.
+ *
+ * Interactive only. A scripted `npm run cli -- job-status --id=...` has a caller
+ * reading stdout for one value, and a multi-megabyte file appearing first would
+ * corrupt anything parsing it. The menu is a human, so a snapshot of the database
+ * as it was when they sat down is worth the second it costs.
+ *
+ * Capped at 200 rows per section, because the benchmark dataset holds 500,000
+ * opportunities and an uncapped dump would be hundreds of megabytes of text no one
+ * is going to read. Row counts are always exact, so the cap is visible rather than
+ * silent. The uncapped dump stays one flag away: the dump-db command.
+ *
+ * Failure is reported and then ignored. A missing snapshot is worth mentioning
+ * once; it is not worth refusing to open a menu over.
+ */
+async function dumpOnLaunch(): Promise<void> {
+  try {
+    const result = await dumpDatabase({
+      out: 'db-state.txt',
+      samplePerSection: 200,
+      databaseUrl: databaseUrl(),
+    });
+    console.log(`  database snapshot: ${basename(result.file)} (${result.bytes} bytes)`);
+    console.log('    run "npm run dump" for every row, or diff before/after a bulk move.');
+  } catch (error) {
+    console.log(`  could not write db-state.txt: ${(error as Error).message}`);
+    console.log('    is postgres up?  "npm run up"');
+  }
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv.length > 0) {
     await runDirect(argv);
     return;
   }
+  await dumpOnLaunch();
   await interactiveMenu();
 }
 

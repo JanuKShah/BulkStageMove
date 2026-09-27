@@ -20,6 +20,16 @@ export interface DumpOptions {
   databaseUrl: string;
 }
 
+/**
+ * Every table, for the row-count summary at the top.
+ *
+ * Kept in step with the migrations by hand, which is exactly how `bulk_job_item`
+ * came to be listed here long after the table was dropped: the first `count(*)`
+ * against it threw, the whole dump aborted, and the CLI reported "could not write
+ * db-state.txt" as though the database were down. So this list is the one place
+ * that has to match the schema, and it is checked rather than trusted - see the
+ * to_regclass guard in dumpDatabase.
+ */
 const TABLES = [
   'workspace',
   'app_user',
@@ -28,7 +38,8 @@ const TABLES = [
   'opportunity',
   'opportunity_transition',
   'bulk_job',
-  'bulk_job_item',
+  'bulk_job_outbox',
+  'bulk_job_failure',
 ] as const;
 
 type Row = Record<string, unknown>;
@@ -73,12 +84,35 @@ export async function dumpDatabase(options: DumpOptions): Promise<{ file: string
     parts.push(`database  : ${options.databaseUrl.replace(/:[^:@/]*@/, ':***@')}`);
     parts.push('');
 
+    // to_regclass rather than a bare count(*), so a table listed above that the
+    // migrations have since dropped is reported rather than thrown on. One missing
+    // name used to abort the whole dump, which is how a dead table went unnoticed
+    // for so long: the only symptom was a generic "could not write db-state.txt".
     const countRows: Row[] = [];
+    const missing: string[] = [];
     for (const t of TABLES) {
+      const present = await client.query<{ ok: string | null }>(
+        'SELECT to_regclass($1)::text AS ok',
+        [t],
+      );
+      if (present.rows[0]!.ok === null) {
+        missing.push(t);
+        countRows.push({ table: t, rows: 'table does not exist' });
+        continue;
+      }
       const r = await client.query<{ n: string }>(`SELECT count(*)::text AS n FROM ${t}`);
       countRows.push({ table: t, rows: r.rows[0]!.n });
     }
     parts.push(section('ROW COUNTS', table(countRows, ['table', 'rows'])));
+    if (missing.length > 0) {
+      // Said out loud, because a silently short table list is how a dump stops
+      // being trustworthy without anyone noticing.
+      parts.push(
+        `\n  NOTE: listed in the dump's table list but absent from the database: ` +
+          `${missing.join(', ')}. The list in scripts/dump-db.ts is out of step ` +
+          `with the migrations.\n`,
+      );
+    }
 
     const workspaces = await client.query(
       'SELECT id, name, created_at FROM workspace ORDER BY created_at',
