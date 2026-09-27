@@ -1,0 +1,42 @@
+-- 0007_preparing_sweep_index.sql
+--
+-- Index for the snapshot sweep: WHERE status = 'preparing' ORDER BY created_at
+-- LIMIT 5.
+--
+-- The sweep is on a 250ms timer and runs for the life of the process, whether or
+-- not anyone is submitting. That is what makes an ordinary small-table query worth
+-- indexing: it is not a cost paid per job, it is a standing cost paid 4 times a
+-- second forever, and it grows with the total number of jobs ever created because
+-- job rows are never deleted.
+--
+-- Measured at 200,000 job rows (69 MB), same host as the benchmark:
+--   without   parallel seq scan, 200,000 rows filtered, 2 workers launched
+--             45.8ms
+--   with      index scan, no sort
+--             0.091ms
+--
+-- Two things make the unindexed plan worse than the raw number suggests. It
+-- launches parallel workers to scan the table for a status that normally matches
+-- nothing, so on a 12-core host it contends with the work being measured rather
+-- than idling alongside it. And it gets linearly worse as the system succeeds, so
+-- the busiest deployments pay the most for a query that returns zero rows.
+--
+-- The column order is the point. (created_at), not (status): the sweep orders by
+-- created_at and stops at five rows, so an index on created_at returns them in
+-- order with no sort at all. An index on status would filter correctly and still
+-- sort, which is most of the cost this exists to remove.
+--
+-- The index is partial, so its size tracks the number of jobs currently building
+-- rather than the number that exist. At 200,000 completed jobs it holds zero rows.
+-- Write cost is about three operations per job - one insert, one leaving
+-- 'preparing' when the build finishes - against a text column, so it is not worth
+-- measuring separately.
+--
+-- This is the same index the outbox already has, on the same timer-driven query
+-- shape: bulk_job_outbox_unpublished_idx ON bulk_job_outbox (created_at) WHERE
+-- published_at IS NULL. That table is the hotter of the two, growing 50 rows per
+-- job, and it was indexed. This one was missed.
+
+CREATE INDEX bulk_job_preparing_idx
+    ON bulk_job (created_at)
+    WHERE status = 'preparing';
