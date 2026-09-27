@@ -28,6 +28,10 @@ crosses.
 - Every stage change is recorded as a **transition**.
 - `opportunity.stage_decided_at` is a **logical clock**: a person's edit stamps the wall clock, a bulk job stamps its own submission time, and a rename or value edit changes nothing.
   A job skips any record whose clock is newer than its submission, so a manual edit is never overwritten and the newest job wins however long the older one takes.
+  It covers job-versus-record only, and needs no synchronised clocks — every timestamp in the comparison comes from the one Postgres, never from a worker's own clock.
+  Two people editing the same record is the gap it deliberately does not cover: there is no `version` column, so the second save silently wins.
+  The natural fix is a `version integer` counter with `WHERE version = $expected` on the single-record move, rejecting the **later** save with a 409.
+  The bulk job must never bump it — a job moving 1,000 records would bump 1,000 versions and hand every user with one of them open a 409 about a field they never edited — so the two mechanisms stay independent.
 
 ## Technology
 
