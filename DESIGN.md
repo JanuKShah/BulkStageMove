@@ -20,63 +20,23 @@ After step 1 the job row is the only thing that exists; nothing is held in memor
 
 ## 1. Chunking, and surviving a restart
 
-**Submit writes one row.** A single `bulk_job` row, stamped `now()`, left in
-`preparing`. Nothing is counted or listed at this point.
-
-**The index makes paging cheap.** `opportunity_workspace_created_id_idx` on
-`(workspace_id, created_at, id)`. A page is a contiguous range of that index, so
-each page is a seek rather than a scan.
-
-**The sweep does the walking.** Every 125 ms it picks up jobs sitting in
-`preparing`, and for each one reads the last cursor, then writes the next 1,000
-matching ids as a single batch. It repeats until nothing matches, then the job
-moves to `pending`. Submitting also calls the sweep directly, so a fresh job does
-not wait for the timer.
-
-**The cursor is stored after every batch, in the same transaction as the batch
-itself.** That one rule is the whole restart story. A cursor ahead of its batch
-would skip records on resume. A cursor behind it would duplicate them. One
-transaction cannot do either.
-
-**A half-built job is finished, not restarted.** If the walk dies at batch 10 of
-50, the job is still `preparing`, so the next sweep reads the cursor and carries
-on from batch 11. The batches already written keep draining in the meantime.
-
-**No `OFFSET` anywhere in this path.** It re-reads and discards every row it
-skips, so the sweep would slow down the further it got. The worker does not page
-at all; it reads the ids off its own batch row.
+- **Submit writes one row:** `now()`, status `preparing`.
+- **Index** `(workspace_id, created_at, id)`, so a page is an index range, not a scan.
+- **The sweep** every 125 ms takes `preparing` jobs, reads the last cursor, writes the next 1,000 ids as one batch, until nothing matches.
+- **The cursor is stored after every batch, in the same transaction as the batch.** Ahead skips records, behind duplicates them.
+- **A half-built job resumes, it does not restart.** Still `preparing`, so the next sweep carries on from the cursor. Written batches keep draining.
+- **No `OFFSET` here.** It re-reads every row it skips. The worker does not page at all.
 
 ## 2. Idempotency
 
-**The caller supplies the key.** It goes on the job row and the database enforces
-it: `UNIQUE (workspace_id, idempotency_key)`. The same key in the same workspace
-cannot be inserted twice, whatever the application does.
-
-**On submit, we look the key up first.** If no job has it, this is a new
-submission and we insert one. If a job already has it, we do not insert anything.
-
-**Then we compare.** The stored job's target stage, and its stored filter, against
-the ones in this request:
-
-- **Both match**, so this is the same request arriving twice. We return the
-  original `jobId` and create nothing. A client that retries after a timeout gets
-  one job, not two.
-- **Either differs**, so the caller has reused a key for something else. We
-  return **409** and change nothing. Silently reusing the old job would run a
-  filter the caller did not ask for.
-
-**The filter is compared after it is resolved.** `outcome=won` is turned into the
-list of stage ids it means before it is stored or compared, so two spellings of
-the same request match, and `outcome=won` cannot be compared against a different
-spelling of itself.
-
-**The key is never freed.** It is a column on the row, nothing prunes completed
-jobs, and there is no delete route, so a key stays taken for as long as its job
-exists. That is the cost of never mistaking a retry for a new request.
-
-**What this does not catch:** the same intent sent under a different key. A client
-that generates a fresh uuid per attempt gets a new job each time, and nothing here
-can tell that apart from a deliberate re-run.
+- **Key:** caller-supplied, on the job row. `UNIQUE (workspace_id, idempotency_key)`.
+- **Submit looks the key up.** No match: insert. Match: insert nothing.
+- **Then compare** the stored job's target stage and filter against the request.
+- **Both match:** a retry. Return the same `jobId`, create nothing.
+- **Either differs:** the key was reused for something else. **409**, change nothing.
+- **The filter is compared resolved.** `outcome=won` becomes stage ids first, so two spellings of one request match.
+- **Keys are never freed.** A column on the row, and there is no delete route.
+- **The gap:** the same intent under a new key. A fresh uuid per attempt looks like a deliberate re-run.
 
 ## 3. Concurrency on one opportunity
 
