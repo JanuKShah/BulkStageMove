@@ -71,9 +71,23 @@ const DEFAULTS: RabbitConfig = {
   deadLetterMaxLength: 10_000,
   heartbeatSeconds: 30,
   consumerConcurrency: 12,
-  snapshotSweepIntervalMs: 250,
+  // 125 ms rather than 250, halved to cut the floor on a small job. A job waits
+  // one sweep tick before its first batch exists and one relay tick before any of
+  // it is published, so the expected wait is the sum of the two, and that sum is
+  // most of the wall clock below ~15,000 records - measured 386-470 ms to settle
+  // 5,000 records, against under 100 ms of actual work.
+  //
+  // It is a mitigation, not a fix: polling still imposes a wait, and halving the
+  // interval only halves it. What makes the tighter tick cheap is that both polls
+  // are index scans that usually return nothing - the sweep reads
+  // bulk_job_preparing_idx and the relay reads bulk_job_outbox_unpublished_idx,
+  // itself a partial index over `WHERE published_at IS NULL`, so a tick with no
+  // work behind it touches one index entry and nothing else. Going below this
+  // would need a real wake-up rather than a shorter wait, since the cost stops
+  // being free somewhere below the tick itself.
+  snapshotSweepIntervalMs: 125,
   snapshotSweepLimit: 25,
-  relayIntervalMs: 250,
+  relayIntervalMs: 125,
   relayBatchSize: 50,
 };
 
