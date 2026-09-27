@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { DatabaseService } from '../../shared/database/database.service';
+import { isUniqueViolation } from '../../shared/database/unique-violation';
 import { ServiceClient } from '../../shared/http/service-client';
 import { currentRequestId } from '../../shared/http/request-context';
 import { parseListFilter, type Outcome } from '../../shared/filter/opportunity-filter';
@@ -86,38 +87,42 @@ export class TransitionService {
 
     // The key identifies one logical submission. Reusing it for a different
     // request is a client bug, so it is rejected rather than silently accepted.
-    //
-    // This pre-check cannot see concurrent duplicates: callers racing on the
-    // same key all read "not found" and only one insert wins, so the losers fall
-    // through to the unique constraint and surface as a 500. Serialising
-    // submissions properly is deferred to a distributed lock. Until then the
-    // data-layer guarantee still holds - the constraint prevents the double
-    // move - but the status code is wrong, which test/endpoints/idempotency-race
-    // .spec.ts records.
     const existing = await this.jobs.findByIdempotencyKey(workspaceId, key);
     if (existing) {
-      const sameTarget = existing.target_stage_id === targetStageId;
-      const sameFilter = JSON.stringify(existing.filter) === JSON.stringify(canonical);
-      if (sameTarget && sameFilter) {
-        // A retry of the same submission. Returning the existing job is what
-        // makes the retry safe rather than a second 50,000-row move.
-        return { job: existing, created: false, itemsCreated: 0 };
-      }
-      throw new ConflictException(
-        'idempotencyKey was already used for a different filter or target stage',
-      );
+      return this.replayOrConflict(existing, targetStageId, canonical);
     }
 
-    const job = await this.jobs.create({
-      workspaceId,
-      idempotencyKey: key,
-      filter: canonical,
-      targetStageId,
-      // Read from the request's async context and stored on the row, because the
-      // build that runs after this returns is outside that context entirely. This
-      // is the join between "someone POSTed this" and "the batches were written".
-      correlationId: currentRequestId(),
-    });
+    let job: BulkJob;
+    try {
+      job = await this.jobs.create({
+        workspaceId,
+        idempotencyKey: key,
+        filter: canonical,
+        targetStageId,
+        // Read from the request's async context and stored on the row, because the
+        // build that runs after this returns is outside that context entirely. This
+        // is the join between "someone POSTed this" and "the batches were written".
+        correlationId: currentRequestId(),
+      });
+    } catch (error) {
+      // A caller that raced a winner on the same key got past the pre-check above,
+      // because both read "not found" before either inserted. The constraint is
+      // what actually prevents the double move; this is only about reporting it as
+      // a replay rather than as a server fault.
+      //
+      // Scoped to this constraint by name, so any other unique violation - the
+      // primary key, say - still propagates as the 500 it is.
+      if (!isUniqueViolation(error, 'bulk_job_workspace_idempotency_uniq')) throw error;
+
+      // Postgres blocks the conflicting insert until the other transaction
+      // resolves, so a violation means that transaction committed and its row is
+      // visible to us now. The null check is unreachable, and rethrowing beats
+      // inventing an answer: if it ever were null, the honest report is the
+      // violation we were actually given.
+      const winner = await this.jobs.findByIdempotencyKey(workspaceId, key);
+      if (!winner) throw error;
+      return this.replayOrConflict(winner, targetStageId, canonical);
+    }
 
     // Kick the build without waiting for it. The sweep would pick the job up
     // anyway, and doing it here as well only removes the wait for the common case
@@ -125,6 +130,31 @@ export class TransitionService {
     void this.builder.sweep();
 
     return { job, created: true, itemsCreated: 0 };
+  }
+
+  /**
+   * Decides what a key that is already on a job means.
+   *
+   * The same request is a retry and gets the job back; a different one is a
+   * client bug and is refused. Shared by the pre-check and the race path so both
+   * answer identically - a replay must not depend on whether the caller happened
+   * to race, or the same request would get two different answers.
+   */
+  private replayOrConflict(
+    existing: BulkJob,
+    targetStageId: string,
+    canonical: Record<string, unknown>,
+  ): SubmitResult {
+    const sameTarget = existing.target_stage_id === targetStageId;
+    const sameFilter = JSON.stringify(existing.filter) === JSON.stringify(canonical);
+    if (sameTarget && sameFilter) {
+      // A retry of the same submission. Returning the existing job is what
+      // makes the retry safe rather than a second 50,000-row move.
+      return { job: existing, created: false, itemsCreated: 0 };
+    }
+    throw new ConflictException(
+      'idempotencyKey was already used for a different filter or target stage',
+    );
   }
 
   /**
