@@ -93,26 +93,42 @@ Only **transition-service** sits behind nginx. The other four keep direct ports,
 because the brief asks for the service boundaries rather than a gateway. Tenant
 scoping is a required `X-Workspace-Id` header.
 
-## A bulk move, end to end
+## The main logic
 
-```
-POST /bulk-moves ──► transition-service writes one job row, returns 201 + jobId
-                     (~9 ms; no batch exists yet)
+Five steps, and after step 1 the job row is the only thing that exists — every
+later step reads it or the rows it produces, and nothing is held in memory.
 
-SnapshotBuilder      a 250 ms sweep finds jobs in 'preparing' and walks each
-                     filter into batches of 1,000, committing a batch and the
-                     cursor that follows it in one transaction
+| # | step | what it does | the part that is not obvious |
+|---|---|---|---|
+| 1 | **Submit** | Resolves the filter to a list of stage ids, writes **one** job row with `snapshot_at = now()`, returns `201` + `jobId` in ~9 ms | No batch exists yet, so the row defaults to `preparing` — the state a job with no batches is actually in, and the state the sweep looks for |
+| 2 | **Build** | A 250 ms sweep claims a job with a Postgres advisory lock, then walks the filter keyset-style, 1,000 ids per page | Each page commits its batch **and** the cursor that follows it in one transaction, so a crash resumes instead of restarting — and the advisory lock makes "one builder per job" something Postgres enforces, not a property of there being one replica |
+| 3 | **Relay** | A 250 ms timer publishes unpublished batch rows to RabbitMQ | A row is marked published only *after* the broker confirms, so a crash in between re-publishes rather than loses the batch |
+| 4 | **Drain** | 12 consumers claim a batch `pending → running` by compare-and-set, then apply it in one transaction: move the records, insert one transition each, write back the counts | The claim is what turns at-least-once delivery into effectively-once. A duplicate batch is harmless; a lost one hangs the job for ever |
+| 5 | **Status** | `GET /bulk-moves/:id` — progress, batches by state, failures, dead letters | A dead-lettered message goes to a dead-letter queue and **the rest of the job keeps draining** |
 
-OutboxRelay          a 250 ms timer publishes unpublished batch rows to RabbitMQ
+**A record is moved only if it survives all six checks, in this order:**
 
-BatchWorker          12 consumers, one channel each, apply batches
+| # | check | if it fires |
+|---|---|---|
+| 1 | the record still exists | **fail** — deleted since the batch was built |
+| 2 | it is **not already in the target stage** | count as **moved** |
+| 3 | `record.stage_decided_at <= job.snapshot_at` | **skip** — somebody decided after this job was submitted |
+| 4 | it is still in a stage the filter names | **skip** — it left scope |
+| 5 | its current stage has a permitted transition to the target | **fail** — no permitted move |
+| 6 | — | **move it**, and insert one transition |
 
-GET  /bulk-moves/:id progress, batches by state, failures, dead letters
-```
+Check 2 must stay ahead of check 3, and the reason is the mirror image of the
+obvious one. A person who moves a record *to* the target has stamped it with a
+time newer than the job's, so testing the clock first would report that as a
+skip — and under-report a job that in fact achieved its intent. Check 2 also
+makes a retry idempotent: a record the previous attempt already moved is counted
+as moved, not as a failure, so a batch that dies halfway does not turn every
+record it finished into a failure on the second attempt.
 
-A submitted job is dispatched in batches of 1,000 records. Each batch applies in
-one transaction, and the worker re-reads each record's live stage before moving
-it, so a record someone edited by hand in the meantime is left alone.
+The whole batch, before any of this, is gated on the `pending → running`
+compare-and-set — the only guard against a redelivered message, which is why it
+is a database check and not an in-process flag. A second replica has to be
+excluded too.
 
 ## Design decisions
 
@@ -209,11 +225,20 @@ counter before a new dependency.
 no `log_format`, so the hop that *starts* every trace is the one hop missing from
 it. Two lines.
 
-**The build is the critical path.** It is ~90% of a job's wall clock on one
-thread, and it is within 1% of the drain's length — so shortening either alone
+**The build and the drain are the same length.** Measured build against
+work-per-consumer-slot is 1.00× and 1.01× in two of three runs, so the job costs
+roughly the longer of the two rather than their sum — and shortening either alone
 moves the total very little, because the other immediately becomes the
-constraint. Its per-page cost has not yet been separated from contention with the
-workers running alongside it.
+constraint. A 30% win needs both. Its per-page cost has not yet been separated
+from contention with the workers running alongside it.
+
+**Small jobs are bound by the poll intervals, not by their data.** Below roughly
+15,000 records a job spends most of its wall clock waiting to be noticed: a 250 ms
+sweep tick before the first batch exists, then a 250 ms relay tick before any of
+it is published. Measured over three runs, a filter matching 5,050 records settles
+in 390–470 ms and one matching 5,065 in 386–407 ms — indistinguishable, and both
+carrying roughly half a second of pure waiting. Nothing in the current design
+removes that floor.
 
 **The drain residue is unattributed.** Removing 50,000 row inserts should have
 made the drain faster; it got slower. Pool starvation is ruled out by
