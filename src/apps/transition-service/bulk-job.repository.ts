@@ -46,15 +46,33 @@ export class BulkJobRepository {
     idempotencyKey: string;
     filter: unknown;
     targetStageId: string;
+    /**
+     * The submitting request's correlation id, stored so the build can be traced
+     * back to it. The build runs minutes later from a timer, outside the async
+     * chain that held the id, so this is the only way the two are ever connected.
+     *
+     * Not validated here because it cannot be unvalidated by the time it arrives:
+     * the edge and the middleware both accept it only against
+     * ^[A-Za-z0-9._:-]{1,64}$, and anything else was replaced with a fresh uuid
+     * before it was ever stored. Re-checking would guard against nothing.
+     */
+    correlationId?: string;
   }): Promise<BulkJob> {
     // status is left to the column default, which is 'preparing' - the state a
     // job is actually in when it is created, since its batches do not exist yet
     // and SnapshotBuilder writes them. Saying it here as well would be a second
     // place to change it when the lifecycle does.
     const rows = await this.db.query<BulkJob>(
-      `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id, snapshot_at)
-       VALUES ($1, $2, $3, $4, now()) RETURNING ${COLUMNS}`,
-      [input.workspaceId, input.idempotencyKey, JSON.stringify(input.filter), input.targetStageId],
+      `INSERT INTO bulk_job
+         (workspace_id, idempotency_key, filter, target_stage_id, snapshot_at, correlation_id)
+       VALUES ($1, $2, $3, $4, now(), $5) RETURNING ${COLUMNS}`,
+      [
+        input.workspaceId,
+        input.idempotencyKey,
+        JSON.stringify(input.filter),
+        input.targetStageId,
+        input.correlationId ?? null,
+      ],
     );
     return rows[0]!;
   }

@@ -1,0 +1,28 @@
+-- 0006_correlation_id.sql
+--
+-- Stores the correlation id of the request that created a bulk job.
+--
+-- The id is minted at the edge and carried on every log line for the lifetime of
+-- the request, but a bulk job outlives its request by minutes. Submission returns
+-- as soon as the job row is written; the snapshot that turns the filter into
+-- batches is built afterwards by a timer. Before this column the only way to
+-- connect a build to the request that caused it was to compare timestamps, which
+-- is the thing that drifts, and which cannot distinguish two jobs submitted in
+-- the same second.
+--
+-- Stored rather than inherited because it cannot be inherited. The correlation id
+-- lives in AsyncLocalStorage, which is scoped to the async chain the request
+-- handler started. The sweep runs from a setInterval callback registered at module
+-- init, so it is permanently outside that chain and getStore() returns undefined
+-- there on every call. The id has to travel as data.
+--
+-- Nullable, not NOT NULL. A job inserted by anything other than the submit path -
+-- a fixture, a backfill - has no request behind it, and inventing a uuid for
+-- those would put an id in the log that resolves to no request at all, which is
+-- worse than an absent one.
+--
+-- No index. This is read once per build, on a row already selected by primary
+-- key, and never filtered on. An index here would be a write cost on every
+-- submission and a probe on every build, for a column that is only ever displayed.
+
+ALTER TABLE bulk_job ADD COLUMN correlation_id text;

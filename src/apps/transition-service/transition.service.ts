@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { DatabaseService } from '../../shared/database/database.service';
 import { ServiceClient } from '../../shared/http/service-client';
+import { currentRequestId } from '../../shared/http/request-context';
 import { parseListFilter, type Outcome } from '../../shared/filter/opportunity-filter';
 import { BulkJob, BulkJobRepository } from './bulk-job.repository';
 import { JobTransitionRepository } from './job-transition.repository';
@@ -110,6 +111,10 @@ export class TransitionService {
       idempotencyKey: key,
       filter: canonical,
       targetStageId,
+      // Read from the request's async context and stored on the row, because the
+      // build that runs after this returns is outside that context entirely. This
+      // is the join between "someone POSTed this" and "the batches were written".
+      correlationId: currentRequestId(),
     });
 
     // Kick the build without waiting for it. The sweep would pick the job up

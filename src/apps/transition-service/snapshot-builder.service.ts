@@ -96,8 +96,11 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
       snapshot_at: Date;
       snapshot_cursor: Date | null;
       snapshot_cursor_id: string | null;
+      created_at: Date;
+      correlation_id: string | null;
     }>(
-      `SELECT filter, snapshot_at, snapshot_cursor, snapshot_cursor_id
+      `SELECT filter, snapshot_at, snapshot_cursor, snapshot_cursor_id,
+              created_at, correlation_id
          FROM bulk_job WHERE id = $1 AND workspace_id = $2`,
       [jobId, workspaceId],
     );
@@ -114,6 +117,18 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
         : null;
     let batchNo = 0;
     let matched = 0;
+    // When the first page became available to a worker, measured from the job row
+    // rather than from this function's start, so it includes the sweep's wait for
+    // the next tick. That wait is part of what the submitter experiences and would
+    // otherwise be invisible - it happens before the stopwatch here does.
+    let firstBatchMs: number | null = null;
+    // Per-page cost, tracked as running figures rather than kept in an array. A
+    // 500,000 record job is 500 pages, and the only question the numbers answer
+    // is whether the walk stays linear as the cursor advances - so the spread is
+    // what matters, not every sample. The mean comes from the total instead of
+    // from these, because it then includes the final read that ends the walk.
+    let pageMinMs = Infinity;
+    let pageMaxMs = 0;
 
     const resumeFrom = cursor;
     if (resumeFrom) {
@@ -126,6 +141,11 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
     }
 
     for (;;) {
+      // Started before the read, not after it. A page's cost is the read plus the
+      // write plus the commit, and stopping the clock after the read would report
+      // only the write - which is the cheap half, and would make the walk look
+      // far more uniform than it is.
+      const pageStart = startTimer();
       const page = await pageMatching(
         query,
         workspaceId,
@@ -156,9 +176,21 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
         );
       });
 
+      const pageMs = elapsedMs(pageStart);
+      if (pageMs < pageMinMs) pageMinMs = pageMs;
+      if (pageMs > pageMaxMs) pageMaxMs = pageMs;
+
       matched += page.length;
       cursor = nextCursor;
       batchNo += 1;
+      if (firstBatchMs === null) {
+        // Wall clock, not the stopwatch: job.created_at was written by Postgres on
+        // a different connection, so only a wall-clock delta spans the two. The
+        // containers share one host clock, so the skew is nil, and the alternative
+        // - a timestamp column written by this process - would be a second source
+        // of truth for something the job row already records.
+        firstBatchMs = Date.now() - job.created_at.getTime();
+      }
       if (page.length < BATCH_SIZE) break;
     }
 
@@ -193,9 +225,25 @@ export class SnapshotBuilder implements OnModuleInit, OnModuleDestroy {
     // within milliseconds of the first batch landing. The last batch's
     // created_at is a close proxy, but it is a proxy, and a build that walked
     // nothing records no batch at all.
+    //
+    // Per-page and first-batch are here for the same reason. The per-page figure
+    // is what makes the walk's linearity checkable rather than assumed - at 50
+    // batches it should be flat, and if it is not, the walk is not the cost. And
+    // time-to-first-batch is the number a submitter actually feels: the total
+    // says how long the job took to become complete, this says how long before
+    // any of it started moving.
+    const totalMs = elapsedMs(started);
+    const perPage = batchNo > 0 ? totalMs / batchNo : 0;
+    const first = firstBatchMs === null ? 'never' : ms1(firstBatchMs);
+    // The spread, not just the mean. A flat walk means the cost is the pages and
+    // 500,000 records is 500 of them; a spread that widens as the cursor advances
+    // means something is degrading with depth, and the mean hides that completely.
+    const spread =
+      batchNo > 0 ? `${ms1(pageMinMs)}/${ms1(perPage)}/${ms1(pageMaxMs)} min/mean/max` : 'none';
     this.logger.log(
       `job ${jobId} snapshot built: ${matched} records in ${batchNo} batches ` +
-        `in ${ms1(elapsedMs(started))}`,
+        `in ${ms1(totalMs)} (page ${spread}, first batch at ${first}) ` +
+        `id=${job.correlation_id ?? 'none'}`,
     );
   }
 }
