@@ -115,33 +115,6 @@ Six checks, fixed order. The order is load-bearing.
 9. **Rate limits at workspace, user and job level,** not only per request.
 10. **More RabbitMQ queues, partitioned by `workspace_id`.** Every worker subscribes to every queue but treats one as its priority, so a noisy tenant cannot delay another, and a worker with spare capacity can still pick up load from a single tenant.
 
-## 8. Known gaps
-
-True now, and would bite at scale.
-
-- **Idempotency keys are never cleared**, a key lives as long as its row, so the
-  constraint grows without bound and a key cannot be reused even after its job is
-  deleted. A retention window fixes both, and a job must outlive any retry a
-  client might make.
-- **Nothing prunes `bulk_job` or `opportunity_transition`**, both grow without
-  bound, and the transition table is the audit trail.
-- **Batching's per-page cost is not separated from contention**, how much of the
-  18 ms is the walk's own work is unknown; a quiet table costs ~7 ms.
-- **Batching got ~2x faster when only a timer changed**, per-page mean 41–47 ms
-  to 16–31 ms, and the tick is not on the page-write path. Unexplained; likeliest
-  cause is contention, but the direction is backwards from what the new overlap
-  predicts.
-- **Queue wait is the largest cost at 177 ms and the tick does not set it**,
-  halving the interval moved it only 195 → 177 ms. An earlier 3-run reading said
-  it doubled; 5 runs per tick says otherwise, and the two sets overlap.
-- **The record count at which waiting stops dominating a small job is not
-  re-measured**, the floor is ~125 ms not ~250 ms, so the crossover moved, but
-  the smallest filter measured is 5,050 records. Quote no threshold until the
-  bench runs below 1,000.
-- **Batching is single-threaded per job** and cannot be otherwise, because each
-  page's cursor is the previous page's last row. Only *different* jobs
-  parallelise, which is what the per-job claim is for.
-
 ## 9. Design decisions
 
 One line each; the sections above are the reasoning.
