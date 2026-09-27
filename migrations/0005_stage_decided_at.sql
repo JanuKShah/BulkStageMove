@@ -1,4 +1,4 @@
--- 0008_stage_decided_at.sql
+-- 0005_stage_decided_at.sql
 --
 -- A logical clock on every opportunity, so a bulk job cannot overwrite a change
 -- that was made after it was submitted, and cannot be overwritten by an older job

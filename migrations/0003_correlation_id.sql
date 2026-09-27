@@ -1,4 +1,4 @@
--- 0006_correlation_id.sql
+-- 0003_correlation_id.sql
 --
 -- Stores the correlation id of the request that created a bulk job.
 --

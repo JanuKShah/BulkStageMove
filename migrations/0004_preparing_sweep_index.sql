@@ -1,4 +1,4 @@
--- 0007_preparing_sweep_index.sql
+-- 0004_preparing_sweep_index.sql
 --
 -- Index for the snapshot sweep: WHERE status = 'preparing' ORDER BY created_at
 -- LIMIT 5.

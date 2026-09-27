@@ -1,4 +1,4 @@
--- 0005_read_path_indexes.sql
+-- 0002_read_path_indexes.sql
 --
 -- Indexes for the read paths that are hot at the brief's scale. Each one is here
 -- because EXPLAIN showed a sequential scan or an in-memory sort on a query that
