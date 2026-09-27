@@ -681,7 +681,11 @@ async function cmdTransitions(id: string): Promise<Reply> {
 
 type CommandResult = Reply | void;
 
-const COMMANDS: Record<
+// Exported so a test can assert the command surface rather than the README
+// asserting it. The README names one of these as the example of the
+// non-interactive interface, and documentation naming a command nobody runs rots
+// without anything failing.
+export const COMMANDS: Record<
   string,
   (args: Record<string, string | undefined>) => Promise<CommandResult>
 > = {
@@ -1112,9 +1116,14 @@ async function main(): Promise<void> {
   await interactiveMenu();
 }
 
-main()
-  .catch((error: unknown) => {
-    console.error(error instanceof Error ? error.message : error);
-    process.exitCode = 1;
-  })
-  .finally(() => rl.close());
+// Only when run as a script. COMMANDS is imported by a test that checks the
+// command surface, and running the CLI as a side effect of importing it would
+// have that test start a readline prompt and make requests it never asked for.
+if (require.main === module) {
+  main()
+    .catch((error: unknown) => {
+      console.error(error instanceof Error ? error.message : error);
+      process.exitCode = 1;
+    })
+    .finally(() => rl.close());
+}

@@ -129,18 +129,12 @@ move, or read a transition history.
 Run bare, it lists the workspaces in the database so you can pick one by number, writes `db-state.txt`, and opens the menu.
 
 ```bash
-npm run cli                                                          # that, then a menu
-npm run cli -- opportunities --workspace=<uuid> --outcome=won --limit=20
-npm run cli -- stages --workspace=<uuid>                             # what can be moved where
-npm run cli -- can-move --workspace=<uuid> --from=<uuid> --to=<uuid>
+npm run cli
 npm run cli -- bulk-move --workspace=<uuid> --to=<stageId> --stageId=<uuid> --outcome=won
-npm run cli -- job-watch --workspace=<uuid> --id=<jobId>            # poll to completion
-npm run cli -- job-status --workspace=<uuid> --id=<jobId>           # one shot
-npm run cli -- job-batches --workspace=<uuid> --id=<jobId>          # per-batch state
-npm run cli -- job-failures --workspace=<uuid> --id=<jobId>         # why records did not move
-npm run cli -- job-retry --workspace=<uuid> --id=<jobId>            # retry batches it gave up on
-npm run cli -- dump-db --out=before.txt                              # then --out=after.txt and diff
 ```
+
+Every menu action has a command equivalent, for when the menu cannot be used. A
+mistyped name lists them all.
 
 A workspace id is required. `npm run seed` prints them, and bare `npm run cli` lists them from the database directly, there is no endpoint that does, because a caller must not be able to enumerate other tenants.
 
