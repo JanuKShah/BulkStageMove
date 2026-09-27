@@ -183,10 +183,12 @@ CREATE TABLE bulk_job (
 -- getting its 201 back - measured, not estimated.
 --
 -- What replaced it is the watermark on bulk_job.snapshot_at plus the filter
--- already stored on bulk_job.filter. A batch is not a stored set of ids, it is a
--- position: batch N is the Nth page of the filter evaluated against the
--- watermark. Because created_at never changes, that resolves to the same records
--- for every worker, on every retry, without anything being written per record.
+-- already stored on bulk_job.filter: submission writes no per-record row at all.
+-- A batch does hold its ids, in bulk_job_outbox below - 1,000 of them, bounded -
+-- so a batch is a stored set and not a position. What the watermark replaces is
+-- the 50,000-row table, not the batch. Because created_at never changes, the walk
+-- that materialises the batches resolves to the same records for every worker,
+-- on every retry.
 --
 -- The trade is deliberate and it is a real one. The job now moves what matches
 -- when the worker reaches it, not what matched at submission, so a record moved

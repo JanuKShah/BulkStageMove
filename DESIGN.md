@@ -172,8 +172,9 @@ against that frozen copy — the request is never consulted again.**
      missing predicate into a full-partition scan.
   5. **Replicas** — more builders is the only way to speed one huge job, because
      page N+1's cursor is page N's last row; more workers drain concurrent jobs,
-     no code change. Both already safe at N. **The relay is the exception:** no
-     claim, so replicas double-publish.
+     no code change. Both already safe at N. The relay is safe at N too: it claims
+     with `FOR UPDATE SKIP LOCKED` ordered by `attempts` then `created_at`, so two
+     relays take disjoint rows rather than both publishing one batch.
   6. **Past the ceiling** — PgBouncer cannot help, because transaction pooling
      hands two workers the same key on two backends. Raise `max_connections`, or
      a lease table with expiry.
