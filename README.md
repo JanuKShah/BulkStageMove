@@ -44,8 +44,6 @@ crosses.
 | ESLint + Prettier | lint and format |
 | Docker Compose | 10 containers |
 
-Deliberately absent: **Redis**. See *Left for later*.
-
 ## Running it
 
 ```bash
