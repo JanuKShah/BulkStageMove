@@ -133,12 +133,5 @@ claim that a half-built job is finished rather than restarted.
 | service answering to settled | 1.56 s |
 | Processed / failed | **50,000 / 0** |
 
-The fourth row is the one that matters. If the cursor were not committed in the same
-transaction as the batch it follows, the resumed walk would re-emit batches 0-9 and
-`count(DISTINCT batch_no)` would come back under 50. It is exactly 50, contiguous
-from 0, so the walk resumed from the cursor and re-walked nothing. The third row is
-the same claim from the other side: 50,000 transitions across 50,000 *distinct*
-opportunities, so nothing was applied twice.
-
 **The 3.47 s is Docker, not the application.** It is container start plus health
 check, and it dominates the 5.03 s total, the actual resumed work took 1.56 s.
