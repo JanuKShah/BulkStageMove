@@ -184,6 +184,55 @@ describe('a job does not overwrite a newer decision', () => {
     expect(await stageOf(ids[0]!)).toBe(b);
   });
 
+  it('skips only the record the person touched, and moves the rest of the batch', async () => {
+    // The mixed case, and the one the tests above cannot reach: both of them seed
+    // a single record, so the whole batch is skipped and "skipped this record" is
+    // indistinguishable from "refused the batch".
+    //
+    // That distinction is the whole point of skipping per record. A bulk move is
+    // 1,000 records at a time, and a person editing one of them must not hold up
+    // the other 999 - so a guard implemented as "if anything changed, skip the
+    // batch" would pass every test in this file and still be wrong in production.
+    // This is the test that tells the two apart.
+    const a = await stage();
+    const b = await stage();
+    await rule(a, won());
+    await rule(b, won());
+    const ids = await seed(a, 3);
+    const { jobId, batchNo } = await jobOver(a, ids);
+
+    // One record, moved to another stage the filter also names, so the scope check
+    // waves it through and only the clock can catch it.
+    await personMoves(ids[0]!, b);
+
+    const result = await processBatchForTest(ws.workspaceId, jobId, batchNo);
+
+    // Two moved, one skipped, and nothing counted as failed. A skip is a decision
+    // the job reports, not an error it hit.
+    expect(result.moved).toBe(2);
+    expect(result.skipped).toBe(1);
+    expect(result.failed).toBe(0);
+
+    // The person's record is where they put it. The other two reached the target.
+    expect(await stageOf(ids[0]!)).toBe(b);
+    expect(await stageOf(ids[1]!)).toBe(won());
+    expect(await stageOf(ids[2]!)).toBe(won());
+
+    // The clock is a logical one, so the job's own write carries the job's time
+    // rather than the moment the worker got to it. Checked because a record the
+    // job moved and a record a person moved must not be indistinguishable to the
+    // next job that reaches them.
+    const clocks = await pool.query<{ stage_decided_at: Date }>(
+      'SELECT stage_decided_at FROM opportunity WHERE id = $1',
+      [ids[1]!],
+    );
+    const jobRow = await pool.query<{ snapshot_at: Date }>(
+      'SELECT snapshot_at FROM bulk_job WHERE id = $1',
+      [jobId],
+    );
+    expect(clocks.rows[0]!.stage_decided_at.getTime()).toBe(jobRow.rows[0]!.snapshot_at.getTime());
+  });
+
   it('proceeds when the person moved it BEFORE submission', async () => {
     // The other side of the ordering, and the one that would be easy to break by
     // making the rule too eager. An edit older than the job is not a conflict -

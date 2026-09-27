@@ -78,42 +78,75 @@ describe('the build claims a job before walking it', () => {
     );
   };
 
-  /** A job the submit path will not touch, as a crashed build would leave it. */
-  const plant = async (stageId: string): Promise<string> => {
-    const { rows } = await pool.query<{ id: string }>(
-      `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id, status)
-       VALUES ($1, $2, $3::jsonb, $4, 'preparing') RETURNING id`,
-      [ws.workspaceId, `claim-${randomUUID()}`, JSON.stringify({ stageId: [stageId] }), target()],
-    );
-    return rows[0]!.id;
-  };
-
-  /** Stands in for a second replica that has already claimed this job. */
-  const holdLock = async (jobId: string): Promise<void> => {
+  /**
+   * A job the submit path will not touch, as a crashed build would leave it, with
+   * its claim already held.
+   *
+   * The lock is taken in the same transaction that inserts the row, and that
+   * transaction commits with the key already held. The ordering is the whole point.
+   * Taking the lock afterwards - insert, then lock - leaves a window between the
+   * two, and the live service's sweep runs on a 125ms tick, so it won that window
+   * often enough to matter: roughly one run in four built the job before the test
+   * had finished planting it, and the assertion was then made against a job that
+   * had already been walked.
+   *
+   * A session-level advisory lock survives the commit, so by the time the row
+   * becomes visible the key is already ours, and no other builder - this process
+   * or the container - can claim it until release.
+   *
+   * Taken blocking rather than with try, which is safe precisely because the id is
+   * brand new: nothing can be holding a key derived from a uuid that never existed.
+   */
+  const plant = async (
+    stageId: string,
+  ): Promise<{ jobId: string; release: () => Promise<void> }> => {
     const client = await pool.connect();
+    let jobId: string;
     try {
-      const got = await client.query<{ locked: boolean }>(
-        'SELECT pg_try_advisory_lock(hashtext($1)) AS locked',
-        [jobId],
+      await client.query('BEGIN');
+      const { rows } = await client.query<{ id: string }>(
+        `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id, status)
+         VALUES ($1, $2, $3::jsonb, $4, 'preparing') RETURNING id`,
+        [ws.workspaceId, `claim-${randomUUID()}`, JSON.stringify({ stageId: [stageId] }), target()],
       );
-      expect(got.rows[0]!.locked).toBe(true);
-    } finally {
-      // Held on this connection deliberately; the release is explicit below so a
-      // failure inside the test still frees the key rather than leaking it for
-      // the life of the pool.
-      heldClients.push(client);
+      jobId = rows[0]!.id;
+      await client.query('SELECT pg_advisory_lock(hashtext($1))', [jobId]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+      throw e;
     }
+    held.push({ client, jobId });
+    return { jobId, release: () => releaseLock(jobId) };
   };
 
-  const heldClients: Array<{
-    query: (q: string, v?: unknown[]) => Promise<unknown>;
-    release: () => void;
-  }> = [];
+  interface Held {
+    client: { query: (q: string, v?: unknown[]) => Promise<unknown>; release: () => void };
+    jobId: string;
+  }
+  const held: Held[] = [];
 
-  const releaseLock = async (jobId: string): Promise<void> => {
-    for (const c of heldClients.splice(0)) {
-      await c.query('SELECT pg_advisory_unlock(hashtext($1))', [jobId]);
-      c.release();
+  /**
+   * Releases one key, or every key this file took when given no id.
+   *
+   * Keyed per held client rather than passed in, because the lock lives on the
+   * session and handing that session back to the pool does not drop it - so an
+   * unlock aimed at the wrong key leaks the lock for the life of the process.
+   */
+  const releaseLock = async (jobId?: string): Promise<void> => {
+    for (const h of held.splice(0)) {
+      if (jobId !== undefined && h.jobId !== jobId) {
+        // Not the key asked for, so it stays held. The client must stay checked
+        // out too: it is the session the lock lives on, and handing a session with
+        // a live advisory lock back to the pool is how a lock outlives the test
+        // that took it. Releasing here and releasing again on the next call is
+        // what threw "Release called on client which has already been released".
+        held.push(h);
+        continue;
+      }
+      await h.client.query('SELECT pg_advisory_unlock(hashtext($1))', [h.jobId]);
+      h.client.release();
     }
   };
 
@@ -128,24 +161,25 @@ describe('the build claims a job before walking it', () => {
   const build = (): SnapshotBuilder => new SnapshotBuilder(db, rabbitConfig());
 
   afterEach(async () => {
-    // Any lock a test took and did not release, so a failing test cannot leave a
-    // key held against every later run in this file.
-    await releaseLock('*');
+    // Every lock this file took, whether or not the test released it, so a failing
+    // test cannot leave a key held against every later run in this file.
+    await releaseLock();
   });
 
   it('skips a job another builder is already walking', async () => {
     const stageId = await privateStage();
     await seed(stageId, 40);
-    const jobId = await plant(stageId);
+    // plant already holds this job's claim, which is the "replica elsewhere" this
+    // test is about.
+    const { jobId } = await plant(stageId);
 
-    // A replica elsewhere holds this job. The sweep must not touch it - not
-    // because that would corrupt anything, but because walking it a second time
-    // reads and writes every page for no gain, and the waste scales with the
-    // number of replicas.
+    // The sweep must not touch it - not because that would corrupt anything, but
+    // because walking it a second time reads and writes every page for no gain,
+    // and the waste scales with the number of replicas.
     //
-    // Safe to assert immediately: the live service honours this lock too, so
-    // nothing can build the job until it is released.
-    await holdLock(jobId);
+    // Safe to assert immediately, and now safe for a stronger reason than it was:
+    // the lock was taken before the row was visible, so the live service never had
+    // a window in which it could have built this job.
     await build().sweep();
 
     expect(await batchesFor(jobId)).toBe(0);
@@ -169,10 +203,13 @@ describe('the build claims a job before walking it', () => {
     const freeStage = await privateStage();
     await seed(heldStage, 25);
     await seed(freeStage, 30);
-    const heldJob = await plant(heldStage);
-    const freeJob = await plant(freeStage);
+    // Both come back claimed. The free one is released immediately, so the sweep
+    // below has exactly one job it is allowed to walk.
+    const held = await plant(heldStage);
+    const heldJob = held.jobId;
+    const { jobId: freeJob } = await plant(freeStage);
+    await releaseLock(freeJob);
 
-    await holdLock(heldJob);
     await build().sweep();
 
     // The property is the asymmetry, not who built what: the free job is allowed
@@ -208,7 +245,8 @@ describe('the build claims a job before walking it', () => {
     // build, so it holds whoever did the first one.
     const stageId = await privateStage();
     await seed(stageId, 12);
-    const jobId = await plant(stageId);
+    const { jobId } = await plant(stageId);
+    await releaseLock(jobId);
 
     await build().sweep();
     const built = await waitForSnapshot(ws.workspaceId, jobId, 20_000);
@@ -242,7 +280,8 @@ describe('the build claims a job before walking it', () => {
     // which is what the status check on the read prevents.
     const stageId = await privateStage();
     await seed(stageId, 1_500);
-    const jobId = await plant(stageId);
+    const { jobId } = await plant(stageId);
+    await releaseLock(jobId);
 
     await build().sweep();
     const first = await waitForSnapshot(ws.workspaceId, jobId, 20_000);
@@ -293,7 +332,8 @@ describe('the build claims a job before walking it', () => {
     // never reports a count its own rows contradict.
     const stageId = await privateStage();
     await seed(stageId, 2_500);
-    const jobId = await plant(stageId);
+    const { jobId } = await plant(stageId);
+    await releaseLock(jobId);
 
     await Promise.all([build().sweep(), build().sweep()]);
     const built = await waitForSnapshot(ws.workspaceId, jobId, 30_000);
@@ -321,7 +361,11 @@ describe('the build claims a job before walking it', () => {
     for (const [i, count] of counts.entries()) {
       const stageId = await privateStage();
       await seed(stageId, count);
-      jobs.push(await plant(stageId));
+      const { jobId } = await plant(stageId);
+      jobs.push(jobId);
+      // Released one at a time, so the burst below is a burst of free jobs rather
+      // than a burst of jobs the sweep is locked out of.
+      await releaseLock(jobId);
       void i;
     }
 

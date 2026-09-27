@@ -49,7 +49,7 @@ describe('the snapshot is built after the response', () => {
   const plantOrphan = async (
     key: string,
     records: number,
-  ): Promise<{ jobId: string; stageId: string }> => {
+  ): Promise<{ jobId: string; stageId: string; release: () => Promise<void> }> => {
     const stageId = await createPrivateStage(ws.workspaceId, 'orphan');
     await pool.query(
       `INSERT INTO opportunity (workspace_id, stage_id, name, value)
@@ -57,13 +57,62 @@ describe('the snapshot is built after the response', () => {
       [ws.workspaceId, stageId, records],
     );
     const filter = JSON.stringify({ stageId: [stageId] });
-    const { rows } = await pool.query<{ id: string }>(
-      `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id, status)
-       VALUES ($1, $2, $3::jsonb, $4, 'preparing') RETURNING id`,
-      [ws.workspaceId, key, filter, won()],
-    );
-    return { jobId: rows[0]!.id, stageId };
+
+    // The claim is taken in the same transaction that inserts the job, and that
+    // transaction commits with the key already held.
+    //
+    // A planted job is 'preparing', which is exactly what the live transition
+    // service's 125ms sweep goes looking for, so inserting one and locking it
+    // afterwards leaves a window the live builder can win - and it did, often
+    // enough to matter. The failure looked like the walk itself: total_matched
+    // came back as 10, or 40, or 30 depending on which builder got there and how
+    // far it had got, so the test was measuring a race and reading it as an
+    // arithmetic bug.
+    //
+    // Locking before the row is visible means the live builder never sees a moment
+    // at which it could claim this job. Each test then releases it and waits,
+    // which tolerates either builder doing the work.
+    const client = await pool.connect();
+    let jobId: string;
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query<{ id: string }>(
+        `INSERT INTO bulk_job (workspace_id, idempotency_key, filter, target_stage_id, status)
+         VALUES ($1, $2, $3::jsonb, $4, 'preparing') RETURNING id`,
+        [ws.workspaceId, key, filter, won()],
+      );
+      jobId = rows[0]!.id;
+      // Blocking rather than try, which is safe because the id is brand new.
+      await client.query('SELECT pg_advisory_lock(hashtext($1))', [jobId]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+      throw e;
+    }
+    heldLocks.push({ client, jobId });
+    return {
+      jobId,
+      stageId,
+      release: async () => {
+        await client.query('SELECT pg_advisory_unlock(hashtext($1))', [jobId]);
+      },
+    };
   };
+
+  const heldLocks: Array<{
+    client: { query: (q: string, v?: unknown[]) => Promise<unknown>; release: () => void };
+    jobId: string;
+  }> = [];
+
+  afterEach(async () => {
+    for (const h of heldLocks.splice(0)) {
+      await h.client
+        .query('SELECT pg_advisory_unlock(hashtext($1))', [h.jobId])
+        .catch(() => undefined);
+      h.client.release();
+    }
+  });
 
   it('returns before the batches exist, and says so', async () => {
     const res = await submitBulkMove(ws.workspaceId, { targetStageId: won() });
@@ -108,12 +157,19 @@ describe('the snapshot is built after the response', () => {
     // This is the crash case. A job left preparing with nothing to trigger it is
     // the one the timer exists for: the opposite status default produced exactly
     // this shape and the job sat there for ever.
-    const { jobId } = await plantOrphan('orphan-' + randomUUID(), 25);
+    const { jobId, release } = await plantOrphan('orphan-' + randomUUID(), 25);
+
+    // Nothing may exist yet. Safe to assert immediately because the claim is still
+    // held, so no builder - this process or the live service - can have walked it.
     const before = await pool.query<{ n: number }>(
       'SELECT count(*)::int AS n FROM bulk_job_outbox WHERE job_id = $1',
       [jobId],
     );
     expect(before.rows[0]!.n).toBe(0);
+
+    // Released, so the timer can now do its job. From here the assertions are on
+    // the finished state, which tolerates either builder having built it.
+    await release();
 
     const status = await waitForSnapshot(ws.workspaceId, jobId, 20_000);
     expect(status.snapshotInProgress).toBe(false);
@@ -129,7 +185,7 @@ describe('the snapshot is built after the response', () => {
     // Its own stage, so the 30 records this test expects are the only 30 the walk
     // can see. Planted on the shared stage, the planted batch and the cursor were
     // drawn from a different population than the one the job was filtering on.
-    const { jobId, stageId } = await plantOrphan('resume-' + randomUUID(), 30);
+    const { jobId, stageId, release } = await plantOrphan('resume-' + randomUUID(), 30);
 
     // A half-finished build. The page is deliberately short of a full batch so the
     // resume has real work left to do, and the cursor goes on the page's LAST
@@ -140,6 +196,7 @@ describe('the snapshot is built after the response', () => {
     // already written: the resumed walk then re-read the other 29 and the job
     // reported 59 records for a 30 record fixture. The duplicate-count assertion
     // below caught it, which is the argument for having that assertion at all.
+    //
     // created_at as text, and that is load-bearing rather than incidental. The
     // stored cursor is the position the resumed walk continues from, so it has to
     // carry the same precision the builder writes - microseconds. Reading this as
@@ -163,6 +220,12 @@ describe('the snapshot is built after the response', () => {
       `UPDATE bulk_job SET snapshot_cursor = $2, snapshot_cursor_id = $3 WHERE id = $1`,
       [jobId, cursorRow.created_at, cursorRow.id],
     );
+
+    // The half-finished state is written before the claim is dropped, so the
+    // builder that picks this up cannot see a job with batches but no cursor. That
+    // ordering is the invariant the test exists to check, and it is only checkable
+    // because the claim kept every other builder out while it was set up.
+    await release();
 
     const status = await waitForSnapshot(ws.workspaceId, jobId, 20_000);
     expect(status.totalMatched).toBe(30);
@@ -197,7 +260,8 @@ describe('the snapshot is built after the response', () => {
     // job with no batches at all is finished. A preparing job has no batches by
     // definition, so it has to be excluded or the worker settles a job that has
     // not been built yet.
-    const { jobId } = await plantOrphan('clobber-' + randomUUID(), 12);
+    const { jobId, release } = await plantOrphan('clobber-' + randomUUID(), 12);
+    await release();
     await waitForSnapshot(ws.workspaceId, jobId, 20_000);
 
     // Back to preparing with its batches still on disk, which is the state that
