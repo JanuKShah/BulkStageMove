@@ -131,8 +131,6 @@ One line each; the sections above are the reasoning.
   together.
 - **The scheduler is in-process, not a broker message**, so an abandoned job is
   picked up by whichever replica is alive.
-- **A correlation id is minted at the edge**, validated against
-  `^[A-Za-z0-9._:-]{1,64}$`, a newline would let a client forge a log line.
 - **One exchange and one queue.** No dead letter queue and no retry queues: a
   batch that runs out of attempts is marked `failed` in `bulk_job_outbox` with its
   reason, plus a `bulk_job_failure` row per record, and the message is acked. A
