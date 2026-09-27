@@ -73,16 +73,6 @@ Mean of five runs, fresh volume each time, from the four timestamps on each batc
 At 500,000 the job still completes cleanly — 500,000 moved, 0 failed, 57.34 s
 end-to-end.
 
-**Submission used to break here, and no longer does.** It was 0.56 s at 50,000
-and 32.06 s at 500,000 — sixteen times the time for ten times the data — because
-`submit()` accumulated every batch's ids in memory before writing any, roughly
-50–100 MB of uuid strings at 500,000, and it would not hold at 5,000,000. The walk
-now runs in `SnapshotBuilder` and streams: each page is written with the cursor
-that follows it, so the response returns in single-digit milliseconds at any size
-and memory is bounded by one page.
-
-That fix is unmeasured at 500,000. The 57.34 s above predates it.
-
 ## Tests
 
 | suite | files | tests | time |

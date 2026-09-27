@@ -2,6 +2,12 @@
 
 Bulk stage move for Opportunities — SDE-3 backend take-home.
 
+| | |
+|---|---|
+| **[`DESIGN.md`](DESIGN.md)** | chunking and the cursor, idempotency, concurrency on one record, snapshot vs live, isolation, what breaks at 10× |
+| **[`BENCHMARKS.md`](BENCHMARKS.md)** | the numbers, the hardware, the method |
+| **[`TESTSTRATEGY.md`](TESTSTRATEGY.md)** | what each test protects and why it exists |
+
 ## The problem
 
 A user selects a filter — stage, owner, status, value range, date range — and

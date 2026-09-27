@@ -3,20 +3,6 @@
 216 tests, 19 suites, in three projects. `npm test` runs all; `npm run test:safety`
 is the one to read first.
 
-**This file lists only the tests that exist because something was designed to go
-wrong.** Ordinary coverage — a route returns 200, a bad uuid gives a 400, a
-transition is written on a permitted move — is not here, because a test that only
-proves the code does what the code says is not a test strategy. It is inventory.
-`test/endpoints` and the plain assertions in `safety` cover that.
-
-What is here is the short list of places where the obvious implementation is
-wrong, the guard is load-bearing, or the failure is silent. Each row is a decision
-that would otherwise have to be taken on faith.
-
-**[non-vacuous]** marks a test verified to **fail when the mechanism it covers is
-deleted** — not merely to pass. Breaking the guard and watching it go red is the
-only evidence that the test is testing the thing.
-
 | project | files | tests | scope |
 |---|---|---|---|
 | `safety` | 11 | 119 | the mechanisms below |
