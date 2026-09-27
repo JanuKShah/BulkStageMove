@@ -278,6 +278,16 @@ async function cmdJobStatus(jobId: string): Promise<Reply> {
   return request('transition', `/bulk-moves/${jobId}`);
 }
 
+/**
+ * Puts back the batches that ran out of attempts.
+ *
+ * Nothing does this on its own, so it is a command rather than a flag: a
+ * deliberate act, on a job that has already reported itself finished.
+ */
+async function cmdJobRetry(jobId: string): Promise<Reply> {
+  return request('transition', `/bulk-moves/${jobId}/retry-failed`, { method: 'POST' });
+}
+
 async function cmdJobTransitions(jobId: string, limit?: number): Promise<Reply> {
   const qs = limit ? `?limit=${limit}` : '';
   return request('transition', `/bulk-moves/${jobId}/transitions${qs}`);
@@ -399,9 +409,12 @@ function renderJobStatus(reply: Reply): void {
   if (b.error) console.log(`  error:     ${b.error}`);
   if (b.deadLettered.batches > 0) {
     console.log(
-      `  dead letter: ${b.deadLettered.batches} batch(es), ` +
-        `${b.deadLettered.records} record(s) never attempted`,
+      `  given up: ${b.deadLettered.batches} batch(es), ` +
+        `${b.deadLettered.records} record(s) never moved`,
     );
+    // Worth printing rather than leaving to the docs: these records are in no
+    // counter anywhere, and nothing retries them unless a caller asks.
+    console.log('  They are not retried automatically. To try them again: job-retry --id=<uuid>');
   }
   if (b.failedCount > 0) {
     console.log(`\n  ${b.failedCount} record(s) did not move and are listed individually.`);
@@ -700,6 +713,19 @@ const COMMANDS: Record<
     if (!args.id) throw new Error('usage: job-status --id=<uuid>');
     renderJobStatus(await cmdJobStatus(args.id));
   },
+  'job-retry': async (args) => {
+    if (!args.id) throw new Error('usage: job-retry --id=<uuid>');
+    const r = (await cmdJobRetry(args.id)) as unknown as {
+      retriedBatches?: number;
+      retriedRecords?: number;
+    };
+    if (r.retriedBatches) {
+      console.log(`  re-queued ${r.retriedBatches} batch(es), ${r.retriedRecords} record(s).`);
+      console.log(`  watch it with:  job-watch --id=${args.id}`);
+    } else {
+      console.log('  nothing to retry - no batch has run out of attempts.');
+    }
+  },
   'job-watch': async (args) => {
     if (!args.id) throw new Error('usage: job-watch --id=<uuid> [--interval=ms] [--timeout=ms]');
     const interval = Number(args.interval);
@@ -995,6 +1021,23 @@ async function interactiveMenu(): Promise<void> {
         const id = await askUuid('  job id: ');
         const limit = await askNumber('  max rows (blank = default)');
         renderJobFailures(await cmdJobFailures(id, limit));
+      },
+    },
+    {
+      key: 'jobretry',
+      label: 'retry the batches a bulk job gave up on',
+      run: async () => {
+        const id = await askUuid('  job id: ');
+        const r = (await cmdJobRetry(id)) as unknown as {
+          retriedBatches?: number;
+          retriedRecords?: number;
+        };
+        if (r.retriedBatches) {
+          console.log(`  re-queued ${r.retriedBatches} batch(es), ${r.retriedRecords} record(s).`);
+          console.log(`  watch it with:  job-watch --id=${id}`);
+        } else {
+          console.log('  nothing to retry - no batch has run out of attempts.');
+        }
       },
     },
     {

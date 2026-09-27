@@ -103,8 +103,7 @@ export class BulkJobRepository {
   }
 
   /**
-   * Batches that exhausted their attempt budget, which is what it means for a
-   * message to reach the dead letter queue.
+   * Batches that exhausted their attempt budget and were given up on.
    *
    * The distinction matters because "failed" on a batch row is overloaded and the
    * two cases call for different responses:
@@ -115,15 +114,15 @@ export class BulkJobRepository {
    *
    *   status = 'failed'
    *     The batch never completed. It was attempted RABBITMQ_MAX_ATTEMPTS times
-   *     and the worker gave up, and the message went to the DLQ. That is an
-   *     infrastructure or contention problem, and those records are in neither
-   *     per-record failures nor the job's counters - they are simply not moved.
+   *     and the worker gave up. That is an infrastructure or contention problem,
+   *     and those records are in neither per-record failures nor the job's
+   *     counters - they are simply not moved.
    *
-   * Nothing consumes the DLQ, deliberately: a batch that has exhausted its budget
-   * should not be resurrected automatically, and the queue's own TTL and length
-   * cap are how it is eventually discarded. So the batch row is the only durable
-   * record that it happened, and this is the only way a caller learns of it
-   * without paging all fifty batches.
+   * The batch row is the record. There is no queue holding a second copy of it,
+   * because every field such a message carried is already here, and a queue
+   * nobody reads cannot be queried. This is the only way a caller learns of it
+   * without paging all fifty batches, and `POST /bulk-moves/:id/retry-failed` is
+   * how a caller acts on it.
    */
   async deadLettered(
     workspaceId: string,
@@ -155,6 +154,80 @@ export class BulkJobRepository {
       records: summary[0]?.records ?? 0,
       reasons: reasons.map((r) => ({ reason: r.reason, batches: r.batches })),
     };
+  }
+
+  /**
+   * Puts every given-up batch back in the queue.
+   *
+   * The batch row is reset to `pending` with `published_at` cleared, which is all
+   * it takes: the relay already selects on `published_at IS NULL`, so the normal
+   * timer picks these rows up and publishes them again. No new publish path, and
+   * no queue to hold the failures in the meantime.
+   *
+   * Safe to call twice. The second call matches no rows, because a batch that is
+   * no longer 'failed' is not a candidate, so it reports zero rather than
+   * re-queueing a batch that is mid-flight.
+   *
+   * Safe on a partly applied batch. A batch that failed may have moved some of its
+   * records before it did, and the worker's second check counts a record already in
+   * the target stage as moved without transitioning it again. So a retry cannot
+   * double-apply, which is the same guarantee the kill-and-resume check proves for
+   * a redelivered message.
+   *
+   * `attempts` goes back to zero on purpose. The batch was given up on because the
+   * condition that stopped it may well be gone - a restarted database, a cleared
+   * lock - and leaving the count where it was would make the retry fail instantly
+   * for the original reason.
+   */
+  async retryFailed(
+    workspaceId: string,
+    jobId: string,
+  ): Promise<{ batches: number; records: number }> {
+    return this.db.transaction(async (client) => {
+      // Freed first, and by cardinality rather than by the stored failed_count:
+      // a retried batch's records are in its item_ids, and that is the set being
+      // put back in play.
+      const freed = await client.query<{ batches: number; records: number }>(
+        `WITH doomed AS (
+            SELECT id, job_id, batch_no, cardinality(item_ids)::int AS n
+              FROM bulk_job_outbox
+             WHERE job_id = $1 AND workspace_id = $2 AND status = 'failed'
+             FOR UPDATE
+         ), dropped AS (
+            DELETE FROM bulk_job_failure f
+             USING doomed d
+             WHERE f.job_id = d.job_id AND f.batch_no = d.batch_no AND f.workspace_id = $2
+             RETURNING 1
+         )
+         SELECT count(*)::int AS batches, coalesce(sum(n), 0)::int AS records FROM doomed`,
+        [jobId, workspaceId],
+      );
+
+      await client.query(
+        `UPDATE bulk_job_outbox
+            SET status = 'pending', attempts = 0, error = NULL,
+                completed_count = 0, failed_count = 0,
+                started_at = NULL, completed_at = NULL,
+                published_at = NULL, updated_at = now()
+          WHERE job_id = $1 AND workspace_id = $2 AND status = 'failed'`,
+        [jobId, workspaceId],
+      );
+
+      const records = freed.rows[0]?.records ?? 0;
+      // The job has to leave its terminal state or settleJob's guard
+      // (`status NOT IN ('completed','failed','preparing')`) would ignore every
+      // batch that finishes from here on, and the job would report completed
+      // while records are still moving.
+      await client.query(
+        `UPDATE bulk_job
+            SET status = 'pending', error = NULL, completed_at = NULL,
+                failed_count = greatest(failed_count - $3, 0), updated_at = now()
+          WHERE id = $1 AND workspace_id = $2`,
+        [jobId, workspaceId, records],
+      );
+
+      return { batches: freed.rows[0]?.batches ?? 0, records };
+    });
   }
 
   /**

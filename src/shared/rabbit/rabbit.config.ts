@@ -19,14 +19,16 @@ export interface RabbitConfig {
   exchange: string;
   routingKey: string;
   queue: string;
-  retryQueue: string;
-  deadLetterQueue: string;
   prefetch: number;
+  /**
+   * How many times a batch is attempted before it is marked failed for good.
+   *
+   * Counted by the application, in the batch row's own `attempts` column, which
+   * is incremented by the same transaction that claims the batch. The database is
+   * the counter because the database is also where the failure is recorded, so
+   * the number that decides and the row that explains it cannot disagree.
+   */
   maxAttempts: number;
-  /** Per-attempt backoff, index 0 used after the first failure. */
-  retryDelaysMs: number[];
-  deadLetterTtlMs: number;
-  deadLetterMaxLength: number;
   heartbeatSeconds: number;
   consumerConcurrency: number;
   /**
@@ -62,13 +64,8 @@ const DEFAULTS: RabbitConfig = {
   exchange: 'bulk.move',
   routingKey: 'batch',
   queue: 'bulk.move',
-  retryQueue: 'bulk.move.retry',
-  deadLetterQueue: 'bulk.move.dlq',
   prefetch: 1,
   maxAttempts: 3,
-  retryDelaysMs: [1_000, 5_000, 30_000],
-  deadLetterTtlMs: 7 * 24 * 60 * 60 * 1_000,
-  deadLetterMaxLength: 10_000,
   heartbeatSeconds: 30,
   consumerConcurrency: 12,
   // 125 ms rather than 250, halved to cut the floor on a small job. A job waits
@@ -118,13 +115,8 @@ export function rabbitConfig(): RabbitConfig {
     exchange: process.env.RABBITMQ_EXCHANGE ?? DEFAULTS.exchange,
     routingKey: process.env.RABBITMQ_ROUTING_KEY ?? DEFAULTS.routingKey,
     queue: process.env.RABBITMQ_QUEUE ?? DEFAULTS.queue,
-    retryQueue: process.env.RABBITMQ_RETRY_QUEUE ?? DEFAULTS.retryQueue,
-    deadLetterQueue: process.env.RABBITMQ_DLQ ?? DEFAULTS.deadLetterQueue,
     prefetch: int('RABBITMQ_PREFETCH', DEFAULTS.prefetch),
     maxAttempts: int('RABBITMQ_MAX_ATTEMPTS', DEFAULTS.maxAttempts),
-    retryDelaysMs: list('RABBITMQ_RETRY_DELAYS_MS', DEFAULTS.retryDelaysMs),
-    deadLetterTtlMs: int('RABBITMQ_DLQ_TTL_MS', DEFAULTS.deadLetterTtlMs),
-    deadLetterMaxLength: int('RABBITMQ_DLQ_MAX_LENGTH', DEFAULTS.deadLetterMaxLength),
     heartbeatSeconds: int('RABBITMQ_HEARTBEAT', DEFAULTS.heartbeatSeconds),
     consumerConcurrency: int('RABBITMQ_CONSUMER_CONCURRENCY', DEFAULTS.consumerConcurrency),
     snapshotSweepIntervalMs: int('SNAPSHOT_SWEEP_INTERVAL_MS', DEFAULTS.snapshotSweepIntervalMs),

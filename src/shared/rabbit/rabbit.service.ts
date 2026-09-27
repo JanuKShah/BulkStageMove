@@ -76,51 +76,19 @@ export class RabbitService implements OnModuleDestroy {
    * Declares the topology. Idempotent, so every process can call it on startup
    * and it is the only place the layout is written down.
    *
-   * The retry queue carries a TTL and dead-letters back to the main exchange, so
-   * a failed batch is delayed without the worker sleeping and holding a consumer
-   * slot. Requeueing in place (basicNack with requeue) would instead spin hot,
-   * carry no attempt count, and reorder the queue.
-   *
-   * The DLQ is bounded on both length and age. An unbounded dead letter queue
-   * is a slow leak that nobody notices until the disk is full.
+   * One exchange and one queue. There is no dead letter queue: a batch that runs
+   * out of attempts is marked failed in Postgres - `bulk_job_outbox.status =
+   * 'failed'` with the reason, plus a `bulk_job_failure` row per record - and the
+   * message is acked. A queue would only have repeated what the batch row already
+   * says, and it could not be queried. There are no retry queues either; a
+   * requeued message comes straight back, and the attempt count is the batch
+   * row's own column.
    */
   async declareTopology(channel: Channel): Promise<void> {
     const c = this.config;
     await channel.assertExchange(c.exchange, 'direct', { durable: true });
-
     await channel.assertQueue(c.queue, { durable: true });
     await channel.bindQueue(c.queue, c.exchange, c.routingKey);
-
-    const delays = c.retryDelaysMs;
-    // One retry queue per distinct delay. A single queue can only carry one TTL,
-    // and the backoff is per attempt.
-    for (const delay of [...new Set(delays)]) {
-      const name = delays.length === 1 ? c.retryQueue : `${c.retryQueue}.${delay}`;
-      await channel.assertQueue(name, {
-        durable: true,
-        messageTtl: delay,
-        deadLetterExchange: c.exchange,
-        deadLetterRoutingKey: c.routingKey,
-      });
-    }
-
-    await channel.assertQueue(c.deadLetterQueue, {
-      durable: true,
-      arguments: {
-        'x-message-ttl': c.deadLetterTtlMs,
-        'x-max-length': c.deadLetterMaxLength,
-        'x-overflow': 'drop-head',
-      },
-    });
-  }
-
-  /** The retry queue matching a 1-based attempt number. */
-  retryQueueFor(attempt: number): string {
-    const delays = this.config.retryDelaysMs;
-    const index = Math.min(Math.max(attempt - 1, 0), delays.length - 1);
-    return delays.length === 1
-      ? this.config.retryQueue
-      : `${this.config.retryQueue}.${delays[index]}`;
   }
 
   async onModuleDestroy(): Promise<void> {

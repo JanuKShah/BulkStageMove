@@ -183,38 +183,33 @@ against that frozen copy — the request is never consulted again.**
 
 ## 7. Another week, ranked
 
-By dependency, not size: 3 enables 4, and 6 enables 7.
+By dependency, not size: 2 enables 3, and 5 enables 6.
 
 1. **`opportunity.version`** — the one real concurrency gap. `WHERE version =
    $expected`, reject the later save 409. **A bulk job must never bump it**, or a
    job moving 1,000 records hands every affected user a 409 about a field they
    never edited.
-2. **Retry a dead-lettered batch** — `bulk.move.dlq` has no consumer, so those
-   records are in no counter and are **simply not moved**. Re-driving is safe: the
-   worker's per-batch claim and compare-and-swap make a second attempt a no-op on
-   records already moved, and no new idempotency key is needed. Must land
-   **before** 3, which prunes the row it re-drives.
-3. **Retention at 60 days** on `bulk_job`, `bulk_job_outbox` and
-   `bulk_job_failure`. **Not** `opportunity_transition` — the audit trail must
-   outlive the job row. Makes 4 possible; 60 days is far longer than any client
+2. **Retention at 60 days** on `bulk_job`, `bulk_job_outbox` and
+   `bulk_job_failure`. **Not** `opportunity_transition` - the audit trail must
+   outlive the job row. Makes 3 possible; 60 days is far longer than any client
    retry window.
-4. **Clear the idempotency key past retention**, closing the § 8 gap — a key is
+3. **Clear the idempotency key past retention**, closing the § 8 gap — a key is
    reserved for the life of its row and nothing ever frees it, so the unique index
    grows without bound and a key can never be reused.
-5. **Redis, for two of the three things it is wanted for** — a token bucket for
+4. **Redis, for two of the three things it is wanted for** — a token bucket for
    the rate limit, and replacing the session-scoped advisory locks so the design
    survives connection pooling, which is what would make PgBouncer usable.
    **Not the idempotency key:** the unique constraint is transactional and durable
    where a Redis key is neither, and Redis cannot commit atomically with the
    insert, so the constraint stays regardless and the lookup gains roughly nothing
    against a 13–22 ms submit.
-6. **ZooKeeper or etcd for worker and scheduler membership — one, not both.**
+5. **ZooKeeper or etcd for worker and scheduler membership — one, not both.**
    Both give ephemeral leases and watches, which is what "bring up a worker as
    required" needs and what a database transaction cannot span. **etcd** is the
    cheaper bet — a static binary, gRPC, the library Kubernetes already ships.
    **ZooKeeper** is heavier but has more very-large-cluster evidence. Register on
    start, deregister on shutdown, watch for peers instead of waking on a timer.
-7. **Multi-region, which needs 6 first** — quorum consensus, the coordination
+6. **Multi-region, which needs 5 first** — quorum consensus, the coordination
    service, geo-aware worker placement. It opens a question this design does not
    answer: a bulk move crossing a border is a data-residency problem, not a
    latency one.
@@ -223,11 +218,14 @@ By dependency, not size: 3 enables 4, and 6 enables 7.
 
 True now, and would bite at scale.
 
-- **A dead-lettered batch cannot be retried** — nothing consumes `bulk.move.dlq`, by
-  design, and its 7-day TTL and length cap discard it eventually. Those records
-  are **in neither the per-record failures nor the job's counters — they are
-  simply not moved**, and the batch row's `deadLettered` field is the only durable
-  record. Re-submitting is the only recovery, and needs a new key.
+- **A given-up batch is retried only when a caller asks** —
+  `POST /bulk-moves/:id/retry-failed` resets it to `pending` and clears
+  `published_at`, so the relay republishes it. Nothing retries on its own: the
+  condition that stopped the batch is usually gone by the time anyone notices, and
+  a silent retry would hide the failure it was retrying. Until it is called, those
+  records are **in neither the per-record failures nor the job's counters - they
+  are simply not moved** - which is why `deadLettered` is reported on the status
+  response and worth alerting on.
 - **Idempotency keys are never cleared** — a key lives as long as its row, so the
   constraint grows without bound and a key cannot be reused even after its job is
   deleted. A retention window fixes both, and a job must outlive any retry a
@@ -269,9 +267,14 @@ One line each; the sections above are the reasoning.
   picked up by whichever replica is alive.
 - **A correlation id is minted at the edge**, validated against
   `^[A-Za-z0-9._:-]{1,64}$` — a newline would let a client forge a log line.
-- **Five queues: one work, one dead-letter, three retry**, one per backoff step
-  (1 s, 5 s, 30 s), because a queue carries one TTL. The backoff waits in the
-  broker, so a retrying batch holds no worker slot — which matters at
-  `prefetch: 1`.
+- **One exchange and one queue.** No dead letter queue and no retry queues: a
+  batch that runs out of attempts is marked `failed` in `bulk_job_outbox` with its
+  reason, plus a `bulk_job_failure` row per record, and the message is acked. A
+  queue would only repeat what the batch row already says and could not be
+  queried. The attempt count is that row's own `attempts` column, incremented by
+  the same transaction that claims the batch, so the number that stops a retry and
+  the row that records why are the same fact. `POST /bulk-moves/:id/retry-failed`
+  puts a given-up batch back, by clearing `published_at` so the relay republishes
+  it.
 - **A dash in a benchmark table** means the instrumentation did not exist for
   that configuration, not that the figure is zero.

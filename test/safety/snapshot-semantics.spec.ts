@@ -300,11 +300,12 @@ describe('batches hold records instead of rows', () => {
       enqueue: false,
     });
 
-    // Nothing consumes the dead letter queue, deliberately: a batch that has spent
-    // its budget should not be resurrected automatically. That makes the batch row
-    // the only durable record, so the status response has to carry it - otherwise
-    // these records are in neither the per-record failures nor the job counters
-    // and are simply not moved.
+    // A batch that has spent its budget is not retried automatically: the
+    // condition that stopped it may still be there, and a silent retry would hide
+    // the failure. So the batch row is the record, the status response has to
+    // carry it, and `POST /bulk-moves/:id/retry-failed` is how a caller asks for
+    // another go. Without that reporting these records are in neither the
+    // per-record failures nor the job counters and are simply not moved.
     await pool.query(
       `UPDATE bulk_job_outbox
           SET status = 'failed', failed_count = cardinality(item_ids), error = $3,
@@ -370,6 +371,94 @@ describe('batches hold records instead of rows', () => {
     );
     expect(batch.rows[0]!.status).toBe('completed');
     expect(batch.rows[0]!.failed_count).toBe(3);
+  });
+
+  it('re-queues given-up batches on request, and a second call is a no-op', async () => {
+    const ids = await seedOpportunitiesInStage(ws.workspaceId, contacted(), 5);
+    const { jobId, batchNo } = await createJobWithItems(ws.workspaceId, closedWon(), ids, {
+      enqueue: false,
+    });
+    // Marked failed the way the worker marks it, so the reset has the same row to
+    // find that it would find in production.
+    await pool.query(
+      `UPDATE bulk_job_outbox
+          SET status = 'failed', failed_count = cardinality(item_ids),
+              error = 'attempts exhausted', attempts = 3,
+              completed_at = now(), updated_at = now()
+        WHERE job_id = $1 AND batch_no = $2`,
+      [jobId, batchNo],
+    );
+    await pool.query(
+      `UPDATE bulk_job SET status = 'completed', failed_count = 5, completed_at = now()
+        WHERE id = $1`,
+      [jobId],
+    );
+
+    const retried = await api<{ retriedBatches: number; retriedRecords: number }>(
+      'http://localhost:3005',
+      `/bulk-moves/${jobId}/retry-failed`,
+      { method: 'POST', workspaceId: ws.workspaceId },
+    );
+    expect(retried.status).toBe(201);
+    expect(retried.body.retriedBatches).toBe(1);
+    expect(retried.body.retriedRecords).toBe(5);
+
+    // Reset to pending with the attempt budget back, or the retry would fail
+    // immediately for the original reason.
+    const after = await pool.query<{ status: string; attempts: number; published_at: Date | null }>(
+      'SELECT status, attempts, published_at FROM bulk_job_outbox WHERE job_id = $1 AND batch_no = $2',
+      [jobId, batchNo],
+    );
+    expect(after.rows[0]!.status).toBe('pending');
+    expect(after.rows[0]!.attempts).toBe(0);
+    // Cleared, because that is the column the relay selects on - this is what
+    // makes the row get published again.
+    expect(after.rows[0]!.published_at).toBeNull();
+
+    // The job has to leave its terminal state, or settleJob's guard would ignore
+    // every batch that finishes from here on.
+    const job = await pool.query<{ status: string; failed_count: number }>(
+      'SELECT status, failed_count FROM bulk_job WHERE id = $1',
+      [jobId],
+    );
+    expect(job.rows[0]!.status).toBe('pending');
+    expect(job.rows[0]!.failed_count).toBe(0);
+
+    // Idempotent: the second call matches no failed rows, so it reports zero
+    // rather than re-queueing a batch that may be mid-flight.
+    const again = await api<{ retriedBatches: number }>(
+      'http://localhost:3005',
+      `/bulk-moves/${jobId}/retry-failed`,
+      { method: 'POST', workspaceId: ws.workspaceId },
+    );
+    expect(again.status).toBe(201);
+    expect(again.body.retriedBatches).toBe(0);
+  });
+
+  it('retries nothing when there is nothing given up', async () => {
+    const ids = await seedOpportunitiesInStage(ws.workspaceId, contacted(), 3);
+    const { jobId, batchNo } = await createJobWithItems(ws.workspaceId, closedWon(), ids, {
+      enqueue: false,
+    });
+    await processBatchForTest(ws.workspaceId, jobId, batchNo);
+
+    const res = await api<{ retriedBatches: number; retriedRecords: number }>(
+      'http://localhost:3005',
+      `/bulk-moves/${jobId}/retry-failed`,
+      { method: 'POST', workspaceId: ws.workspaceId },
+    );
+    expect(res.status).toBe(201);
+    expect(res.body.retriedBatches).toBe(0);
+    expect(res.body.retriedRecords).toBe(0);
+  });
+
+  it('404s a retry for a job in another workspace', async () => {
+    const other = await provisionWorkspace('retry-tenant');
+    const res = await api('http://localhost:3005', `/bulk-moves/${randomUUID()}/retry-failed`, {
+      method: 'POST',
+      workspaceId: other.workspaceId,
+    });
+    expect(res.status).toBe(404);
   });
 
   it('reports no dead-lettered batches for a healthy job', async () => {

@@ -85,7 +85,7 @@ migrations, and blocks until healthy. `npm run down` tears the stack down and
 | `worker-service` | applies batches; **no port** — it only consumes | — | 1 process, **12 consumers**, **DB pool of 12** |
 | `nginx` | the edge; fronts transition-service only | 18080 | 1 |
 | `postgres` | the datastore | 5432 | 1 |
-| `rabbitmq` | batch dispatch | 5672, UI 15672 | 1 exchange, **5 queues** |
+| `rabbitmq` | batch dispatch | 5672, UI 15672 | 1 exchange, **1 queue** |
 | `migrate` | applies migrations, then exits | — | runs once at startup |
 
 **The three loops that do the work:**
@@ -100,8 +100,9 @@ Twelve workers is the widest thing here, matched to this host's 12 cores; why ba
 
 **"DB pool of N" is a ceiling on Postgres connections** for that process (`PG_POOL_MAX` becomes `pg`'s `max`), opened on demand — the idle stack held 8 while this was written. Five pools of 10 plus the worker's 12 is **62 against Postgres' 100** `max_connections`, which is why the worker gets 12 and the rest 10. The ceiling is per process, so it multiplies by replica count: three worker replicas put the stack at 86, and a fourth breaches the limit.
 
-**Five queues: one work, one dead-letter, three retry.** The reasoning for the shape
-is in `DESIGN.md` § 9.
+**One exchange, one queue.** No dead letter queue: a batch that runs out of attempts
+is marked `failed` in Postgres and the message is acked, so `POST
+/bulk-moves/:id/retry-failed` can put it back. The reasoning is in `DESIGN.md` § 9.
 
 Tenant scoping is a required `X-Workspace-Id` header.
 
@@ -120,9 +121,9 @@ observable without a UI. A gateway, websockets, or one service per noun. An
 event-driven *relay* kick — submit kicks the sweep inline, but a committed batch
 still waits out the relay's next tick.
 
-**Known gaps, in `DESIGN.md` § 8.** A dead-lettered batch cannot be retried and its
-records are in no counter. Idempotency keys are never cleared. Queue wait is the
-largest cost and is not yet attributed to anything.
+**Known gaps, in `DESIGN.md` § 8.** A given-up batch's records sit in no counter
+until someone calls `retry-failed`. Idempotency keys are never cleared. Queue wait
+is the largest cost and is not yet attributed to anything.
 
 ## Exploring it
 
@@ -143,6 +144,7 @@ npm run cli -- job-watch --workspace=<uuid> --id=<jobId>            # poll to co
 npm run cli -- job-status --workspace=<uuid> --id=<jobId>           # one shot
 npm run cli -- job-batches --workspace=<uuid> --id=<jobId>          # per-batch state
 npm run cli -- job-failures --workspace=<uuid> --id=<jobId>         # why records did not move
+npm run cli -- job-retry --workspace=<uuid> --id=<jobId>            # retry batches it gave up on
 npm run cli -- dump-db --out=before.txt                              # then --out=after.txt and diff
 ```
 

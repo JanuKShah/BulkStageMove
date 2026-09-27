@@ -62,6 +62,18 @@ export class TransitionController {
     return this.service.batches(requireWorkspaceId(headers), requireUuid('id', id));
   }
 
+  /**
+   * Re-queues the batches that ran out of attempts.
+   *
+   * A caller has to ask for this. Nothing retries a given-up batch on its own,
+   * because the condition that stopped it is usually gone by the time anyone
+   * notices, and a silent automatic retry would hide the failure it is retrying.
+   */
+  @Post(':id/retry-failed')
+  async retryFailed(@Headers() headers: Headers_, @Param('id') id: string) {
+    return this.service.retryFailed(requireWorkspaceId(headers), requireUuid('id', id));
+  }
+
   @Get(':id/transitions')
   transitions(
     @Headers() headers: Headers_,

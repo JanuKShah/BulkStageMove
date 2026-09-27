@@ -95,8 +95,7 @@ export class WorkerRepository {
    * session rather than the transaction. The advisory lock that keeps a second
    * worker off the batch, and the attempt counter, which must commit before the
    * work runs - incremented inside the work transaction, a rollback would erase
-   * it and the batch would retry until the broker gave up rather than reaching
-   * the dead letter queue.
+   * it and the batch would retry for ever rather than ever being marked failed.
    *
    * Taking the lock through the pool instead would put it on an arbitrary
    * connection: a second worker could then acquire the same key on a different
@@ -258,7 +257,7 @@ export class WorkerRepository {
       // Only reached for conditions that are not per-record: a lost job row, or
       // a concurrent write. Those are worth retrying, and only the attempt that
       // spends the budget records the failure - reporting 'dead' without writing
-      // it would dead-letter the message and leave the batch running forever.
+      // it would ack the message and leave the batch running forever.
       if (attempts >= this.config.maxAttempts) {
         const failed = await this.failBatch(
           client,
@@ -690,7 +689,7 @@ export class WorkerRepository {
   }
 }
 
-/** A batch that cannot be applied as it stands. Retried, then dead-lettered. */
+/** A batch that cannot be applied as it stands. Retried, then marked failed. */
 export class BatchRejected extends Error {
   constructor(message: string) {
     super(message);

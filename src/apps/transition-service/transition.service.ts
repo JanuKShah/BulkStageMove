@@ -11,6 +11,7 @@ import { parseListFilter, type Outcome } from '../../shared/filter/opportunity-f
 import { BulkJob, BulkJobRepository } from './bulk-job.repository';
 import { JobTransitionRepository } from './job-transition.repository';
 import { OutboxRepository } from './outbox.repository';
+import { OutboxRelay } from './outbox-relay';
 import { SnapshotBuilder } from './snapshot-builder.service';
 
 const DEFAULT_LIMIT = 50;
@@ -42,6 +43,7 @@ export class TransitionService {
     private readonly stages: ServiceClient,
     private readonly jobTransitions: JobTransitionRepository,
     private readonly builder: SnapshotBuilder,
+    private readonly relay: OutboxRelay,
   ) {}
 
   /**
@@ -125,6 +127,25 @@ export class TransitionService {
     return { job, created: true, itemsCreated: 0 };
   }
 
+  /**
+   * Re-queues the batches that ran out of attempts, for a caller to ask for
+   * explicitly rather than for the system to do behind their back.
+   *
+   * The reset alone is enough to get the work going: it clears `published_at`, so
+   * the relay's next pass publishes those rows like any other. Returns how many
+   * batches and records went back, which is zero when there was nothing to do.
+   */
+  async retryFailed(workspaceId: string, jobId: string) {
+    const job = await this.jobs.findById(workspaceId, jobId);
+    if (!job) throw new NotFoundException(`bulk job ${jobId} not found`);
+    const retried = await this.jobs.retryFailed(workspaceId, jobId);
+    // Nudged rather than waited on, so the common case - one failed batch, one
+    // idle relay - does not pay a full tick. The sweep timer is the fallback, and
+    // the reset is durable either way.
+    void this.relay.tick();
+    return { jobId, retriedBatches: retried.batches, retriedRecords: retried.records };
+  }
+
   async status(workspaceId: string, jobId: string) {
     const job = await this.jobs.findById(workspaceId, jobId);
     if (!job) throw new NotFoundException(`bulk job ${jobId} not found`);
@@ -157,11 +178,10 @@ export class TransitionService {
         completed: counts['completed'] ?? 0,
         failed: counts['failed'] ?? 0,
       },
-      // Batches that ran out of attempts, which is what it means for a message to
-      // reach the dead letter queue. Separate from `batches.failed` in meaning
-      // even though both count the same rows, and from `failures` in kind: those
-      // are records a user has to fix, these are records the worker never got to.
-      // Zero for a healthy job, and worth alerting on.
+      // Batches that ran out of attempts. Separate from `batches.failed` in
+      // meaning even though both count the same rows, and from `failures` in
+      // kind: those are records a user has to fix, these are records the worker
+      // never got to. Zero for a healthy job, and worth alerting on.
       deadLettered,
       createdAt: job.created_at,
       startedAt: job.started_at,

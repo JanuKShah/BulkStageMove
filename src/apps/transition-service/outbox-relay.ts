@@ -33,6 +33,8 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
   private timer: NodeJS.Timeout | null = null;
   private running = false;
   private stopped = false;
+  /** A pass was asked for while one was already running. */
+  private again = false;
   /** Last totals written to the log, so an idle relay stays silent. */
   private reported = { published: 0, failed: 0 };
   readonly stats: RelayStats = { published: 0, failed: 0 };
@@ -57,10 +59,25 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
     this.timer = null;
   }
 
-  /** Exposed so tests can drive one pass instead of waiting for the timer. */
+  /**
+   * One pass over the unpublished rows.
+   *
+   * Exposed so tests can drive a pass instead of waiting for the timer, and so a
+   * caller that has just written a row - `retry-failed` - can ask for it now
+   * rather than at the next tick.
+   *
+   * A call that arrives while a pass is running does not run a second pass in
+   * parallel; it sets a flag and returns, and the running pass loops again. That
+   * is not the same as ignoring it. Returning without a flag would drop the
+   * request, and the row would sit unpublished until the timer came round again,
+   * which is the delay the caller asked us to skip.
+   */
   async tick(): Promise<void> {
-    // Overlapping ticks would publish the same row twice before either marks it.
-    if (this.running || this.stopped) return;
+    if (this.stopped) return;
+    if (this.running) {
+      this.again = true;
+      return;
+    }
     this.running = true;
     try {
       const rows = await this.outbox.unpublished(this.config.relayBatchSize);
@@ -104,6 +121,14 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
     } finally {
       this.reportProgress();
       this.running = false;
+      // Someone asked for another pass while this one was in flight. Looping
+      // here rather than on the next timer is what makes the flag worth setting;
+      // `again` is cleared first so a request that lands during *this* pass is
+      // not also served by it.
+      if (this.again && !this.stopped) {
+        this.again = false;
+        await this.tick();
+      }
     }
   }
 

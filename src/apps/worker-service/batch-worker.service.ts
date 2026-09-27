@@ -19,9 +19,10 @@ import { type BatchResult, WorkerRepository } from './worker.repository';
  * Consumes batch messages and applies them.
  *
  * All the decision-making is in WorkerRepository.processBatch. This class only
- * turns its answer into broker behaviour, and does so by republishing rather
- * than nacking with requeue: requeue puts a message back immediately with no
- * delay and no attempt count, which spins.
+ * turns its answer into broker behaviour: a retry is nacked straight back onto the
+ * queue, and a give-up is acked, because processBatch has already written the
+ * failure to the batch row. There is no delay and no second queue, so the count
+ * that eventually stops a retry is the batch row's own `attempts` column.
  *
  * It also owns the per-batch log line, because it is the only place that knows
  * which consumer slot took the message. That slot is the piece that makes a
@@ -97,9 +98,15 @@ export class BatchWorker implements OnModuleInit, OnModuleDestroy {
     try {
       batch = JSON.parse(message.content.toString()) as BatchMessage;
     } catch {
-      // Unparseable will never succeed on a retry, so it goes straight to the DLQ.
-      await this.deadLetter(message);
-      this.logger.warn(`slot=${slot} unparseable message dead-lettered`);
+      // Unparseable will never succeed on a retry. There is no batch row to mark
+      // - the message never parsed into a job and batch number - so this is the
+      // one failure the database cannot record, and it is logged rather than
+      // silently acked. Acked because requeueing an unparseable message is an
+      // infinite loop against a poison payload.
+      this.logger.error(
+        `slot=${slot} unparseable batch message, dropped: ${message.content.toString('utf8').slice(0, 200)}`,
+      );
+      ackOn?.ack(message);
       return { disposition: 'dead', moved: 0, failed: 0, skipped: 0, attempts: 0 };
     }
 
@@ -107,30 +114,39 @@ export class BatchWorker implements OnModuleInit, OnModuleDestroy {
     try {
       result = await this.repository.processBatch(batch.workspaceId, batch.jobId, batch.batchNo);
     } catch (error) {
-      // Infrastructure failure, nothing was touched. Retried without spending
-      // the attempt budget: a database outage should not be what dead-letters a
-      // batch. The reason this is safe is that the lock is released and the
+      // Infrastructure failure, nothing was touched: the lock is released and the
       // items are still pending, so a redelivery starts cleanly.
+      //
+      // Requeued rather than failed, because the batch is fine and the database
+      // is not. Nothing was written, so the attempt column did not move either and
+      // a long outage retries indefinitely rather than marking the batch failed.
       //
       // Logged rather than swallowed, because this is the path where the work
       // stops making progress and nothing else records it: the batch row is
       // untouched, so no column shows the failure either.
       this.logger.error(
         `job=${batch.jobId.slice(0, 8)} batch=${batch.batchNo} slot=${slot} ` +
-          `infrastructure failure, republishing: ${(error as Error).message}`,
+          `infrastructure failure, requeueing: ${(error as Error).message}`,
       );
       result = { disposition: 'retry', moved: 0, failed: 0, skipped: 0, attempts: 0 };
     }
 
     this.logBatch(batch, result, slot);
 
-    if (result.disposition === 'retry' || result.disposition === 'dead') {
-      await this.republish(message, result);
+    // Exactly one of these runs. A delivery is settled once: acking a message
+    // that has already been nacked is a double-settle, and amqplib closes the
+    // channel on it, so the redelivery the nack asked for would never arrive.
+    if (result.disposition === 'retry') {
+      this.reject(message, ackOn);
+    } else {
+      // 'applied', 'skipped' and 'dead' all settle here. 'dead' needs nothing
+      // more: processBatch already wrote the failure to bulk_job_outbox and
+      // bulk_job_failure and settled the job. Acked only once the outcome is
+      // durable, so a process that dies first leaves the message unacked and the
+      // broker redelivers it - which is harmless, because the claim is a
+      // compare-and-set and a completed batch is recognised rather than reapplied.
+      ackOn?.ack(message);
     }
-    // Acked last, and only once the outcome is durable. If this process dies
-    // before the ack, RabbitMQ redelivers, and the claim is a compare-and-set so
-    // the redelivery is harmless.
-    ackOn?.ack(message);
     return result;
   }
 
@@ -160,30 +176,22 @@ export class BatchWorker implements OnModuleInit, OnModuleDestroy {
     );
   }
 
-  private async republish(message: ConsumeMessage, result: BatchResult): Promise<void> {
-    const dead = result.disposition === 'dead' || result.attempts >= this.config.maxAttempts;
-    const queue = dead ? this.config.deadLetterQueue : this.rabbit.retryQueueFor(result.attempts);
-    const channel = await this.rabbit.publisherChannel();
-    const properties = message.properties as { contentType?: string; messageId?: string };
-    channel.publish('', queue, message.content, {
-      persistent: true,
-      contentType: properties.contentType ?? 'application/json',
-      ...(properties.messageId === undefined ? {} : { messageId: properties.messageId }),
-      headers: {
-        'x-attempt': result.attempts + 1,
-        ...(result.reason ? { reason: result.reason } : {}),
-      },
-    });
-    await channel.waitForConfirms();
-  }
-
-  private async deadLetter(message: ConsumeMessage): Promise<void> {
-    const channel = await this.rabbit.publisherChannel();
-    channel.publish('', this.config.deadLetterQueue, message.content, {
-      persistent: true,
-      contentType: 'application/json',
-    });
-    await channel.waitForConfirms();
+  /**
+   * Hand the message back for another attempt.
+   *
+   * The channel is the one the delivery arrived on, because that is the only one
+   * the broker will accept a nack on. A shared reference would nack the wrong
+   * delivery whenever two consumers are in flight.
+   *
+   * No channel means the connection is already gone, and an unacked delivery is
+   * redelivered by the broker when it notices. So there is nothing to repair
+   * here, and nacking on a guessed channel would be the error.
+   */
+  private reject(
+    message: ConsumeMessage,
+    channel: Awaited<ReturnType<RabbitService['consumerChannel']>> | undefined,
+  ): void {
+    channel?.nack(message, false, true);
   }
 
   get isStopping(): boolean {
