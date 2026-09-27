@@ -101,7 +101,7 @@ Twelve workers is the widest thing here, matched to this host's 12 cores; why ba
 **"DB pool of N" is a ceiling on Postgres connections** for that process (`PG_POOL_MAX` becomes `pg`'s `max`), opened on demand — the idle stack held 8 while this was written. Five pools of 10 plus the worker's 12 is **62 against Postgres' 100** `max_connections`, which is why the worker gets 12 and the rest 10. The ceiling is per process, so it multiplies by replica count: three worker replicas put the stack at 86, and a fourth breaches the limit.
 
 **Five queues: one work, one dead-letter, three retry.** The reasoning for the shape
-is in `DESIGN.md` § 10.
+is in `DESIGN.md` § 9.
 
 Tenant scoping is a required `X-Workspace-Id` header.
 
@@ -111,15 +111,16 @@ Tenant scoping is a required `X-Workspace-Id` header.
 that commits each batch with the cursor after it; batches of 1,000 dispatched over
 an outbox to 12 consumers; `stage_decided_at` so a person's edit is never
 overwritten and the newest job wins; composite-FK tenant isolation; 216 tests; a
-50,000-record job in **1.40 s**, and 500,000 in 57.34 s. A CLI with a job watcher
+50,000-record job in **1.40 s**, and 500,000 in 58.71 s. A CLI with a job watcher
 that polls to completion, and a database dump for checking a move by eye.
 
 **Deliberately not built.** Redis — every piece of state is already durable in
 Postgres or per-process. `opportunity.version` — the one real concurrency gap, not
-observable without a UI. A gateway, websockets, or one service per noun. Event-driven
-job kick — the timers are the floor, and a shorter tick only lowers it.
+observable without a UI. A gateway, websockets, or one service per noun. An
+event-driven *relay* kick — submit kicks the sweep inline, but a committed batch
+still waits out the relay's next tick.
 
-**Known gaps, in `DESIGN.md` § 9.** A dead-lettered batch cannot be retried and its
+**Known gaps, in `DESIGN.md` § 8.** A dead-lettered batch cannot be retried and its
 records are in no counter. Idempotency keys are never cleared. Queue wait is the
 largest cost and is not yet attributed to anything.
 

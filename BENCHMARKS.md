@@ -7,9 +7,35 @@ Measured on Windows 11, 12 logical cores, 15.7 GB, Node v24.21.0, PostgreSQL
 
 ## 50k bulk job
 
-![Design diagram](docs/design.png)
+**A tick is one firing of the two background timers** — the builder sweep and the
+outbox relay, both on this interval. Only one of them gates a fresh job: submit
+kicks the sweep itself, fire-and-forget, so batching starts in **10 ms** rather than
+waiting out a tick. The sweep timer is the fallback that finishes a job whose walk
+did not complete. The relay is never kicked, so written batches wait up to one tick
+to be published — **208 ms mean**, and the only poll wait in a job. The worker has no
+timer; it consumes messages as they arrive.
 
-**A tick is one firing of the two background timers** — the builder sweep and the outbox relay, both on this interval. A job waits one tick before its first batch exists and one before any of it is published, so the expected wait is half the interval per tick, and that is most of a small job's wall clock. The worker has no timer; it consumes messages as they arrive.
+```
+  POST /bulk-moves ──▶  one job row written as 'preparing', 201 + jobId (~13 ms)
+                              │
+                              │  submit kicks the sweep itself — no timer, 10 ms
+                              ▼
+                        batches written, 1,000 ids each
+                              │
+                              │  wait up to one RELAY tick — 208 ms mean
+                              ▼
+                        published to RabbitMQ
+                              │
+                              │  no timer — consumed as it arrives
+                              ▼
+                        12 consumers apply batches
+                              │
+                              ▼
+  GET /bulk-moves/:id ──▶  progress, batches, failures, dead letters
+```
+
+One of the three phases is poll-driven, and it is the only place a fresh job waits.
+The drain is not.
 
 | 50,000 records | item table, 4 consumers | batches, 4 consumers | batches, 12 consumers | **+ scheduler, 250 ms ticks** | **+ scheduler, 125 ms ticks** |
 |---|---|---|---|---|---|
@@ -70,5 +96,5 @@ Mean of five runs, fresh volume each time, from the four timestamps on each batc
 
 ## Beyond the brief
 
-At 500,000 the job still completes cleanly — 500,000 moved, 0 failed, 57.34 s
+At 500,000 the job still completes cleanly — 500,000 moved, 0 failed, 58.71 s
 end-to-end.
