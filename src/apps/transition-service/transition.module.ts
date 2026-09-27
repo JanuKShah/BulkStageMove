@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { DatabaseService } from '../../shared/database/database.service';
+import { RequestContextModule } from '../../shared/http/request-context.module';
 import { ServiceClient } from '../../shared/http/service-client';
 import { HealthController } from '../../shared/health/health.controller';
 import { BulkJobRepository } from './bulk-job.repository';
@@ -13,6 +14,7 @@ import { TransitionController } from './transition.controller';
 import { TransitionService } from './transition.service';
 
 @Module({
+  imports: [RequestContextModule],
   controllers: [TransitionController, HealthController],
   providers: [
     TransitionService,

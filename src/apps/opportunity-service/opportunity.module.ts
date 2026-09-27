@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { DatabaseService } from '../../shared/database/database.service';
+import { RequestContextModule } from '../../shared/http/request-context.module';
 import { HealthController } from '../../shared/health/health.controller';
 import { ServiceClient } from '../../shared/http/service-client';
 import { OpportunityController } from './opportunity.controller';
@@ -7,6 +8,7 @@ import { OpportunityRepository } from './opportunity.repository';
 import { OpportunityService } from './opportunity.service';
 
 @Module({
+  imports: [RequestContextModule],
   controllers: [HealthController, OpportunityController],
   providers: [
     OpportunityService,

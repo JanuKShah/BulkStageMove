@@ -21,6 +21,7 @@ export function headers(workspaceId: string): Record<string, string> {
 export interface ApiResponse<T> {
   status: number;
   body: T;
+  headers: Headers;
 }
 
 export async function api<T = unknown>(
@@ -41,6 +42,9 @@ export async function api<T = unknown>(
   return {
     status: response.status,
     body: (text === '' ? null : JSON.parse(text)) as T,
+    // Carried because the correlation id is only visible there - it is minted or
+    // honoured per request, so a test cannot know it in advance.
+    headers: response.headers,
   };
 }
 
