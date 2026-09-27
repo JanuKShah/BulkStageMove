@@ -1,23 +1,23 @@
 /**
- * How filter selectivity changes the cost of a build.
+ * How filter selectivity changes the cost of a bulk move.
  *
  *   npx tsx test/happyflow/filter-bench.ts
  *
- * A bulk move's filter is not only a predicate - it decides how far the walk has
- * to read. The page query is keyset-paginated over
- * (workspace_id, created_at, id), and stage_id is applied as a filter on top of
- * that rather than being an index column, so a selective filter keeps walking
- * past rows it will discard until it has collected a full page.
- *
- * That predicts something the unfiltered benchmark cannot show: the same number of
- * matched records should cost more per page when they are a small slice of a large
- * workspace than when they are all of it. This measures it, because the index
- * choice only makes sense once the cost of the wrong shape is known.
+ * A filter is not only a predicate - it decides how much work the job is. This
+ * measures a build and a full job per filter, so the two rates can be told apart:
+ * the build rate is records per second of *finding* records, and the end-to-end
+ * rate includes the drain and is what a submitter actually waits for.
  *
  * Each case gets its own freshly seeded workspace. They cannot share one: a build
  * moves every record it matched, so the second case would filter over a
  * distribution the first had already rearranged, and the comparison would be
- * between two different datasets rather than four filters.
+ * between two datasets rather than four filters.
+ *
+ * Each case also runs twice, reporting only the second. Run once, the first case
+ * is always the coldest thing in shared buffers - 50,000 rows have just been
+ * inserted and nothing has touched them - and it reads high against the rest.
+ * That is a warm-up curve, not a property of the filter, and reporting it as one
+ * would be reading the order the cases happened to run in.
  *
  * Deliberately not a test. Wall-clock on a shared host, like benchmark.ts.
  */
@@ -40,16 +40,8 @@ interface Case {
 }
 
 const CASES: Case[] = [
-  {
-    label: 'no filter',
-    shape: `all ${TOTAL.toLocaleString('en-US')}`,
-    filter: () => ({}),
-  },
-  {
-    label: 'outcome',
-    shape: `the quarter already won`,
-    filter: () => ({ outcome: 'won' }),
-  },
+  { label: 'no filter', shape: 'all 50,000', filter: () => ({}) },
+  { label: 'outcome', shape: 'the quarter already won', filter: () => ({ outcome: 'won' }) },
   {
     label: 'value range',
     shape: 'the top tenth by value',
@@ -57,7 +49,7 @@ const CASES: Case[] = [
   },
   {
     label: 'date range',
-    shape: 'the most recent tenth by created_at',
+    shape: 'the most recent tenth',
     filter: () => ({ createdFrom: DATE_CUT }),
   },
 ];
@@ -108,25 +100,30 @@ function get(path: string, workspaceId: string): Promise<{ status: number; body:
 }
 
 /**
- * Pages written, and the mean gap between consecutive pages.
+ * Pages, mean gap between them, and records the drain actually moved.
  *
- * Three things force this shape. The gap needs its own level because an aggregate
- * cannot wrap a window function. b.created_at has to be qualified, because the
- * window default joins bulk_job's column of the same name. And the parameter is
- * referenced once, in the CTE: a scalar subquery in the outer SELECT re-referencing
- * $1 parses but does not bind.
+ * Three things force this shape. The gaps need their own level because an
+ * aggregate cannot wrap a window function. b.created_at has to be qualified,
+ * because the window default joins bulk_job's column of the same name. And the
+ * parameter is referenced once per CTE, because a scalar subquery in the outer
+ * SELECT re-referencing $1 parses but does not bind.
  */
-const PAGE_COST = `
+const JOB_COST = `
   WITH gaps AS (
     SELECT b.created_at - LAG(b.created_at, 1, j.created_at)
              OVER (ORDER BY b.batch_no) AS gap
       FROM bulk_job_outbox b
       JOIN bulk_job j ON j.id = b.job_id
      WHERE b.job_id = $1
+  ),
+  drained AS (
+    SELECT coalesce(sum(completed_count), 0)::int AS processed
+      FROM bulk_job_outbox WHERE job_id = $1
   )
-  SELECT count(*)::int AS pages,
-         COALESCE(round(avg(EXTRACT(EPOCH FROM gap) * 1000))::int, 0) AS per_page_ms
-    FROM gaps`;
+  SELECT (SELECT count(*)::int FROM gaps) AS pages,
+         COALESCE((SELECT round(avg(EXTRACT(EPOCH FROM gap) * 1000))::int FROM gaps), 0)
+           AS per_page_ms,
+         (SELECT processed FROM drained) AS processed`;
 
 /**
  * A fixture with something for each filter to select.
@@ -138,9 +135,10 @@ const PAGE_COST = `
  * against it, three of the four filters matched zero records and the fourth
  * matched all of them, which says nothing about selectivity.
  *
- * So: three stages carrying three outcomes, a linear value spread, and a year of
- * created_at, with forward rules into a fourth stage so a matched record is
- * genuinely movable rather than refused.
+ * The created_at spread is deliberately a past year. A job's watermark is
+ * `created_at <= now()`, so a spread running into the current year had its
+ * future-dated records excluded from every job - which showed up as 36,989
+ * matched against a 50,000 fixture and read as a build that stopped early.
  */
 async function seed(): Promise<{ workspaceId: string; target: string }> {
   const created = await pool.query<{ id: string }>(
@@ -169,15 +167,9 @@ async function seed(): Promise<{ workspaceId: string; target: string }> {
     );
   }
 
-  // A quarter in each outcome, a linear value spread, and created_at over a year
-  // so a date boundary is a real cut rather than a coin toss. The casts on the
-  // CASE branches are required: untyped parameters arrive as unknown, resolve the
-  // CASE to text, and the insert then fails on the uuid column.
-  //
-  // The year is 2025, deliberately in the past. A job's watermark is
-  // `created_at <= now()`, so a spread that ran into the current year had its
-  // future-dated records excluded from every job - which showed up as 36,989
-  // matched against a 50,000 fixture and read as a build that stopped early.
+  // A quarter in each outcome, a linear value spread, created_at over a year. The
+  // casts on the CASE branches are required: untyped parameters arrive as unknown,
+  // resolve the CASE to text, and the insert then fails on the uuid column.
   await pool.query(
     `INSERT INTO opportunity (workspace_id, stage_id, name, value, created_at)
      SELECT $1,
@@ -209,9 +201,8 @@ async function seed(): Promise<{ workspaceId: string; target: string }> {
     d.rows[0]!.lo.getTime() + 0.9 * (d.rows[0]!.hi.getTime() - d.rows[0]!.lo.getTime()),
   ).toISOString();
 
-  // Asserted rather than assumed. An earlier version of this benchmark reported
-  // 36,989 matched against a 50,000 fixture and nothing checked, because a build
-  // that stops early still returns a number and a number is not a count.
+  // Asserted rather than assumed. A build that stops early still returns a
+  // number, and a number is not a count.
   const { rows: check } = await pool.query<{ n: number }>(
     'SELECT count(*)::int AS n FROM opportunity WHERE workspace_id = $1',
     [workspaceId],
@@ -223,12 +214,11 @@ async function seed(): Promise<{ workspaceId: string; target: string }> {
   return { workspaceId, target: stageIds['target']! };
 }
 
-async function run(
-  workspaceId: string,
-  target: string,
-  c: Case,
-  report: boolean,
-): Promise<void> {
+function perSec(n: number, millis: number): string {
+  return millis > 0 ? Math.round(n / (millis / 1000)).toLocaleString('en-US') : '-';
+}
+
+async function run(workspaceId: string, target: string, c: Case, report: boolean): Promise<void> {
   const submitted = await post('/bulk-moves', workspaceId, {
     ...c.filter(),
     targetStageId: target,
@@ -243,44 +233,68 @@ async function run(
   const jobId = (JSON.parse(submitted.body) as { jobId: string }).jobId;
 
   const t0 = Date.now();
+  let matched = 0;
+  let buildMs = 0;
+  let settledMs = 0;
+
+  // Two stops, not one. The build ends when the snapshot is done; the job ends
+  // when every batch has settled. Reporting only the second would hide how much
+  // of a small job is spent waiting to be noticed, which is the interesting part.
   for (;;) {
     const res = await get(`/bulk-moves/${jobId}`, workspaceId);
     if (res.status === 200) {
       const st = JSON.parse(res.body) as {
         snapshotInProgress: boolean;
         totalMatched: number;
+        status: string;
+        batches: Record<string, number>;
       };
-      if (!st.snapshotInProgress) {
-        const buildMs = Date.now() - t0;
-        const { rows } = await pool.query<{ pages: number; per_page_ms: number }>(PAGE_COST, [
-          jobId,
-        ]);
-        if (report) {
-          console.log(
-            `  ${c.label.padEnd(12)} ${String(st.totalMatched).padStart(6)} matched ` +
-              `${String(rows[0]?.pages ?? 0).padStart(3)} pages  ` +
-              `build ${ms(buildMs).padStart(8)}  ` +
-              `per page ${String(rows[0]?.per_page_ms ?? 0).padStart(4)}ms`,
-          );
+      matched = st.totalMatched;
+      if (!st.snapshotInProgress && buildMs === 0) buildMs = Date.now() - t0;
+      if (buildMs > 0) {
+        const done = st.status === 'completed' || st.status === 'failed';
+        const idle = (st.batches['pending'] ?? 0) === 0 && (st.batches['running'] ?? 0) === 0;
+        if (done && idle) {
+          settledMs = Date.now() - t0;
+          break;
         }
-        return;
       }
     }
-    if (Date.now() - t0 > 120_000) {
-      console.log(`  ${c.label.padEnd(12)} build did not finish in 120s`);
+    if (Date.now() - t0 > 180_000) {
+      console.log(`  ${c.label.padEnd(12)} did not settle in 180s`);
       return;
     }
     await new Promise((r) => setTimeout(r, 50));
   }
+
+  const { rows } = await pool.query<{ pages: number; per_page_ms: number; processed: number }>(
+    JOB_COST,
+    [jobId],
+  );
+  const processed = rows[0]?.processed ?? 0;
+
+  if (report) {
+    console.log(
+      `  ${c.label.padEnd(12)} ${String(matched).padStart(6)} matched  ` +
+        `${String(rows[0]?.pages ?? 0).padStart(3)} pages  ` +
+        `build ${ms(buildMs).padStart(7)}  ` +
+        `${String(rows[0]?.per_page_ms ?? 0).padStart(3)}ms/page  ` +
+        `${perSec(matched, buildMs).padStart(7)}/sec  |  ` +
+        `moved ${String(processed).padStart(6)} in ${ms(settledMs).padStart(7)}  ` +
+        `${perSec(processed, settledMs).padStart(7)}/sec`,
+    );
+  }
 }
 
 async function main(): Promise<void> {
+  console.log(`Filter selectivity against a ${TOTAL.toLocaleString('en-US')} record workspace.`);
   console.log(
-    `Filter selectivity against a ${TOTAL.toLocaleString('en-US')} record workspace.`,
+    'One freshly seeded workspace and one full job per filter, twice, warm pass shown.\n',
   );
-  console.log('One freshly seeded workspace and one build per filter.\n');
-  console.log('  filter         matched  pages        build   per page');
-  console.log(`  ${'-'.repeat(52)}`);
+  console.log(
+    '  filter         matched  pages      build   per page   build/s  |    moved     total     total/s',
+  );
+  console.log('  ' + '-'.repeat(98));
 
   // Boundaries come from one throwaway seed so every case filters by the same
   // yardstick, and it is cleaned up - the version that left it behind put 50,000
@@ -288,15 +302,7 @@ async function main(): Promise<void> {
   const boundary = await seed();
   try {
     for (const c of CASES) {
-      // Twice, reporting the second.
-      //
-      // Run once, the first case is always the coldest thing in shared buffers -
-      // 50,000 rows have just been inserted and no query has touched them - and it
-      // read 25ms per page against 13-18ms for the rest. That is a cache warm-up
-      // curve, not a property of the filter, and reporting it as a filter effect
-      // would be reading the order the cases happened to run in. The first pass
-      // is the warm-up; the second is the measurement.
-      for (let pass = 0; pass < 2; pass++) {
+      for (let pass = 0; pass < 2; pass += 1) {
         const ws = await seed();
         try {
           await run(ws.workspaceId, ws.target, c, pass === 1);
@@ -314,19 +320,28 @@ async function main(): Promise<void> {
   }
 
   console.log(
-    `\n  Total build tracks the page count, which is matched records over 1,000 -\n` +
-      `  so a selective filter is faster for the uninteresting reason that there\n` +
-      `  is less to do.\n` +
-      `\n  Per page is the column that was supposed to show the cost of selectivity,\n` +
-      `  and it does not. Across four filters it lands in the 12-29ms band with no\n` +
-      `  ordering, so at 50,000 on this host the walk's cost per page is dominated\n` +
-      `  by the batch write - a 1,000-element uuid array and a commit - rather than\n` +
-      `  by how many rows the stage filter discarded. The earlier reading of 25ms\n` +
-      `  against 13ms was a cache warm-up curve from the cases running in order;\n` +
-      `  each is now run twice and only the warm pass reported.\n` +
-      `\n  That does not rule the effect out at 500,000, where a selective filter\n` +
-      `  walks proportionally further. It says the index question is not answerable\n` +
-      `  at this scale, and should not be argued from these numbers.`,
+    `
+  Throughput is the column that says something useful, and it says the opposite
+  of what the per-page column was written to show. Build rate is high and flat -
+  tens of thousands of records a second - because a page costs about what a page
+  costs whatever matched it.
+
+  End-to-end rate falls by roughly 3x from the unfiltered case to the smallest
+  filter, on a job moving five thousand records instead of fifty thousand. The
+  data is not the reason. The two small cases settle in about 400ms whatever
+  they match, and roughly half of that is the job waiting to be noticed: a 250ms
+  sweep tick before the first batch exists, then a 250ms relay tick before any of
+  it is published. Below roughly 15,000 records that fixed cost is the job.
+
+  Those two rates are also the reason the earlier framing was wrong. Counting
+  only the build flatters a selective filter - it does less work - while counting
+  only the end-to-end figure punishes it for being small. Neither alone is the
+  number a caller waits on.
+
+  Per page shows no selectivity effect. Whether stage_id belongs in the walk's
+  index is therefore not answered here, and should not be argued from these
+  numbers - though it is not ruled out either, since at 500,000 a selective filter
+  walks proportionally further past the rows it discards.`,
   );
 
   await pool.end();
