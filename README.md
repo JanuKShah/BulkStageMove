@@ -83,7 +83,7 @@ migrations, and blocks until healthy. `npm run down` tears the stack down and
 | `opportunity-service` | deals, their stages, the list and filter | 3004 | 1 process, **DB pool of 10** |
 | `transition-service` | **bulk jobs**: submit, batching, status | 3005 | 1 process, **DB pool of 10**, **2 background loops** |
 | `worker-service` | applies batches; **no port** — it only consumes | — | 1 process, **12 consumers**, **DB pool of 12** |
-| `nginx` | the edge; fronts transition-service only | 8080 | 1 |
+| `nginx` | the edge; fronts transition-service only | 18080 | 1 |
 | `postgres` | the datastore | 5432 | 1 |
 | `rabbitmq` | batch dispatch | 5672, UI 15672 | 1 exchange, **5 queues** |
 | `migrate` | applies migrations, then exits | — | runs once at startup |

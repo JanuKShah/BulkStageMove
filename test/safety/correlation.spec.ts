@@ -170,7 +170,7 @@ describe('request correlation', () => {
     // A proxied path, deliberately not /_health. That location is a local
     // `return`, so it never reaches proxy_set_header and would pass or fail for
     // reasons that have nothing to do with the header logic under test.
-    const proxied = 'http://localhost:8080/bulk-moves/' + randomUUID();
+    const proxied = 'http://localhost:18080/bulk-moves/' + randomUUID();
     const auth = { 'x-workspace-id': ws.workspaceId };
 
     let reachable = false;
